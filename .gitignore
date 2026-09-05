@@ -1,0 +1,11 @@
+.work/
+.venv/
+target/
+dist/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
+
+[project]
+name = "typedsolid"
+version = "0.1.0"
+description = "Semantic solid modeling with explicit manufacturability checks"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+readme = "README.md"
+
+[project.optional-dependencies]
+cadquery = ["cadquery==2.8.0"]
+
+[tool.maturin]
+manifest-path = "crates/typedsolid-python/Cargo.toml"
+python-source = "python"
+module-name = "typedsolid._native"
+features = ["extension-module"]
