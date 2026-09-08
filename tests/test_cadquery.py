@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -51,6 +52,17 @@ class CadQueryTests(unittest.TestCase):
         result = build(add_feature(block(), Feature("remove", Box((-1, -1, -1), (11, 11, 11)), operation="cut")))
         self.assertFalse(result.export_allowed)
         self.assertTrue(failures(result, "valid_solid"))
+
+    def test_minimum_size_box_is_a_valid_solid(self):
+        # 実装上の最小box寸法0.001 mmの立方体は1e-9 mm³であり、
+        # 交差判定の許容差1e-7 mm³を空判定に流用すると無効と扱われる。
+        model = Model(
+            (Part("speck", (Feature("body", Box((0, 0, 0), (0.001, 0.001, 0.001))),)),),
+            policy=Policy(min_feature_mm=0.001),
+        )
+        result = build(model)
+        self.assertFalse(failures(result, "valid_solid"), result.report)
+        self.assertTrue(result.export_allowed, result.report)
 
     def test_thin_additive_feature(self):
         model = Model((Part("plate", (Feature("thin", Box((0, 0, 0), (10, 10, 0.4))),)),))
@@ -128,6 +140,14 @@ class CadQueryTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 export(model, output)
             self.assertEqual(before, (output / "block.stl").read_bytes())
+
+    def test_model_sha256_matches_the_saved_file(self):
+        with tempfile.TemporaryDirectory(dir=".work") as root:
+            output = Path(root) / "hashed"
+            manifest = export(block(), output)
+            saved = (output / "model.json").read_bytes()
+            self.assertEqual(manifest["model_sha256"], hashlib.sha256(saved).hexdigest())
+            self.assertEqual(json.loads(saved), json.loads(block().to_json()))
 
     def test_public_build_mutation_does_not_bypass_export(self):
         model = replace(block(), policy=Policy(required=("support_free",)))

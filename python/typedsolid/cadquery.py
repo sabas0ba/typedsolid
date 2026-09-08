@@ -17,8 +17,12 @@ import cadquery as cq
 from . import _native
 from .model import Model
 
-# OCCTの境界演算誤差を吸収する絶対体積許容差。単位はmm³。
+# OCCTの境界演算誤差を吸収する接触判定の絶対体積許容差。単位はmm³。
 VOLUME_TOLERANCE = 1e-7
+# 立体が空でないとみなす下限体積。単位はmm³。実装上の最小box寸法0.001 mmの立方体は
+# 1e-9 mm³であり、接触判定の許容差を流用すると正当な最小形状を無効と判定するため、
+# 目的の異なる閾値として独立に定義する。
+EMPTY_VOLUME_TOLERANCE = 1e-12
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
 )
@@ -74,7 +78,7 @@ def build(model: Model) -> Build:
             shape = shape.clean()
             solids = shape.Solids()
             volume = sum(abs(s.Volume()) for s in solids)
-            valid = bool(solids) and shape.isValid() and math.isfinite(volume) and volume > VOLUME_TOLERANCE
+            valid = bool(solids) and shape.isValid() and math.isfinite(volume) and volume > EMPTY_VOLUME_TOLERANCE
             geometry.append(_check("valid_solid", part["id"], valid, f"valid={shape.isValid()}, volume={volume:.9g} mm³"))
             geometry.append(_check("single_solid", part["id"], len(solids) == 1, f"final solid count: {len(solids)}"))
             shapes[part["id"]] = shape
@@ -129,11 +133,13 @@ def export(model: Model, directory: str | Path) -> dict:
                 if path.stat().st_size == 0:
                     raise ValueError(f"empty export: {part_id}.{suffix}")
                 files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        (root / "model.json").write_text(result.model_json + "\n", encoding="utf-8")
+        # 保存bytesとdigestを同一の値から得る。model.jsonの再hashで照合できるようにする。
+        model_bytes = (result.model_json + "\n").encode("utf-8")
+        (root / "model.json").write_bytes(model_bytes)
         manifest = {
             "schema_version": 1, "units": "mm", "cadquery": version("cadquery"),
             "cadquery_ocp": version("cadquery-ocp"),
-            "model_sha256": hashlib.sha256(result.model_json.encode()).hexdigest(),
+            "model_sha256": hashlib.sha256(model_bytes).hexdigest(),
             "files_sha256": files, "report": result.report,
             "notice": "Only listed checks were evaluated. This is not a printability or structural safety certification.",
         }
