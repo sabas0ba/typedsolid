@@ -126,3 +126,19 @@ PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テ
 ## 作業データ
 
 `.work/`、`.venv/`、`target/`はgit管理外。生成済み出力を消さずに再評価する場合は別名の出力ディレクトリを使用する。開発環境全体を再構築する前に、`.work/`内の必要な作例を退避する。
+
+## 開放筐体のE2E作例
+
+`examples/electronics_enclosure.py`は80×55×24 mm、底板・壁厚2 mmの筐体を生成する。底面から6 mmの位置に支持面を持つ外径8 mmのbossを4個配置し、直径3 mmの貫通穴を開ける。前面に20×8 mmの矩形開口、背面に3×10 mmのスリットを5本配置する。60×35×3 mmの説明用基板領域をz=6 mmに確保し、+Zへのアクセスを検査する。実基板・コネクタの仕様、放熱性能、ねじ規格を保証する作例ではない。
+
+```bash
+make check
+.venv/bin/python examples/electronics_enclosure.py --output .work/electronics-enclosure
+MPLCONFIGDIR=.work/matplotlib .venv/bin/python scripts/render-stl.py --stl .work/electronics-enclosure/electronics_enclosure.stl --model-json .work/electronics-enclosure/model.json --output .work/electronics-enclosure.png
+```
+
+![出力STLから描画した開放筐体](assets/electronics-enclosure.png)
+
+画像は出力済みSTLの三角形とdepth bufferから生成する。輪郭・穴・開口は実際のmeshに由来し、形状の前後関係と高さに応じて陰影を付ける。右上の緑点線は基板の確保領域で、STLには含まれない。描画は既存lockに含まれるnumpy/matplotlibを使用し、追加依存は導入しない。
+
+`tests/test_e2e.py`は公開CLIをsubprocessで起動し、STL/STEP/model/reportの生成とhash、STEP再読込後の寸法・体積・solid数、boss・穴・矩形開口の位置、STLの有限座標と寸法、必須検査と未評価項目、既存出力の上書き拒否を検証する。STL manifold性、slicer、実機印刷、強度・放熱はこのE2Eの検証対象外である。

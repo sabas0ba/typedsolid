@@ -10,3 +10,7 @@
 - [依存調査と固定方針](docs/dependencies.md)
 
 Linux x86_64 / CPython 3.12を初期検証対象とします。Apache-2.0 license。
+
+![穴付きbossと矩形開口を持つ筐体の出力STL](docs/assets/electronics-enclosure.png)
+
+[開放筐体のE2E作例と再現手順](docs/development.md#開放筐体のe2e作例)
