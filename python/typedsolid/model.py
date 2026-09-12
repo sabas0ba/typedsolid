@@ -21,9 +21,18 @@ class Box:
 
 
 @dataclass(frozen=True)
+class Cylinder:
+    """底面中心centerから+Zへ延びる円柱。座標・半径・高さはmm。"""
+
+    center: Vec3
+    radius_mm: float
+    height_mm: float
+
+
+@dataclass(frozen=True)
 class Feature:
     id: str
-    bounds: Box
+    bounds: Box | Cylinder
     role: Literal["base", "wall", "mount", "rib", "generic"] = "generic"
     operation: Literal["add", "cut"] = "add"
 

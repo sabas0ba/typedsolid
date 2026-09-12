@@ -7,11 +7,12 @@
 - 最終solid数、形状妥当性、keepout、+Zアクセス、部品間干渉
 - 成功・失敗作例、単体/統合test、CI、再現手順
 
-今回のPRの範囲。製造可能性全体を保証する段階ではない。
+実装済み。製造可能性全体を保証する段階ではない。
 
 ## M1: 実用筐体の構造と寸法
 
-- 円柱・穴・面取り・rib・boss、寸法型と座標変換
+- 対応済み: +Z円柱、円柱Cutによる穴、boxと組み合わせた穴付きbossの作例、入力検証・CAD統合テスト
+- 残項目: 面取り、rib・bossの専用API、寸法型と座標変換
 - 部品catalog、基板・コネクタ寸法と出典、支持面への接触指定
 - 最終肉厚、接続部断面、slendernessの保守的な検査
 - 閉空洞、印刷姿勢、overhang/bridgeの検査。slicerでの評価との突合
@@ -35,4 +36,4 @@
 
 ## 後続判断
 
-Nix/Docker環境、Windows/macOSのwheel、API拡張、可視化は需要とCI費用を見て追加する。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。
+Nix環境を追加し、digest固定NixイメージのPodman専用コンテナで検証する。Windows/macOSのwheel、API拡張、可視化は需要とCI費用を見て追加する。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開は行わない。

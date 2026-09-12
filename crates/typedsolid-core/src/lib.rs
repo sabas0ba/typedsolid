@@ -32,6 +32,69 @@ impl Box3 {
     }
 }
 
+/// 底面中心から+Zへ延びる円柱。長さの単位はmm。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cylinder3 {
+    pub center: [f64; 3],
+    pub radius_mm: f64,
+    pub height_mm: f64,
+}
+
+impl Cylinder3 {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.radius_mm.is_finite()
+            || !self.height_mm.is_finite()
+            || self.radius_mm < 0.0005
+            || self.height_mm < 0.001
+        {
+            return Err("cylinder diameter and height must be finite and at least 0.001 mm".into());
+        }
+        // 外接box全体を座標上限内に制限する。中心だけの検証では越境を見逃す。
+        Box3 {
+            min: [
+                self.center[0] - self.radius_mm,
+                self.center[1] - self.radius_mm,
+                self.center[2],
+            ],
+            max: [
+                self.center[0] + self.radius_mm,
+                self.center[1] + self.radius_mm,
+                self.center[2] + self.height_mm,
+            ],
+        }
+        .validate()
+    }
+
+    pub fn minimum_dimension(&self) -> f64 {
+        (2.0 * self.radius_mm).min(self.height_mm)
+    }
+}
+
+/// v1のbox表現を維持する。各variantは未知fieldを拒否し、混在した形状を受理しない。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Primitive {
+    Box(Box3),
+    Cylinder(Cylinder3),
+}
+
+impl Primitive {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Box(bounds) => bounds.validate(),
+            Self::Cylinder(cylinder) => cylinder.validate(),
+        }
+    }
+
+    pub fn minimum_dimension(&self) -> f64 {
+        match self {
+            Self::Box(bounds) => bounds.minimum_dimension(),
+            Self::Cylinder(cylinder) => cylinder.minimum_dimension(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
@@ -55,7 +118,7 @@ pub struct Feature {
     pub id: String,
     pub role: Role,
     pub operation: Operation,
-    pub bounds: Box3,
+    pub bounds: Primitive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,10 +360,10 @@ mod tests {
                     id: "plate".into(),
                     role: Role::Base,
                     operation: Operation::Add,
-                    bounds: Box3 {
+                    bounds: Primitive::Box(Box3 {
                         min: [0.; 3],
                         max: [10., 10., 2.],
-                    },
+                    }),
                 }],
             }],
             keepouts: vec![],
@@ -310,6 +373,85 @@ mod tests {
             },
         }
     }
+    fn box_mut(m: &mut Model) -> &mut Box3 {
+        let Primitive::Box(bounds) = &mut m.parts[0].features[0].bounds else {
+            panic!("fixture must contain a box");
+        };
+        bounds
+    }
+
+    #[test]
+    fn cylinder_dimensions_and_extents_are_validated() {
+        let cylinder = Cylinder3 {
+            center: [0.; 3],
+            radius_mm: 0.6,
+            height_mm: 2.,
+        };
+        assert!(cylinder.validate().is_ok());
+        assert_eq!(cylinder.minimum_dimension(), 1.2);
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.,
+            0.,
+            0.0004,
+            1e7,
+        ] {
+            let mut c = cylinder.clone();
+            c.radius_mm = value;
+            assert!(c.validate().is_err());
+            c = cylinder.clone();
+            c.height_mm = value;
+            assert!(c.validate().is_err());
+        }
+        for axis in 0..3 {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e6, -1e7] {
+                let mut c = cylinder.clone();
+                c.center[axis] = value;
+                assert!(c.validate().is_err());
+            }
+        }
+        let minimum = Cylinder3 {
+            radius_mm: 0.0005,
+            height_mm: 0.001,
+            ..cylinder
+        };
+        assert!(minimum.validate().is_ok());
+        assert_eq!(minimum.minimum_dimension(), 0.001);
+    }
+
+    #[test]
+    fn cylinder_preflight_uses_diameter_and_height() {
+        let mut m = model();
+        for (radius_mm, height_mm, expected) in [
+            (0.6, 2., Status::Pass),
+            (0.59, 2., Status::Fail),
+            (2., 1.19, Status::Fail),
+            (2., 1.2, Status::Pass),
+        ] {
+            m.parts[0].features[0].bounds = Primitive::Cylinder(Cylinder3 {
+                center: [0.; 3],
+                radius_mm,
+                height_mm,
+            });
+            assert_eq!(m.preflight().unwrap().checks[0].status, expected);
+            let json = serde_json::to_string(&m).unwrap();
+            assert!(Model::from_json(&json).is_ok());
+        }
+    }
+
+    #[test]
+    fn mixed_or_unknown_primitive_fields_are_rejected() {
+        for json in [
+            r#"{"center":[0,0,0],"radius_mm":1,"height_mm":2,"typo":1}"#,
+            r#"{"min":[0,0,0],"max":[1,1,1],"center":[0,0,0],"radius_mm":1,"height_mm":2}"#,
+            r#"{"center":[0,0,0],"radius_mm":1}"#,
+        ] {
+            assert!(serde_json::from_str::<Primitive>(json).is_err());
+        }
+    }
+
     #[test]
     fn json_round_trip() {
         let json = serde_json::to_string(&model()).unwrap();
@@ -322,20 +464,20 @@ mod tests {
     #[test]
     fn thin_feature_fails() {
         let mut m = model();
-        m.parts[0].features[0].bounds.max[2] = 0.4;
+        box_mut(&mut m).max[2] = 0.4;
         assert_eq!(m.preflight().unwrap().checks[0].status, Status::Fail);
     }
     #[test]
     fn boundary_thickness_passes() {
         let mut m = model();
-        m.parts[0].features[0].bounds.max[2] = 1.2;
+        box_mut(&mut m).max[2] = 1.2;
         assert_eq!(m.preflight().unwrap().checks[0].status, Status::Pass);
     }
     #[test]
     fn invalid_numbers_rejected() {
         for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1., 0., 1e7] {
             let mut m = model();
-            m.parts[0].features[0].bounds.max[0] = n;
+            box_mut(&mut m).max[0] = n;
             assert!(m.validate().is_err());
         }
     }

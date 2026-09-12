@@ -2,7 +2,7 @@
 
 ## 対象環境
 
-初期検証対象はLinux x86_64 / CPython 3.12、Rust 1.97.1。Rust、Python packageはproject専用ディレクトリに配置する。Nixは必須ではない。Nix/Dockerを用いた環境の追加は後続項目で、現在同等性を検証済みとするものではない。
+初期検証対象はLinux x86_64 / CPython 3.12、Rust 1.97.1。Rust、Python packageはproject専用ディレクトリに配置する。Nixは必須ではない。Nix経路は下記の固定環境を使用する。
 
 ## セットアップ
 
@@ -18,6 +18,50 @@ make check
 ```
 
 既存のrustupを使う場合はbootstrapを省略できる。`rust-toolchain.toml`の固定版を使用する。`make`は`.work/toolchain/bin`があれば優先する。Pythonだけの代替ルール実装や、native moduleがない場合の自動fallbackは用意しない。
+
+## Nix / Podman環境
+
+`shell.nix`は[sabas0ba/dotfiles](https://github.com/sabas0ba/dotfiles/tree/2d272319883e37b7213b2910b1036fad751238cc)の固定nixpkgs `597283ad8aa0b331c788e97c4c262d58877074ef`と同じsource hashを使う。dotfilesのsoftware profileはRust 1.95.0 / Python 3.13のため、そのまま本projectの検証環境には使わない。Rustは既存component hashから1.97.1を構築し、Python 3.12とCAD wheel用共有libraryをNixで用意する。Rust配布物のELF interpreter/RPATHはNixのautoPatchelfHookで調整する。Nix storeは専用コンテナ内、Python環境は`.venv/`、cacheと一時データは`.work/`に置く。
+
+依存取得の承認と調査後、Linux x86_64の独立したcheckoutで実行する。
+
+```bash
+nix-shell
+python3.12 scripts/audit-dependencies.py > .work/dependency-audit.json
+bash scripts/setup-nix-python.sh
+make check
+python examples/mounting_plate.py --output .work/mounting-plate
+```
+
+`setup-nix-python.sh`はhash固定wheelのみをcopyで配置する。maturinが動的リンクの場合だけvenv内のELF interpreterを調整し、uv cacheは変更しない。通常Linux向けbootstrapをこのNix checkoutに重ねて実行しない。`make`は既存の`.work/toolchain`を優先するためである。
+
+Windowsではホストcheckoutをmountせず、専用コンテナ内にcheckoutを置く。使用したベースイメージはdotfilesのDockerfileと同じdigest固定版である。
+
+```powershell
+podman run -d --name typedsolid-dev --pull=never --cap-drop=ALL --security-opt=no-new-privileges docker.io/nixos/nix@sha256:377d4887aca98f0dfa12971c1ea6d6a625a435d8b610d4c95a436843da6fbfd1 sleep infinity
+```
+
+この例は承認の上でイメージ取得済みであることを前提とする。リポジトリは`/root/repos/typedsolid`へ取得し、feature branchで作業する。private repositoryの認証情報はコンテナへ持ち込まず、承認済みのホスト側GitHub取得経路からソースを転送する。転送したソースと元commitのGit tree SHAを照合する。host checkoutのコピーやmountは不要である。
+
+コンテナ内でのNix実行は`nix-shell --option build-users-group '' shell.nix`とする。この設定は当該コンテナのコマンドに限定し、ホストのNix設定は変更しない。Nixイメージのsandbox無効設定と組み合わせ、認証情報・ホストmount・deviceを持たない専用環境で使用する。
+
+## 穴付きbossの作例
+
+```bash
+make python-build
+.venv/bin/python examples/mounting_plate.py --output .work/mounting-plate
+```
+
+40×30×2 mmの底板に半径3 mm・高さ6 mmの円柱を4個配置する。円柱底面はz=1 mm、底板との重なりは1 mm。半径1.2 mmの円柱Cutをz=-1から8 mmまで通し、底板とbossを貫通する。各bossの上端はz=7 mmである。出力はSTL、STEP、意味モデル、検査report。寸法は説明用で、ねじ仕様や実基板catalogへの対応は含まない。
+
+```python
+from typedsolid import Cylinder, Feature
+
+boss = Feature("boss", Cylinder((6, 6, 1), radius_mm=3, height_mm=6), role="mount")
+hole = Feature("hole", Cylinder((6, 6, -1), radius_mm=1.2, height_mm=9), operation="cut")
+```
+
+円柱の直径と高さは入力・primitive寸法検査の対象となる。加工後の肉厚・接続部強度・印刷可否は未評価であり、それらを必須にした場合は出力を拒否する。面取り、任意軸、座標変換、ねじ規格、STL manifold検査は未対応。
 
 ## 検証
 

@@ -36,11 +36,17 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換・材料はまだ扱わない。
 - `Model`は`schema_version=1`、`parts`、`keepouts`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
-- `Feature`は軸平行box、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
+- `Feature`は軸平行boxまたは+Z円柱、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - Booleanの意味は「すべてのAddの和から、すべてのCutを引く」。記述順依存の逐次CSGではない。Cutは生成用であり、最小feature寸法ルールの対象外。
 - `Keepout`は確保領域と一様clearanceを持つ。`access=plus_z`はclearance込み断面を全部品の最高点より2 mm上まで掃引した領域を検査する。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
-- 座標±1,000,000 mm、box寸法0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- 座標±1,000,000 mm（円柱は外接box全体）、box寸法・円柱の直径と高さ0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+
+### M1の円柱拡張
+
+`Feature.bounds`は歴史的なfield名を維持し、boxの`{min, max}`または円柱の`{center, radius_mm, height_mm}`を受け取る。円柱の`center`は底面中心、軸は+Z固定である。既存boxのJSONと`schema_version=1`は変更しない。旧実装は円柱fieldを未知fieldとして拒否する。両形式の混在・未知field・寸法欠落も拒否する。`Keepout.bounds`は引き続きbox専用である。
+
+円柱のAddでbossやpinを、Cutで円形穴を構成できる。穴にねじ規格や嵌合公差の意味は自動付与しない。`feature_thickness`はAdd円柱の直径と高さの小さい方を評価する。半径、穴加工後のboss肉厚、接続部断面の検査とは異なる。円柱を含む部品にも最終solid・干渉・keepout・+Zアクセス検査を適用し、CAD例外時は出力を拒否する。
 
 ## 検査と出力
 
@@ -58,7 +64,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ## CadQuery/OCCT依存への対策
 
-永続的な意味IDはIRのPart/Featureに置き、face番号やedge列挙順に置かない。初期実装はboxとBooleanに限定し、fragileなface selectorを使用しない。Boolean後のface→feature対応は現段階で保証しない。
+永続的な意味IDはIRのPart/Featureに置き、face番号やedge列挙順に置かない。形状生成はbox・+Z円柱とBooleanに限定し、fragileなface selectorを使用しない。Boolean後のface→feature対応は現段階で保証しない。
 
 backend例外、無効形状、空形状をfailとして保持する。依存を固定し、版更新時は孤立・切断・空形状・干渉・アクセス・STEP再読込の回帰テストを行う。STLのバイト一致ではなく、寸法・体積・接続性と検査結果を比較する。カーネルのhard crashやhangはPython例外処理では隔離できないため、将来worker processとtimeoutを導入する。
 

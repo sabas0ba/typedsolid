@@ -1,4 +1,4 @@
-"""軸平行boxのunion-minus-cutsをCadQueryに変換する実験的backend。"""
+"""軸平行boxと+Z円柱のunion-minus-cutsをCadQueryに変換する実験的backend。"""
 
 from __future__ import annotations
 
@@ -31,6 +31,20 @@ GEOMETRY_RULES = (
 def _box(bounds: dict) -> cq.Solid:
     lo, hi = bounds["min"], bounds["max"]
     return cq.Solid.makeBox(*(hi[i] - lo[i] for i in range(3)), pnt=cq.Vector(*lo))
+
+
+def _primitive(bounds: dict) -> cq.Solid:
+    if "radius_mm" in bounds:
+        return cq.Solid.makeCylinder(
+            bounds["radius_mm"], bounds["height_mm"], pnt=cq.Vector(*bounds["center"]),
+        )
+    return _box(bounds)
+
+
+def _top_z(bounds: dict) -> float:
+    if "radius_mm" in bounds:
+        return bounds["center"][2] + bounds["height_mm"]
+    return bounds["max"][2]
 
 
 def _check(rule: str, target: str, passed: bool, message: str) -> dict:
@@ -68,13 +82,13 @@ def build(model: Model) -> Build:
     geometry: list[dict] = []
     try:
         for part in data["parts"]:
-            additives = [_box(f["bounds"]) for f in part["features"] if f["operation"] == "add"]
+            additives = [_primitive(f["bounds"]) for f in part["features"] if f["operation"] == "add"]
             shape: cq.Shape = additives[0]
             for additive in additives[1:]:
                 shape = shape.fuse(additive)
             for feature in part["features"]:
                 if feature["operation"] == "cut":
-                    shape = shape.cut(_box(feature["bounds"]))
+                    shape = shape.cut(_primitive(feature["bounds"]))
             shape = shape.clean()
             solids = shape.Solids()
             volume = sum(abs(s.Volume()) for s in solids)
@@ -84,7 +98,7 @@ def build(model: Model) -> Build:
             shapes[part["id"]] = shape
 
         # 全部品の最高点まで延長することで、上方に別部品がある場合も検査する。
-        z_exit = max(f["bounds"]["max"][2] for p in data["parts"] for f in p["features"] if f["operation"] == "add") + 2.0
+        z_exit = max(_top_z(f["bounds"]) for p in data["parts"] for f in p["features"] if f["operation"] == "add") + 2.0
         for keepout in data["keepouts"]:
             margin = keepout["clearance_mm"]
             bounds = {"min": [v - margin for v in keepout["bounds"]["min"]], "max": [v + margin for v in keepout["bounds"]["max"]]}
