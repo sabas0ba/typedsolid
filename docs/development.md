@@ -2,9 +2,28 @@
 
 ## 対象環境
 
-初期検証対象はLinux x86_64 / CPython 3.12、Rust 1.97.1。Rust、Python packageはproject専用ディレクトリに配置する。Nixは必須ではない。Nix/Dockerを用いた環境の追加は後続項目で、現在同等性を検証済みとするものではない。
+初期検証対象はLinux x86_64 / CPython 3.12、Rust 1.97.1。Rust、Python packageはproject専用ディレクトリに配置する。Nixは必須ではなく、後述の2経路のいずれでも同じ`make check`を実行できる。Dockerを用いた環境と他OSの検証は後続項目である。
 
-## セットアップ
+## セットアップ (Nix)
+
+`nix develop`はrust-toolchain.tomlの指定どおりのRust toolchain、Python 3.12、uv、C compiler、poppler-utilsを提供する。`.envrc`があるためdirenvでも入れる。
+
+```bash
+nix develop
+uv venv --python python3.12 .venv
+uv pip sync --python .venv/bin/python --require-hashes --only-binary :all: requirements-dev.lock
+make check
+```
+
+flake inputは`flake.lock`にrevisionとnarHashで固定する。Rust toolchainはfenixがRust公式のrustup manifestから構成し、`flake.nix`の`sha256`が内容を固定する。取得元と版は`scripts/bootstrap-rust.sh`と同一である。
+
+開発シェル内で`scripts/bootstrap-rust.sh`を実行しない。`.work/toolchain`が残っている場合、Makefileはそちらを優先するため、不要なら削除する。
+
+`.venv`は作成時のinterpreterへの参照を持つ。開発シェル内で作成した`.venv`はNixのinterpreterを指し、シェル外ではcadquery-ocpが必要とする共有ライブラリを解決できない。経路を切り替える場合は`.venv`を削除して作り直す。
+
+提供するsystemはx86_64-linuxのみである。他のsystemはtoolchainのhashを検証していないため定義しない。
+
+## セットアップ (Nixを使わない場合)
 
 Python 3.12、uv、C compiler、make、curl、tar、xzを用意する。uvは環境の既存ツールを使用し、この手順はglobal installを行わない。Python依存の正確な版・hashは`requirements-dev.lock`、Rust依存は`Cargo.lock`に固定する。
 

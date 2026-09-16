@@ -1,5 +1,6 @@
 .work/
 .venv/
+.direnv/
 target/
 dist/
 __pycache__/

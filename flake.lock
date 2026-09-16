@@ -1,0 +1,52 @@
+{
+  "nodes": {
+    "fenix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-analyzer-src": []
+      },
+      "locked": {
+        "lastModified": 1788865058,
+        "narHash": "sha256-ZkvwEHlSa46BkODMEwHCEh9hlUC2igneJ+noEUn9ww4=",
+        "ref": "refs/heads/main",
+        "rev": "9efa138447c5773995d98d9aafa9eba4982aceab",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-community/fenix"
+      },
+      "original": {
+        "rev": "9efa138447c5773995d98d9aafa9eba4982aceab",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/nix-community/fenix"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1784856561,
+        "narHash": "sha256-J+Bx1Z6Oeoj2FgnBhRMKyUhhtDoOpTgXYaVLZpDjW4A=",
+        "ref": "refs/heads/master",
+        "rev": "597283ad8aa0b331c788e97c4c262d58877074ef",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/NixOS/nixpkgs"
+      },
+      "original": {
+        "rev": "597283ad8aa0b331c788e97c4c262d58877074ef",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/NixOS/nixpkgs"
+      }
+    },
+    "root": {
+      "inputs": {
+        "fenix": "fenix",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
