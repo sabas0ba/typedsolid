@@ -9,8 +9,8 @@ from . import _native
 Vec3 = tuple[float, float, float]
 Rule = Literal[
     "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
-    "access_clearance", "part_interference", "final_wall_thickness", "support_free",
-    "strength", "thermal",
+    "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
+    "final_wall_thickness", "support_free", "strength", "thermal",
 ]
 
 
@@ -45,6 +45,8 @@ class Keepout:
 @dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
+    # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
+    mesh_volume_tolerance: float = 0.01
     required: tuple[Rule, ...] = (
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
