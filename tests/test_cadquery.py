@@ -36,7 +36,8 @@ class CadQueryTests(unittest.TestCase):
         result = build(board_tray())
         self.assertTrue(result.export_allowed, result.report)
         self.assertEqual(len(result.shapes["board_tray"].Solids()), 1)
-        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"final_wall_thickness", "support_free", "strength", "thermal"})
+        # meshはbuildでは評価できない。exportがSTLを書き出してから判定する。
+        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"mesh_manifold", "mesh_volume", "final_wall_thickness", "support_free", "strength", "thermal"})
 
     def test_disconnected_feature(self):
         result = build(add_feature(block(), Feature("island", Box((20, 0, 0), (25, 5, 5)))))
@@ -148,6 +149,40 @@ class CadQueryTests(unittest.TestCase):
             saved = (output / "model.json").read_bytes()
             self.assertEqual(manifest["model_sha256"], hashlib.sha256(saved).hexdigest())
             self.assertEqual(json.loads(saved), json.loads(block().to_json()))
+
+    def test_exported_mesh_is_inspected(self):
+        with tempfile.TemporaryDirectory(dir=".work") as root:
+            manifest = export(block(), Path(root) / "mesh")
+            checks = {c["rule"]: c for c in manifest["report"]["checks"] if c["rule"].startswith("mesh_")}
+            self.assertEqual({r: c["status"] for r, c in checks.items()}, {"mesh_manifold": "pass", "mesh_volume": "pass"})
+            self.assertEqual({c["target"] for c in checks.values()}, {"block"})
+
+    def test_cut_geometry_exports_a_closed_mesh(self):
+        model = add_feature(block(), Feature("pocket", Box((2, 2, 2), (8, 8, 11)), operation="cut"))
+        with tempfile.TemporaryDirectory(dir=".work") as root:
+            manifest = export(model, Path(root) / "pocket")
+            mesh = [c for c in manifest["report"]["checks"] if c["rule"].startswith("mesh_")]
+            self.assertEqual([c["status"] for c in mesh], ["pass", "pass"], mesh)
+
+    def test_broken_mesh_blocks_export(self):
+        real = cq.exporters.export
+
+        def truncated(shape, path, *args, **kwargs):
+            real(shape, path, *args, **kwargs)
+            if str(path).endswith(".stl"):
+                # 三角形を1つ落とし、長さも整合させる。解析は通り閉じたmeshでなくなる。
+                content = bytearray(Path(path).read_bytes())
+                count = struct.unpack_from("<I", content, 80)[0] - 1
+                struct.pack_into("<I", content, 80, count)
+                Path(path).write_bytes(bytes(content[: 84 + 50 * count]))
+
+        with tempfile.TemporaryDirectory(dir=".work") as root:
+            output = Path(root) / "broken"
+            with patch("cadquery.exporters.export", truncated):
+                with self.assertRaises(ValueError) as raised:
+                    export(block(), output)
+            self.assertIn("mesh_manifold", str(raised.exception))
+            self.assertFalse(output.exists())
 
     def test_public_build_mutation_does_not_bypass_export(self):
         model = replace(block(), policy=Policy(required=("support_free",)))

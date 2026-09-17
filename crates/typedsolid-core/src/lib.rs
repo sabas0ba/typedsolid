@@ -1,5 +1,7 @@
 //! CADカーネルから独立した意味モデルとpreflight検証。
 
+pub mod mesh;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -103,6 +105,8 @@ pub enum Rule {
     KeepoutClearance,
     AccessClearance,
     PartInterference,
+    MeshManifold,
+    MeshVolume,
     FinalWallThickness,
     SupportFree,
     Strength,
@@ -110,13 +114,15 @@ pub enum Rule {
 }
 
 impl Rule {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
         Self::KeepoutClearance,
         Self::AccessClearance,
         Self::PartInterference,
+        Self::MeshManifold,
+        Self::MeshVolume,
         Self::FinalWallThickness,
         Self::SupportFree,
         Self::Strength,
@@ -128,7 +134,14 @@ impl Rule {
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub min_feature_mm: f64,
+    /// 出力STLとsolidの体積差の相対許容量。tessellationの弦誤差を吸収する。
+    #[serde(default = "default_mesh_volume_tolerance")]
+    pub mesh_volume_tolerance: f64,
     pub required: Vec<Rule>,
+}
+
+fn default_mesh_volume_tolerance() -> f64 {
+    0.01
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +191,10 @@ impl Model {
         let thickness = self.policy.min_feature_mm;
         if !thickness.is_finite() || !(0.001..=1000.0).contains(&thickness) {
             return Err("min_feature_mm must be finite and in [0.001, 1000]".into());
+        }
+        let tolerance = self.policy.mesh_volume_tolerance;
+        if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
+            return Err("mesh_volume_tolerance must be finite and in [0, 1]".into());
         }
         let mut required = BTreeSet::new();
         for rule in &self.policy.required {
@@ -306,6 +323,7 @@ mod tests {
             keepouts: vec![],
             policy: Policy {
                 min_feature_mm: 1.2,
+                mesh_volume_tolerance: 0.01,
                 required: vec![Rule::SingleSolid],
             },
         }
@@ -346,6 +364,22 @@ mod tests {
             m.policy.min_feature_mm = n;
             assert!(m.validate().is_err());
         }
+        for n in [f64::NAN, f64::INFINITY, -1., 1.5] {
+            let mut m = model();
+            m.policy.mesh_volume_tolerance = n;
+            assert!(m.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn mesh_volume_tolerance_defaults_when_absent() {
+        let mut value = serde_json::to_value(model()).unwrap();
+        value["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mesh_volume_tolerance");
+        let restored = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(restored.policy.mesh_volume_tolerance, 0.01);
     }
     #[test]
     fn duplicate_ids_rejected() {

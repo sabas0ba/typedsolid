@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import hashlib
 from importlib.metadata import version
@@ -26,6 +27,8 @@ EMPTY_VOLUME_TOLERANCE = 1e-12
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
 )
+# 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
+MESH_RULES = ("mesh_manifold", "mesh_volume")
 
 
 def _box(bounds: dict) -> cq.Solid:
@@ -112,12 +115,18 @@ def build(model: Model) -> Build:
     return Build(shapes, report, model_json)
 
 
+def _reject_unless_allowed(report: dict) -> None:
+    if _native.export_allowed(json.dumps(report)):
+        return
+    failures = [c for c in report["checks"] if c["status"] == "fail" or (c["rule"] in report["required"] and c["status"] != "pass")]
+    raise ValueError("export blocked: " + json.dumps(failures, ensure_ascii=False))
+
+
 def export(model: Model, directory: str | Path) -> dict:
     """モデルを再buildして検査し、新規ディレクトリへ出力する。既存成果物は上書きしない。"""
     result = build(model)
-    if not result.export_allowed:
-        failures = [c for c in result.report["checks"] if c["status"] == "fail" or (c["rule"] in result.report["required"] and c["status"] != "pass")]
-        raise ValueError("export blocked: " + json.dumps(failures, ensure_ascii=False))
+    _reject_unless_allowed(result.report)
+    tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     target = Path(directory)
     if target.exists():
         raise FileExistsError(f"output directory already exists: {target}")
@@ -125,14 +134,23 @@ def export(model: Model, directory: str | Path) -> dict:
     with tempfile.TemporaryDirectory(prefix=".typedsolid-", dir=target.parent) as staging:
         root = Path(staging)
         files = {}
+        mesh_checks: list[dict] = []
         for part_id, shape in result.shapes.items():
             # 公開Buildを変更してもexportには流用しない。必ず上で検査したshapeを使う。
             for suffix in ("stl", "step"):
                 path = root / f"{part_id}.{suffix}"
                 cq.exporters.export(shape, str(path), tolerance=0.01, angularTolerance=0.1)
-                if path.stat().st_size == 0:
+                content = path.read_bytes()
+                if not content:
                     raise ValueError(f"empty export: {part_id}.{suffix}")
-                files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+                files[path.name] = hashlib.sha256(content).hexdigest()
+                if suffix == "stl":
+                    volume = sum(abs(s.Volume()) for s in shape.Solids())
+                    mesh_checks += json.loads(_native.inspect_mesh(content, part_id, volume, tolerance))
+        # meshは書き出し後にしか検査できない。failならstagingごと破棄し、targetを作らない。
+        report = copy.deepcopy(result.report)
+        report["checks"] = [c for c in report["checks"] if c["rule"] not in MESH_RULES] + mesh_checks
+        _reject_unless_allowed(report)
         # 保存bytesとdigestを同一の値から得る。model.jsonの再hashで照合できるようにする。
         model_bytes = (result.model_json + "\n").encode("utf-8")
         (root / "model.json").write_bytes(model_bytes)
@@ -140,7 +158,7 @@ def export(model: Model, directory: str | Path) -> dict:
             "schema_version": 1, "units": "mm", "cadquery": version("cadquery"),
             "cadquery_ocp": version("cadquery-ocp"),
             "model_sha256": hashlib.sha256(model_bytes).hexdigest(),
-            "files_sha256": files, "report": result.report,
+            "files_sha256": files, "report": report,
             "notice": "Only listed checks were evaluated. This is not a printability or structural safety certification.",
         }
         (root / "report.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
