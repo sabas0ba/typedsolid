@@ -13,6 +13,8 @@
 | maturin | 1.15.0 | 2026-08-24。PyPI表示のmaintainerは2名。Trusted Publishingとrelease workflowのprovenanceを確認 |
 | CadQuery | 2.8.0 | 2026-06-21。PyPI表示のmaintainerは3名。Trusted Publishingは未使用。coreから分離したoptional backendとして採用 |
 | actions/checkout | v7.0.1 / `3d3c42e5aac5ba805825da76410c181273ba90b1` | GitHub公式。2026-07-20公開、releaseとcommitを照合。credential永続化を無効化 |
+| nixpkgs | `597283ad8aa0b331c788e97c4c262d58877074ef` (nixos-26.05) | 開発シェルの周辺ツール。NixOS公式。flake.lockにrevisionとnarHashで固定 |
+| fenix | `9efa138447c5773995d98d9aafa9eba4982aceab` (2026-09-08) | 開発シェルのRust toolchain構成。nix-community org、maintainerは2名 |
 
 CadQueryは13の通常依存を宣言し、OCCT/VTK、数値計算、trame系の推移依存を持つ。Python lock全45件のうちmaturin以外はこのbackend側である。代表的な経路は`cadquery → trame → trame-server → wslink → aiohttp → multidict`で5段ある。coreだけの利用時にCadQueryをimportしないテストを設ける。solver、GUI server、viewer追加依存は導入しない。trame等はCadQueryの通常依存として含まれるが、このprojectからserverを起動しない。
 
