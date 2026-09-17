@@ -1,4 +1,4 @@
-"""軸平行boxのunion-minus-cutsをCadQueryに変換する実験的backend。"""
+"""軸平行primitiveのunion-minus-cutsをCadQueryに変換する実験的backend。"""
 
 from __future__ import annotations
 
@@ -24,16 +24,95 @@ VOLUME_TOLERANCE = 1e-7
 # 1e-9 mm³であり、接触判定の許容差を流用すると正当な最小形状を無効と判定するため、
 # 目的の異なる閾値として独立に定義する。
 EMPTY_VOLUME_TOLERANCE = 1e-12
+# accessの掃引をモデル境界の外へ出す余裕。単位はmm。
+EXIT_MARGIN_MM = 2.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
 )
 # 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
 MESH_RULES = ("mesh_manifold", "mesh_volume")
+AXES = "xyz"
+# 各軸の負側・正側の面名。indexは軸番号に対応する。
+NEGATIVE_FACES = ("minus_x", "minus_y", "minus_z")
+POSITIVE_FACES = ("plus_x", "plus_y", "plus_z")
 
 
-def _box(bounds: dict) -> cq.Solid:
-    lo, hi = bounds["min"], bounds["max"]
-    return cq.Solid.makeBox(*(hi[i] - lo[i] for i in range(3)), pnt=cq.Vector(*lo))
+def _perpendicular(axis: int) -> list[int]:
+    """軸に垂直な2軸のindex。cylinderのcenterはこの順に並ぶ。"""
+    return [index for index in range(3) if index != axis]
+
+
+def _aabb(shape: dict) -> tuple[list[float], list[float]]:
+    """軸平行境界box。keepoutの膨張とaccessの掃引はこれを基準にする。"""
+    if shape["kind"] == "box":
+        return list(shape["min"]), list(shape["max"])
+    axis = AXES.index(shape["axis"])
+    low, high = [0.0] * 3, [0.0] * 3
+    low[axis], high[axis] = shape["span"]
+    for slot, index in enumerate(_perpendicular(axis)):
+        low[index] = shape["center"][slot] - shape["radius"]
+        high[index] = shape["center"][slot] + shape["radius"]
+    return low, high
+
+
+def _solid(shape: dict) -> cq.Solid:
+    if shape["kind"] == "box":
+        lo, hi = shape["min"], shape["max"]
+        return cq.Solid.makeBox(*(hi[i] - lo[i] for i in range(3)), pnt=cq.Vector(*lo))
+    axis = AXES.index(shape["axis"])
+    origin, direction = [0.0] * 3, [0.0] * 3
+    origin[axis] = shape["span"][0]
+    direction[axis] = 1.0
+    for slot, index in enumerate(_perpendicular(axis)):
+        origin[index] = shape["center"][slot]
+    height = shape["span"][1] - shape["span"][0]
+    return cq.Solid.makeCylinder(
+        shape["radius"], height, pnt=cq.Vector(*origin), dir=cq.Vector(*direction)
+    )
+
+
+def _box_solid(bounds: tuple[list[float], list[float]]) -> cq.Solid:
+    low, high = bounds
+    return _solid({"kind": "box", "min": low, "max": high})
+
+
+def _expanded(shape: dict, clearance: dict) -> tuple[list[float], list[float]]:
+    """面ごとのclearanceでkeepoutのAABBを広げる。未指定の面にはdefaultを使う。"""
+    low, high = _aabb(shape)
+    default = clearance["default"]
+    return (
+        [low[i] - clearance.get(NEGATIVE_FACES[i], default) for i in range(3)],
+        [high[i] + clearance.get(POSITIVE_FACES[i], default) for i in range(3)],
+    )
+
+
+def _corridor(
+    bounds: tuple[list[float], list[float]],
+    direction: str,
+    model: tuple[list[float], list[float]],
+) -> tuple[tuple[list[float], list[float]], float]:
+    """指定方向へモデル境界の外まで掃引した領域と、その到達位置。"""
+    low, high = list(bounds[0]), list(bounds[1])
+    axis = AXES.index(direction[-1])
+    if direction.startswith("plus"):
+        high[axis] = max(model[1][axis] + EXIT_MARGIN_MM, high[axis])
+        return (low, high), high[axis]
+    low[axis] = min(model[0][axis] - EXIT_MARGIN_MM, low[axis])
+    return (low, high), low[axis]
+
+
+def _model_bounds(data: dict) -> tuple[list[float], list[float]]:
+    """全部品の付加形状を含むAABB。"""
+    boxes = [
+        _aabb(feature["shape"])
+        for part in data["parts"]
+        for feature in part["features"]
+        if feature["operation"] == "add"
+    ]
+    return (
+        [min(box[0][i] for box in boxes) for i in range(3)],
+        [max(box[1][i] for box in boxes) for i in range(3)],
+    )
 
 
 def _check(rule: str, target: str, passed: bool, message: str) -> dict:
@@ -71,13 +150,13 @@ def build(model: Model) -> Build:
     geometry: list[dict] = []
     try:
         for part in data["parts"]:
-            additives = [_box(f["bounds"]) for f in part["features"] if f["operation"] == "add"]
+            additives = [_solid(f["shape"]) for f in part["features"] if f["operation"] == "add"]
             shape: cq.Shape = additives[0]
             for additive in additives[1:]:
                 shape = shape.fuse(additive)
             for feature in part["features"]:
                 if feature["operation"] == "cut":
-                    shape = shape.cut(_box(feature["bounds"]))
+                    shape = shape.cut(_solid(feature["shape"]))
             shape = shape.clean()
             solids = shape.Solids()
             volume = sum(abs(s.Volume()) for s in solids)
@@ -86,21 +165,22 @@ def build(model: Model) -> Build:
             geometry.append(_check("single_solid", part["id"], len(solids) == 1, f"final solid count: {len(solids)}"))
             shapes[part["id"]] = shape
 
-        # 全部品の最高点まで延長することで、上方に別部品がある場合も検査する。
-        z_exit = max(f["bounds"]["max"][2] for p in data["parts"] for f in p["features"] if f["operation"] == "add") + 2.0
+        # モデル全体の外まで掃引することで、経路上に別部品がある場合も検査する。
+        model_bounds = _model_bounds(data)
         for keepout in data["keepouts"]:
-            margin = keepout["clearance_mm"]
-            bounds = {"min": [v - margin for v in keepout["bounds"]["min"]], "max": [v + margin for v in keepout["bounds"]["max"]]}
-            volume_shape = _box(bounds)
+            clearance = keepout["clearance_mm"]
+            bounds = _expanded(keepout["shape"], clearance)
+            volume_shape = _box_solid(bounds)
+            clearance_text = ", ".join(f"{face}={value}" for face, value in clearance.items())
             for part_id, shape in shapes.items():
                 overlap = _overlap(shape, volume_shape)
-                geometry.append(_check("keepout_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³; clearance: {margin} mm"))
-            if keepout["access"] == "plus_z":
-                corridor = {"min": bounds["min"], "max": [bounds["max"][0], bounds["max"][1], max(z_exit, bounds["max"][2])]}
-                sweep = _box(corridor)
+                geometry.append(_check("keepout_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³; clearance: {clearance_text}"))
+            for direction in keepout["access"]:
+                corridor, exit_at = _corridor(bounds, direction, model_bounds)
+                sweep = _box_solid(corridor)
                 for part_id, shape in shapes.items():
                     overlap = _overlap(shape, sweep)
-                    geometry.append(_check("access_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"+Z straight access overlap: {overlap:.9g} mm³; exit z={corridor['max'][2]} mm"))
+                    geometry.append(_check("access_clearance", f"{keepout['id']}/{part_id}/{direction}", overlap <= VOLUME_TOLERANCE, f"{direction} straight access overlap: {overlap:.9g} mm³; exit at {exit_at} mm"))
         for (left, a), (right, b) in combinations(shapes.items(), 2):
             overlap = _overlap(a, b)
             geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³"))
@@ -155,6 +235,7 @@ def export(model: Model, directory: str | Path) -> dict:
         model_bytes = (result.model_json + "\n").encode("utf-8")
         (root / "model.json").write_bytes(model_bytes)
         manifest = {
+            # report.json自体の形式版。意味モデルの版はmodel.jsonが持つ。
             "schema_version": 1, "units": "mm", "cadquery": version("cadquery"),
             "cadquery_ocp": version("cadquery-ocp"),
             "model_sha256": hashlib.sha256(model_bytes).hexdigest(),

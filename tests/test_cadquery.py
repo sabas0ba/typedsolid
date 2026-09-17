@@ -1,6 +1,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import struct
 import tempfile
@@ -10,7 +11,7 @@ from unittest.mock import patch
 import cadquery as cq
 
 from examples.board_tray import board_tray
-from typedsolid import Box, Feature, Keepout, Model, Part, Policy
+from typedsolid import Box, Clearance, Cylinder, Feature, Keepout, Model, Part, Policy, hole
 from typedsolid.cadquery import build, export
 
 
@@ -79,9 +80,50 @@ class CadQueryTests(unittest.TestCase):
         self.assertTrue(failures(build(replace(block(), keepouts=(keepout,))), "keepout_clearance"))
 
     def test_margin_is_measured_on_final_geometry(self):
-        keepout = Keepout("pcb", Box((10.25, 1, 1), (12, 2, 2)), 0.5)
+        keepout = Keepout("pcb", Box((10.25, 1, 1), (12, 2, 2)), Clearance(default=0.5))
         self.assertTrue(failures(build(replace(block(), keepouts=(keepout,))), "keepout_clearance"))
-        self.assertTrue(build(replace(block(), keepouts=(replace(keepout, clearance_mm=0),))).export_allowed)
+        relaxed = replace(keepout, clearance_mm=Clearance(default=0))
+        self.assertTrue(build(replace(block(), keepouts=(relaxed,))).export_allowed)
+
+    def test_clearance_applies_per_face(self):
+        # blockはx=0..10。-X側に0.5 mmの間隔しかないkeepoutを置く。
+        keepout = Keepout("pcb", Box((10.5, 1, 1), (12, 2, 2)), Clearance(default=1.0))
+        self.assertTrue(failures(build(replace(block(), keepouts=(keepout,))), "keepout_clearance"))
+        # 接する面だけを0にすれば、他の面の要求は残したまま通る。
+        relaxed = replace(keepout, clearance_mm=Clearance(default=1.0, minus_x=0.0))
+        self.assertTrue(build(replace(block(), keepouts=(relaxed,))).export_allowed)
+
+    def test_cylinder_volume_matches_the_analytic_value(self):
+        model = Model((Part("post", (Feature("stem", Cylinder("z", (0, 0), 2.0, (0, 10))),)),))
+        result = build(model)
+        self.assertTrue(result.export_allowed, result.report)
+        volume = sum(s.Volume() for s in result.shapes["post"].Solids())
+        self.assertAlmostEqual(volume, math.pi * 4.0 * 10.0, places=6)
+
+    def test_cylinder_axes_follow_the_declared_direction(self):
+        for axis, expected in (("x", (0, 1)), ("y", (1, 0)), ("z", (2, 0))):
+            with self.subTest(axis=axis):
+                model = Model((Part("post", (Feature("stem", Cylinder(axis, (0, 0), 2.0, (0, 10))),)),))
+                box = build(model).shapes["post"].BoundingBox()
+                lengths = (box.xlen, box.ylen, box.zlen)
+                self.assertAlmostEqual(lengths[expected[0]], 10.0, places=6)
+                self.assertAlmostEqual(lengths[expected[1]], 4.0, places=6)
+
+    def test_hole_removes_material(self):
+        drilled = add_feature(block(), hole("bore", "z", (5, 5), 4.0, (-1, 11)))
+        result = build(drilled)
+        self.assertTrue(result.export_allowed, result.report)
+        volume = sum(s.Volume() for s in result.shapes["block"].Solids())
+        self.assertAlmostEqual(volume, 1000 - math.pi * 4.0 * 10.0, places=5)
+
+    def test_access_is_checked_in_each_declared_direction(self):
+        # blockの-X側に接するkeepout。-Xは開いており、+Xはblockが塞ぐ。
+        keepout = Keepout("pcb", Box((-3, 1, 1), (-1, 2, 2)), Clearance(default=0.0))
+        opened = build(replace(block(), keepouts=(replace(keepout, access=("minus_x",)),)))
+        self.assertTrue(opened.export_allowed, opened.report)
+        blocked = build(replace(block(), keepouts=(replace(keepout, access=("plus_x",)),)))
+        self.assertTrue(failures(blocked, "access_clearance"))
+        self.assertEqual(failures(blocked, "access_clearance")[0]["target"], "pcb/block/plus_x")
 
     def test_access_blocked_even_when_keepout_is_empty(self):
         model = board_tray()
@@ -107,7 +149,7 @@ class CadQueryTests(unittest.TestCase):
                 self.assertFalse(build(model).export_allowed)
 
     def test_kernel_exception_is_not_a_pass(self):
-        with patch("typedsolid.cadquery._box", side_effect=RuntimeError("kernel failed")):
+        with patch("typedsolid.cadquery._solid", side_effect=RuntimeError("kernel failed")):
             result = build(block())
         self.assertFalse(result.export_allowed)
         self.assertEqual(result.shapes, {})

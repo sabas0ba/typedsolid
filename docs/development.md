@@ -36,32 +36,33 @@ Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative modu
 .venv/bin/python examples/board_tray.py --output .work/board-tray-v2
 ```
 
-出力は`board_tray.stl`、`board_tray.step`、`model.json`、`report.json`。STLは1部品分。作例は60×40×20 mm、底・壁厚2 mm、4個の支持padを持つトレイである。44×24×3 mmの説明用基板領域をz=4 mmに確保し、+Zへ抜けることを検査する。支持面接触のためclearance=0を明示し、壁との間隔は6 mm以上設ける。基板固定機構・実基板寸法・ネジ穴はまだ含まないため、完成した実機筐体ではない。
+出力は`board_tray.stl`、`board_tray.step`、`model.json`、`report.json`。STLは1部品分。作例は60×40×20 mm、底・壁厚2 mm、φ6 mmの支持pad 4個と、それを貫くφ2.5 mmのネジ下穴を持つトレイである。44×24×3 mmの説明用基板領域をz=4 mmに確保し、+Zへ抜けることを検査する。支持面へ接触させるため下面のclearanceだけを0とし、他の面は0.5 mmを確保する。壁との間隔は6 mm以上ある。実基板寸法、ネジ・インサートの仕様、蓋は含まないため、完成した実機筐体ではない。
 
-![最終形状と基板確保領域](assets/board-tray.png)
+![最終形状と基板確保領域](assets/board-tray.svg)
 
 濃色の線が出力対象、緑色がSTLに含まれない基板確保領域である。previewは最終CadQuery shapeにOCCTの隠線処理を適用して生成する。+Zアクセスは検査結果としてreport.jsonに記録する。
 
 ```bash
-.venv/bin/python scripts/render-example.py --output .work/board-tray.svg
+.venv/bin/python scripts/render-example.py --output docs/assets/board-tray.svg
 ```
 
-文書掲載のPNGはこのSVGを既存のInkscapeで変換したもの。PNG変換は任意で、Inkscapeを通常の開発依存には含めない。
+作例を変更した場合はSVGを再生成する。ラスタ画像は変換ツールを開発依存に加えることになるため用意しない。
 
 API使用例:
 
 ```python
-from typedsolid import Box, Feature, Model, Part
+from typedsolid import Box, Feature, Model, Part, hole
 from typedsolid.cadquery import export
 
 model = Model(parts=(Part("plate", (
     Feature("base", Box((0, 0, 0), (40, 30, 2)), role="base"),
+    hole("bore", "z", (20, 15), 3.0, (-1, 3)),
 )),))
 print(model.preflight())
 export(model, ".work/plate")
 ```
 
-全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。最終肉厚やサポート不要を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。最終肉厚やサポート不要を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
 
 ## 依存更新
 
