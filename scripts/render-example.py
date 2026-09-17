@@ -36,7 +36,8 @@ def render(output):
             outer = svg.find(f"{{{NS}}}g")
             overlay = ET.SubElement(outer, f"{{{NS}}}g", stroke="#209059", fill="none", **{"stroke-width": "0.4"})
             for keepout in model.keepouts:
-                lo, hi = keepout.bounds.min, keepout.bounds.max
+                # keepoutはboxに限定されている。
+                lo, hi = keepout.shape.min, keepout.shape.max
                 bounds = cq.Solid.makeBox(*(hi[i] - lo[i] for i in range(3)), pnt=cq.Vector(*lo))
                 region_svg = ET.fromstring(cq.exporters.getSVG(bounds, options))
                 for path in region_svg.iter(f"{{{NS}}}path"):
@@ -45,7 +46,7 @@ def render(output):
         title = ET.SubElement(document, f"{{{NS}}}text", x=str(40 + index * 700), y="55", fill="#293a4c", **{"font-family": "sans-serif", "font-size": "24"})
         title.text = "Final solid | 60 x 40 x 20 mm" if index == 0 else "PCB reserved volume (green overlay)"
     caption = ET.SubElement(document, f"{{{NS}}}text", x="40", y="665", fill="#40546a", **{"font-family": "sans-serif", "font-size": "20"})
-    caption.text = "TypedSolid: four support pads; open top; +Z access verified. PCB volume is not exported."
+    caption.text = "TypedSolid: four cylindrical pads with screw holes; open top; +Z access verified. PCB volume is not exported."
     output.parent.mkdir(parents=True, exist_ok=True)
     ET.indent(document, space="  ")
     ET.ElementTree(document).write(output, encoding="utf-8", xml_declaration=True)

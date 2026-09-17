@@ -14,8 +14,8 @@
 | 1 STL＝1部品 | 検査済みPartごとにSTL/STEPを出力 | 対応 |
 | 出力STLが閉じた立体である | 書き出したmeshのmanifold性、向き、連結成分、体積を検査 | 対応 |
 | 細く折れやすい箇所を減らす | primitive寸法、最終肉厚、接続部断面、荷重・積層方向を段階的に評価 | primitive最小寸法のみ |
-| 基板等のスペース確保 | clearanceで拡張したkeepoutと最終形状の交差体積を評価 | 軸平行boxに対応 |
-| アクセスの確保 | 部品・工具の移動領域と形状の干渉検査 | 全部品に対する+Z直線経路のみ |
+| 基板等のスペース確保 | clearanceで拡張したkeepoutと最終形状の交差体積を評価 | 軸平行box、面ごとのclearance |
+| アクセスの確保 | 部品・工具の移動領域と形状の干渉検査 | 全部品に対する6方向の直線経路 |
 | サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 未対応 |
 | 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 未対応 |
 
@@ -32,16 +32,25 @@
 
 JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価しない。今後の性能測定で問題になるまで、独自の複雑なFFIオブジェクト共有を導入しない。
 
-## IR v1
+## IR v2
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換・材料はまだ扱わない。
-- `Model`は`schema_version=1`、`parts`、`keepouts`、`policy`を持つ。
+- `Model`は`schema_version=2`、`parts`、`keepouts`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
-- `Feature`は軸平行box、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
+- `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
+- `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
+- 穴は`operation=cut`のcylinder、bossは`add`のcylinderで表す。面取り・filletはOCCTのedge選択に依存するため導入しない。
 - Booleanの意味は「すべてのAddの和から、すべてのCutを引く」。記述順依存の逐次CSGではない。Cutは生成用であり、最小feature寸法ルールの対象外。
-- `Keepout`は確保領域と一様clearanceを持つ。`access=plus_z`はclearance込み断面を全部品の最高点より2 mm上まで掃引した領域を検査する。
+- 最小feature寸法はprimitiveの寸法を測る。cylinderは直径と高さの小さい方とする。
+- `Keepout`は確保領域と面ごとのclearance、access方向の集合を持つ。`clearance_mm`は`default`と面名 (`minus_x`等) の上書きからなる。支持面へ接触させる面だけを0にでき、他の面の要求は残る。
+- `access`は6方向から選ぶ。各方向についてclearance込みの断面を、全部品のAABBの外側2 mmまで掃引した領域を検査する。
+- keepoutはboxに限る。面別clearanceと6方向accessはboxの面を前提とするため、cylinderのkeepoutは受理しない。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
-- 座標±1,000,000 mm、box寸法0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+
+### v1からの昇格
+
+`schema_version=1`のJSONは読み込み時にv2へ変換する。v1は軸平行box、一様clearance、単一accessだけを表現できるため、対応は一意に定まる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。出力は常にv2で、v1では書き出さない。
 
 ## 検査と出力
 
@@ -69,7 +78,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ## CadQuery/OCCT依存への対策
 
-永続的な意味IDはIRのPart/Featureに置き、face番号やedge列挙順に置かない。初期実装はboxとBooleanに限定し、fragileなface selectorを使用しない。Boolean後のface→feature対応は現段階で保証しない。
+永続的な意味IDはIRのPart/Featureに置き、face番号やedge列挙順に置かない。primitiveは軸平行のboxとcylinderに限定し、fragileなface selectorを使用しない。Boolean後のface→feature対応は現段階で保証しない。
 
 backend例外、無効形状、空形状をfailとして保持する。依存を固定し、版更新時は孤立・切断・空形状・干渉・アクセス・STEP再読込の回帰テストを行う。STLのバイト一致ではなく、寸法・体積・接続性と検査結果を比較する。カーネルのhard crashやhangはPython例外処理では隔離できないため、将来worker processとtimeoutを導入する。
 

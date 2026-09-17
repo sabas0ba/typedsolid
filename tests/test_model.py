@@ -2,7 +2,7 @@ from dataclasses import replace
 import json
 import unittest
 
-from typedsolid import Box, Feature, Keepout, Model, Part, Policy
+from typedsolid import Box, Clearance, Cylinder, Feature, Keepout, Model, Part, Policy, hole
 from typedsolid import _native
 
 
@@ -28,7 +28,45 @@ class ModelTests(unittest.TestCase):
     def test_invalid_clearance(self):
         for value in [-1, float("nan"), float("inf")]:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                replace(block(), keepouts=(Keepout("pcb", Box((0, 0, 0), (1, 1, 1)), value),)).to_json()
+                keepout = Keepout("pcb", Box((0, 0, 0), (1, 1, 1)), Clearance(default=value))
+                replace(block(), keepouts=(keepout,)).to_json()
+            with self.subTest(face=value), self.assertRaises(ValueError):
+                keepout = Keepout("pcb", Box((0, 0, 0), (1, 1, 1)), Clearance(minus_z=value))
+                replace(block(), keepouts=(keepout,)).to_json()
+
+    def test_unset_faces_are_omitted(self):
+        keepout = Keepout("pcb", Box((0, 0, 0), (1, 1, 1)), Clearance(default=0.5, minus_z=0.0))
+        data = json.loads(replace(block(), keepouts=(keepout,)).to_json())
+        self.assertEqual(data["keepouts"][0]["clearance_mm"], {"default": 0.5, "minus_z": 0.0})
+
+    def test_cylinder_round_trips(self):
+        part = Part("post", (Feature("stem", Cylinder("z", (0, 0), 2.0, (0, 10))),))
+        data = json.loads(Model((part,)).to_json())
+        self.assertEqual(
+            data["parts"][0]["features"][0]["shape"],
+            {"kind": "cylinder", "axis": "z", "center": [0, 0], "radius": 2.0, "span": [0, 10]},
+        )
+
+    def test_hole_is_a_cut_cylinder(self):
+        feature = hole("screw", "z", (5, 5), 3.0, (-1, 5))
+        self.assertEqual(feature.operation, "cut")
+        self.assertEqual(feature.shape.radius, 1.5)
+
+    def test_schema_v1_is_accepted(self):
+        v1 = {
+            "schema_version": 1, "units": "mm",
+            "parts": [{"id": "block", "features": [
+                {"id": "body", "role": "generic", "operation": "add",
+                 "bounds": {"min": [0, 0, 0], "max": [10, 10, 10]}}]}],
+            "keepouts": [{"id": "pcb", "bounds": {"min": [1, 1, 1], "max": [2, 2, 2]},
+                          "clearance_mm": 0.25, "access": "plus_z"}],
+            "policy": {"min_feature_mm": 1.2, "required": ["single_solid"]},
+        }
+        upgraded = json.loads(_native.normalize_model(json.dumps(v1)))
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["parts"][0]["features"][0]["shape"]["kind"], "box")
+        self.assertEqual(upgraded["keepouts"][0]["clearance_mm"], {"default": 0.25})
+        self.assertEqual(upgraded["keepouts"][0]["access"], ["plus_z"])
 
     def test_preflight_does_not_approve_geometry(self):
         self.assertFalse(_native.export_allowed(json.dumps(block().preflight())))
@@ -50,6 +88,6 @@ class ModelTests(unittest.TestCase):
             _native.normalize_model(json.dumps(data))
 
     def test_wrong_units_and_schema_rejected(self):
-        for model in [replace(block(), units="in"), replace(block(), schema_version=2)]:
+        for model in [replace(block(), units="in"), replace(block(), schema_version=3)]:
             with self.assertRaises(ValueError):
                 model.to_json()
