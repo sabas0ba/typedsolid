@@ -1,6 +1,7 @@
 //! CADカーネルから独立した意味モデルとpreflight検証。
 
 pub mod mesh;
+pub mod voxel;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -184,6 +185,28 @@ impl Shape {
     pub fn is_box(&self) -> bool {
         matches!(self, Self::Box { .. })
     }
+
+    /// 点が形状の内部または境界にあるか。rasterizeはvoxel中心をこの判定にかける。
+    pub fn contains(&self, point: [f64; 3]) -> bool {
+        match self {
+            Self::Box { min, max } => (0..3).all(|i| point[i] >= min[i] && point[i] <= max[i]),
+            Self::Cylinder {
+                axis,
+                center,
+                radius,
+                span,
+            } => {
+                let along = point[axis.index()];
+                if along < span[0] || along > span[1] {
+                    return false;
+                }
+                let [first, second] = axis.plane();
+                let du = point[first] - center[0];
+                let dv = point[second] - center[1];
+                du * du + dv * dv <= radius * radius
+            }
+        }
+    }
 }
 
 /// 面ごとのclearance。指定のない面にはdefaultを適用する。
@@ -242,6 +265,32 @@ pub struct Part {
     pub features: Vec<Feature>,
 }
 
+impl Part {
+    /// 付加形状を含むAABB。cutは範囲を広げないため対象にしない。
+    pub fn bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        let mut result: Option<([f64; 3], [f64; 3])> = None;
+        for feature in self
+            .features
+            .iter()
+            .filter(|f| f.operation == Operation::Add)
+        {
+            let (low, high) = feature.shape.aabb();
+            result = Some(match result {
+                None => (low, high),
+                Some((current_low, current_high)) => {
+                    let mut merged = (current_low, current_high);
+                    for axis in 0..3 {
+                        merged.0[axis] = merged.0[axis].min(low[axis]);
+                        merged.1[axis] = merged.1[axis].max(high[axis]);
+                    }
+                    merged
+                }
+            });
+        }
+        result
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keepout {
@@ -277,13 +326,15 @@ pub enum Rule {
     MeshManifold,
     MeshVolume,
     FinalWallThickness,
+    NeckSection,
+    ClosedCavity,
     SupportFree,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -293,9 +344,18 @@ impl Rule {
         Self::MeshManifold,
         Self::MeshVolume,
         Self::FinalWallThickness,
+        Self::NeckSection,
+        Self::ClosedCavity,
         Self::SupportFree,
         Self::Strength,
         Self::Thermal,
+    ];
+
+    /// voxel化した最終形状から判定するrule。
+    pub const VOXEL: [Self; 3] = [
+        Self::FinalWallThickness,
+        Self::NeckSection,
+        Self::ClosedCavity,
     ];
 }
 
@@ -306,11 +366,33 @@ pub struct Policy {
     /// 出力STLとsolidの体積差の相対許容量。tessellationの弦誤差を吸収する。
     #[serde(default = "default_mesh_volume_tolerance")]
     pub mesh_volume_tolerance: f64,
+    /// 最終形状をrasterizeする格子の間隔。単位はmm。細かいほど検査は正確になり、
+    /// cell数は3乗で増える。
+    #[serde(default = "default_voxel_mm")]
+    pub voxel_mm: f64,
+    /// 最終形状に要求する最小肉厚。単位はmm。primitive寸法とは別に指定する。
+    #[serde(default = "default_min_wall_mm")]
+    pub min_wall_mm: f64,
+    /// 接続部に要求する最小断面。単位はmm。
+    #[serde(default = "default_min_neck_mm")]
+    pub min_neck_mm: f64,
     pub required: Vec<Rule>,
 }
 
 fn default_mesh_volume_tolerance() -> f64 {
     0.01
+}
+
+fn default_voxel_mm() -> f64 {
+    0.2
+}
+
+fn default_min_wall_mm() -> f64 {
+    1.2
+}
+
+fn default_min_neck_mm() -> f64 {
+    1.2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +509,18 @@ impl Model {
         if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
             return Err("mesh_volume_tolerance must be finite and in [0, 1]".into());
         }
+        let pitch = self.policy.voxel_mm;
+        if !pitch.is_finite() || !(0.01..=10.0).contains(&pitch) {
+            return Err("voxel_mm must be finite and in [0.01, 10]".into());
+        }
+        for (name, value) in [
+            ("min_wall_mm", self.policy.min_wall_mm),
+            ("min_neck_mm", self.policy.min_neck_mm),
+        ] {
+            if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
+                return Err(format!("{name} must be finite and in [0.01, 1000]"));
+            }
+        }
         let mut required = BTreeSet::new();
         for rule in &self.policy.required {
             if !required.insert(rule) {
@@ -455,6 +549,17 @@ impl Model {
                     .shape
                     .validate()
                     .map_err(|e| format!("{}/{}: {e}", part.id, feature.id))?;
+            }
+            // rasterizeできない大きさを受理して評価時に失敗させるより、入力の時点で拒否する。
+            match voxel::grid_cells(part, pitch) {
+                Some(cells) if cells <= voxel::MAX_GRID_CELLS => {}
+                _ => {
+                    return Err(format!(
+                        "{} exceeds the voxel grid limit of {} cells at voxel_mm={pitch}; use a coarser grid or split the part",
+                        part.id,
+                        voxel::MAX_GRID_CELLS
+                    ));
+                }
             }
         }
         let mut ids = BTreeSet::new();
@@ -571,6 +676,9 @@ mod tests {
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
+                voxel_mm: 0.2,
+                min_wall_mm: 1.2,
+                min_neck_mm: 1.2,
                 required: vec![Rule::SingleSolid],
             },
         }

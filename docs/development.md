@@ -81,7 +81,9 @@ print(model.preflight())
 export(model, ".work/plate")
 ```
 
-全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。最終肉厚やサポート不要を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。サポート不要や応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+
+最終肉厚・接続部断面・閉空洞はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約4秒、0.4 mmで約0.5秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
 ## 依存更新
 

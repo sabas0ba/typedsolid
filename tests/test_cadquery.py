@@ -38,7 +38,7 @@ class CadQueryTests(unittest.TestCase):
         self.assertTrue(result.export_allowed, result.report)
         self.assertEqual(len(result.shapes["board_tray"].Solids()), 1)
         # meshはbuildでは評価できない。exportがSTLを書き出してから判定する。
-        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"mesh_manifold", "mesh_volume", "final_wall_thickness", "support_free", "strength", "thermal"})
+        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"mesh_manifold", "mesh_volume", "support_free", "strength", "thermal"})
 
     def test_disconnected_feature(self):
         result = build(add_feature(block(), Feature("island", Box((20, 0, 0), (25, 5, 5)))))
@@ -58,22 +58,50 @@ class CadQueryTests(unittest.TestCase):
     def test_minimum_size_box_is_a_valid_solid(self):
         # 実装上の最小box寸法0.001 mmの立方体は1e-9 mm³であり、
         # 交差判定の許容差1e-7 mm³を空判定に流用すると無効と扱われる。
+        # voxel格子 (下限0.01 mm) より小さいため最終形状は評価できず、
+        # neck_sectionは別途failする。exportはそれを理由に拒否される。
         model = Model(
             (Part("speck", (Feature("body", Box((0, 0, 0), (0.001, 0.001, 0.001))),)),),
             policy=Policy(min_feature_mm=0.001),
         )
         result = build(model)
         self.assertFalse(failures(result, "valid_solid"), result.report)
-        self.assertTrue(result.export_allowed, result.report)
+        self.assertFalse(failures(result, "single_solid"), result.report)
 
     def test_thin_additive_feature(self):
         model = Model((Part("plate", (Feature("thin", Box((0, 0, 0), (10, 10, 0.4))),)),))
         self.assertTrue(failures(build(model), "feature_thickness"))
 
-    def test_post_cut_thickness_remains_unknown(self):
-        model = add_feature(block(), Feature("pocket", Box((0.1, 0.1, 0.1), (9.9, 9.9, 11)), operation="cut"))
-        policy = replace(model.policy, required=(*model.policy.required, "final_wall_thickness"))
-        self.assertFalse(build(replace(model, policy=policy)).export_allowed)
+    def test_post_cut_thickness_is_measured(self):
+        # primitiveはどれも厚い。壁が薄くなるのはcutの後だけである。
+        model = add_feature(block(), Feature("pocket", Box((0.4, 0.4, 0.4), (9.6, 9.6, 11)), operation="cut"))
+        result = build(model)
+        self.assertFalse(failures(result, "feature_thickness"))
+        self.assertTrue(failures(result, "final_wall_thickness"), result.report)
+        self.assertFalse(result.export_allowed)
+
+    def test_thick_shell_passes_wall_thickness(self):
+        model = add_feature(block(), Feature("pocket", Box((2, 2, 2), (8, 8, 11)), operation="cut"))
+        result = build(model)
+        self.assertFalse(failures(result, "final_wall_thickness"), result.report)
+        self.assertTrue(result.export_allowed, result.report)
+
+    def test_sealed_cavity_blocks_export(self):
+        model = add_feature(block(), Feature("void", Box((3, 3, 3), (7, 7, 7)), operation="cut"))
+        result = build(model)
+        self.assertTrue(failures(result, "closed_cavity"), result.report)
+        self.assertFalse(result.export_allowed)
+
+    def test_narrow_neck_blocks_export(self):
+        # 5 mm角の塊2つを1 mm角の首で繋ぐ。単一solidだが断面が足りない。
+        dumbbell = Model((Part("bar", (
+            Feature("left", Box((0, 0, 0), (5, 5, 5))),
+            Feature("neck", Box((5, 2, 2), (7, 3, 3))),
+            Feature("right", Box((7, 0, 0), (12, 5, 5))),
+        )),), policy=Policy(min_wall_mm=0.5))
+        result = build(dumbbell)
+        self.assertFalse(failures(result, "single_solid"), result.report)
+        self.assertTrue(failures(result, "neck_section"), result.report)
 
     def test_keepout_collision(self):
         keepout = Keepout("pcb", Box((1, 1, 1), (2, 2, 2)))

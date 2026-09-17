@@ -13,11 +13,11 @@
 
 - 円柱・穴・boss (対応済み)、寸法型と座標変換。面取りはOCCTのedge選択に依存するため見送る
 - 部品catalog、基板・コネクタ寸法と出典、支持面への接触指定
-- 最終肉厚、接続部断面、slendernessの保守的な検査
-- 閉空洞、印刷姿勢、overhang/bridgeの検査。slicerでの評価との突合
+- 最終肉厚、接続部断面の保守的な検査 (対応済み)。slendernessは後続
+- 閉空洞 (対応済み)、印刷姿勢、overhang/bridgeの検査。slicerでの評価との突合
 - STL meshのmanifold性・接続成分・退化三角形検査 (対応済み)
 
-最終形状に対する検査 (最終肉厚、接続部断面、閉空洞、overhang/bridge) はIRから直接rasterizeしたvoxel上で行い、OCCTのface/edge topologyに依存させない。解像度は`policy.voxel_mm`で指定し、量子化分は失敗側に倒す。
+最終形状に対する検査はIRから直接rasterizeしたvoxel上で行い、OCCTのface/edge topologyに依存させない。解像度は`policy.voxel_mm`で指定し、量子化分は失敗側に倒す。overhang/bridgeも同じoccupancyから判定する。
 
 合格条件: 開口を持つ筐体で、薄肉・折れやすい接続・孤立・支持不能箇所の既知の失敗fixtureを検出し、Tang Nano等の既存ケースへ適用して比較する。
 
