@@ -17,7 +17,7 @@
 | 閉じた空洞を避ける | 最終形状の空領域が外部へ通じているかを検査 | 対応 |
 | 基板等のスペース確保 | clearanceで拡張したkeepoutと最終形状の交差体積を評価 | 軸平行box、面ごとのclearance |
 | アクセスの確保 | 部品・工具の移動領域と形状の干渉検査 | 全部品に対する6方向の直線経路 |
-| サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 未対応 |
+| サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 印刷方向、overhang、bridge |
 | 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 未対応 |
 
 「中空を減らす」は内部を一律に埋める規則にはしない。基板空間・軽量化・放熱と競合するため、閉じた空洞や支持のない天井を制約し、必要な開放空間を保持する。infill率はslicer設定であり、CADの空洞と区別する。
@@ -47,7 +47,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `access`は6方向から選ぶ。各方向についてclearance込みの断面を、全部品のAABBの外側2 mmまで掃引した領域を検査する。
 - keepoutはboxに限る。面別clearanceと6方向accessはboxの面を前提とするため、cylinderのkeepoutは受理しない。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
-- `Policy`は`min_feature_mm`のほか、最終形状の検査に`voxel_mm`、`min_wall_mm`、`min_neck_mm`を持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
+- `Policy`は`min_feature_mm`のほか、最終形状の検査に`voxel_mm`、`min_wall_mm`、`min_neck_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
 - 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
 ### v1からの昇格
@@ -58,9 +58,9 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 検査は`pass / fail / not_evaluated`の3状態とし、rule ID・target ID・理由を保持する。1件でもfailがある場合、またはrequiredルールが全件passでない場合、出力を拒否する。preflightだけでは標準policyの出力条件を満たさない。
 
-標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・access・部品間干渉検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
+標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・access・部品間干渉検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
-`support_free/strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
+`strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
 交差体積は1e-7 mm³を許容差とし、面接触は許容する。印刷公差や嵌合clearanceと、この数値誤差の許容差を混同しない。極小の干渉、STL meshのmanifold性、slicer上の層島・bridge・supportは別の検査が必要である。
 
@@ -68,15 +68,16 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ## 最終形状の検査
 
-`final_wall_thickness`、`neck_section`、`closed_cavity`はIRから直接rasterizeしたvoxel上で判定する。OCCTのface/edge topologyに依存せず、boxとcylinderの内外判定だけで最終形状を得る。Boolean後のface対応を推測しないという方針と整合する。
+`final_wall_thickness`、`neck_section`、`closed_cavity`、`support_free`はIRから直接rasterizeしたvoxel上で判定する。OCCTのface/edge topologyに依存せず、boxとcylinderの内外判定だけで最終形状を得る。Boolean後のface対応を推測しないという方針と整合する。
 
 格子の間隔は`policy.voxel_mm` (既定0.2 mm)、cell数の上限は1 partあたり2億である。上限を超える入力はvalidateで拒否する。cellはvoxel中心で内外を判定するため、形状は最大で格子の半分だけ外側へ膨らむ。要求値に格子1つ分を足して判定し、量子化の誤差を失敗側へ倒す。格子より小さい形状は評価できず、`neck_section`がfailするため出力は拒否される。
 
 - `final_wall_thickness`: 各cellを通る軸方向の連続長のうち最小のものを厚さとする。扱うprimitiveは軸平行に限るため、壁は必ずいずれかの軸に沿って厚さを持つ。球のopeningで測ると角や稜線が必ず除去され、十分に厚い立体まで薄肉と判定されるため採らない。面の縁や稜線は必ず薄くなるので、一辺`min_wall_mm`の立方体に満たない領域は形状の縁として数えない。
 - `neck_section`: 半径`min_neck_mm / 2`でerosionし、6-連結の連結成分が1つに保たれるかを見る。分かれる場合は、その断面で繋がる細い接続部がある。距離場はFelzenszwalb-Huttenlocherの下位包絡線法で求める厳密なEuclidean距離であり、chamfer近似のような方向依存の誤差を持たない。
 - `closed_cavity`: 空cellを格子の外周から6-連結でflood fillし、到達できない空領域を閉空洞とする。格子より細い隙間を通じて外部に通じる空洞は、閉じていると判定される。
+- `support_free`: `policy.build_direction` (既定`plus_z`) の軸で層に分け、各層のcellが直下の層の半径`tan(overhang_angle_deg)` cell以内に材料を持つかを見る。材料が最初に現れる層はbuild plateに接するものとして支持済みとする。直下が支持されているかは問わない。支持の要否は層ごとに独立して評価し、1箇所のoverhangがその上の全体を未支持にすることを避ける。未支持のcellは、同じ層で両端を支持された材料に挟まれ、区間長が`bridge_max_mm`以内であればbridgeとして渡せるものとする。端で終わる区間は片持ちでありbridgeにならない。
 
-この検査は最終形状の幾何を対象とする。印刷姿勢、overhang、bridge、slicer上の層島は別の検査が必要である。
+`support_free`はノズル径、層厚、冷却、材料といったslicerとプリンタの条件を含まない。判定は幾何のみに基づく保守的な近似であり、実際に支持なしで印刷できることを保証しない。slicerでの評価との突合は`docs/development.md`の手順による。
 
 ## 出力meshの検査
 

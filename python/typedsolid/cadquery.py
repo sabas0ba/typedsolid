@@ -32,7 +32,7 @@ GEOMETRY_RULES = (
 # 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
 MESH_RULES = ("mesh_manifold", "mesh_volume")
 # IRから直接rasterizeして判定する。backendのtopologyに依存しない。
-VOXEL_RULES = ("final_wall_thickness", "neck_section", "closed_cavity")
+VOXEL_RULES = ("final_wall_thickness", "neck_section", "closed_cavity", "support_free")
 AXES = "xyz"
 # 各軸の負側・正側の面名。indexは軸番号に対応する。
 NEGATIVE_FACES = ("minus_x", "minus_y", "minus_z")

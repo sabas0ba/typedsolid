@@ -97,10 +97,16 @@ class Policy:
     min_wall_mm: float = 1.2
     # 接続部に要求する最小断面。
     min_neck_mm: float = 1.2
+    # 印刷時に上となる方向。層はこの軸に沿って積む。
+    build_direction: Direction = "plus_z"
+    # 支持なしで許す、印刷方向に対する最大傾斜角。単位は度。
+    overhang_angle_deg: float = 45.0
+    # 両端が支持された未支持区間の許容長。
+    bridge_max_mm: float = 5.0
     required: tuple[Rule, ...] = (
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
-        "final_wall_thickness", "neck_section", "closed_cavity",
+        "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
     )
 
 
