@@ -26,12 +26,14 @@
 
 | 層 | 責務 | 持たない責務 |
 |---|---|---|
-| Python API | typed dataclassによるモデル組立、serialization | 検証の独自再実装 |
+| Python API | typed dataclassによるモデル組立、serialization、部品catalog | 検証の独自再実装 |
 | Rust core | schema、単位、ID、role、入力検証、preflight、出力判定 | OCCTオブジェクト保持 |
 | PyO3 binding | JSON境界でcoreを呼ぶ | CAD処理 |
 | CadQuery backend | IR→形状、最終solid・干渉検査、STL/STEP出力 | 未対応ルールの合格判定 |
 
 JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価しない。今後の性能測定で問題になるまで、独自の複雑なFFIオブジェクト共有を導入しない。
+
+部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
 ## IR v2
 
