@@ -76,6 +76,20 @@ impl Direction {
     }
 }
 
+impl std::fmt::Display for Direction {
+    /// checkのmessageはJSONと同じ綴りで方向を示す。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MinusX => "minus_x",
+            Self::PlusX => "plus_x",
+            Self::MinusY => "minus_y",
+            Self::PlusY => "plus_y",
+            Self::MinusZ => "minus_z",
+            Self::PlusZ => "plus_z",
+        })
+    }
+}
+
 /// 軸平行のprimitive。回転は扱わない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -352,10 +366,11 @@ impl Rule {
     ];
 
     /// voxel化した最終形状から判定するrule。
-    pub const VOXEL: [Self; 3] = [
+    pub const VOXEL: [Self; 4] = [
         Self::FinalWallThickness,
         Self::NeckSection,
         Self::ClosedCavity,
+        Self::SupportFree,
     ];
 }
 
@@ -376,6 +391,15 @@ pub struct Policy {
     /// 接続部に要求する最小断面。単位はmm。
     #[serde(default = "default_min_neck_mm")]
     pub min_neck_mm: f64,
+    /// 印刷時に上となる方向。層はこの軸に沿って積む。
+    #[serde(default = "default_build_direction")]
+    pub build_direction: Direction,
+    /// 支持なしで許す、印刷方向に対する最大傾斜角。単位は度。
+    #[serde(default = "default_overhang_angle_deg")]
+    pub overhang_angle_deg: f64,
+    /// 両端が支持された未支持区間の許容長。単位はmm。
+    #[serde(default = "default_bridge_max_mm")]
+    pub bridge_max_mm: f64,
     pub required: Vec<Rule>,
 }
 
@@ -393,6 +417,18 @@ fn default_min_wall_mm() -> f64 {
 
 fn default_min_neck_mm() -> f64 {
     1.2
+}
+
+fn default_build_direction() -> Direction {
+    Direction::PlusZ
+}
+
+fn default_overhang_angle_deg() -> f64 {
+    45.0
+}
+
+fn default_bridge_max_mm() -> f64 {
+    5.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +556,14 @@ impl Model {
             if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
                 return Err(format!("{name} must be finite and in [0.01, 1000]"));
             }
+        }
+        let overhang = self.policy.overhang_angle_deg;
+        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
+            return Err("overhang_angle_deg must be finite and in [0, 89]".into());
+        }
+        let bridge = self.policy.bridge_max_mm;
+        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
+            return Err("bridge_max_mm must be finite and in [0, 1000]".into());
         }
         let mut required = BTreeSet::new();
         for rule in &self.policy.required {
@@ -679,6 +723,9 @@ mod tests {
                 voxel_mm: 0.2,
                 min_wall_mm: 1.2,
                 min_neck_mm: 1.2,
+                build_direction: Direction::PlusZ,
+                overhang_angle_deg: 45.0,
+                bridge_max_mm: 5.0,
                 required: vec![Rule::SingleSolid],
             },
         }

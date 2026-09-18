@@ -38,7 +38,7 @@ class CadQueryTests(unittest.TestCase):
         self.assertTrue(result.export_allowed, result.report)
         self.assertEqual(len(result.shapes["board_tray"].Solids()), 1)
         # meshはbuildでは評価できない。exportがSTLを書き出してから判定する。
-        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"mesh_manifold", "mesh_volume", "support_free", "strength", "thermal"})
+        self.assertEqual({c["rule"] for c in result.report["checks"] if c["status"] == "not_evaluated"}, {"mesh_manifold", "mesh_volume", "strength", "thermal"})
 
     def test_disconnected_feature(self):
         result = build(add_feature(block(), Feature("island", Box((20, 0, 0), (25, 5, 5)))))
@@ -85,6 +85,17 @@ class CadQueryTests(unittest.TestCase):
         result = build(model)
         self.assertFalse(failures(result, "final_wall_thickness"), result.report)
         self.assertTrue(result.export_allowed, result.report)
+
+    def test_support_free_follows_the_build_direction(self):
+        # 片持ちの棚。+Zに積むと棚の下が未支持になる。
+        shelf = Model((Part("shelf", (
+            Feature("post", Box((0, 0, 0), (4, 4, 20))),
+            Feature("deck", Box((4, 0, 14), (16, 4, 18))),
+        )),), policy=Policy(min_wall_mm=1.0, min_neck_mm=1.0))
+        self.assertTrue(failures(build(shelf), "support_free"))
+        # 寝かせて積むと同じ形状が支持される。
+        laid = replace(shelf, policy=replace(shelf.policy, build_direction="plus_x"))
+        self.assertFalse(failures(build(laid), "support_free"))
 
     def test_sealed_cavity_blocks_export(self):
         model = add_feature(block(), Feature("void", Box((3, 3, 3), (7, 7, 7)), operation="cut"))
@@ -171,7 +182,7 @@ class CadQueryTests(unittest.TestCase):
         self.assertTrue(build(replace(block(), parts=(*block().parts, other))).export_allowed)
 
     def test_unsupported_required_rule_blocks_export(self):
-        for rule in ("support_free", "strength", "thermal"):
+        for rule in ("strength", "thermal"):
             with self.subTest(rule=rule):
                 model = replace(block(), policy=Policy(required=(rule,)))
                 self.assertFalse(build(model).export_allowed)
@@ -255,7 +266,7 @@ class CadQueryTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_public_build_mutation_does_not_bypass_export(self):
-        model = replace(block(), policy=Policy(required=("support_free",)))
+        model = replace(block(), policy=Policy(required=("strength",)))
         result = build(model)
         result.report["required"].clear()
         with tempfile.TemporaryDirectory(dir=".work") as root, self.assertRaises(ValueError):

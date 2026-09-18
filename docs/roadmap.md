@@ -14,7 +14,7 @@
 - 円柱・穴・boss (対応済み)、寸法型と座標変換。面取りはOCCTのedge選択に依存するため見送る
 - 部品catalog、基板・コネクタ寸法と出典、支持面への接触指定
 - 最終肉厚、接続部断面の保守的な検査 (対応済み)。slendernessは後続
-- 閉空洞 (対応済み)、印刷姿勢、overhang/bridgeの検査。slicerでの評価との突合
+- 閉空洞、印刷姿勢、overhang/bridgeの検査 (対応済み)。slicerでの評価との突合
 - STL meshのmanifold性・接続成分・退化三角形検査 (対応済み)
 
 最終形状に対する検査はIRから直接rasterizeしたvoxel上で行い、OCCTのface/edge topologyに依存させない。解像度は`policy.voxel_mm`で指定し、量子化分は失敗側に倒す。overhang/bridgeも同じoccupancyから判定する。

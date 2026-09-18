@@ -83,7 +83,21 @@ export(model, ".work/plate")
 
 全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。サポート不要や応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
 
-最終肉厚・接続部断面・閉空洞はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約4秒、0.4 mmで約0.5秒かかる。大きなモデルを扱う場合は格子を粗くする。
+最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
+
+印刷姿勢は`Policy.build_direction` (既定`plus_z`)、支持なしで許す傾斜は`overhang_angle_deg` (既定45)、渡せる未支持区間の長さは`bridge_max_mm` (既定5.0) で指定する。
+
+## slicerとの突合
+
+`support_free`は幾何のみに基づく近似であり、ノズル径、層厚、冷却、材料を含まない。実機で用いる場合は、出力したSTLをslicerへ読み込み、同じ印刷姿勢でサポート生成の要否を比較する。
+
+```bash
+make example
+# .work/board-tray/board_tray.stl をslicerで開き、build_directionと同じ向きに置く
+# サポート自動生成を有効にし、生成箇所がreport.jsonのsupport_freeと矛盾しないか確認する
+```
+
+slicerは開発依存に含めず、CIでも実行しない。突合は手元での確認とし、判定が食い違った場合は`overhang_angle_deg`と`bridge_max_mm`を実機の条件に合わせる。
 
 ## 依存更新
 

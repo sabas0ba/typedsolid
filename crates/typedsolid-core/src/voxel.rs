@@ -3,7 +3,7 @@
 //! backendのface/edge topologyに依存せず、boxとcylinderの内外判定だけで最終形状を
 //! 得る。厚さ・接続部・空洞はいずれも同じoccupancyから導く。
 
-use crate::{Check, Model, Operation, Part, Rule, Status};
+use crate::{Check, Direction, Model, Operation, Part, Rule, Status};
 
 /// 1 partあたりのcell数の上限。超える入力はvalidateで拒否する。
 pub const MAX_GRID_CELLS: u64 = 200_000_000;
@@ -305,6 +305,139 @@ impl Grid {
     }
 }
 
+/// 積層方向を基準にした座標系。layer 0がbuild plate側の層である。
+struct Layered {
+    up: usize,
+    /// 層をgridの正方向へ積むか。build_directionが負向きなら層は逆順に進む。
+    positive: bool,
+    plane: [usize; 2],
+}
+
+impl Layered {
+    fn new(direction: Direction) -> Self {
+        let up = direction.axis().index();
+        Self {
+            up,
+            positive: direction.is_positive(),
+            plane: direction.axis().plane(),
+        }
+    }
+
+    fn cell(&self, grid: &Grid, layer: usize, a: usize, b: usize) -> usize {
+        let mut coordinate = [0usize; 3];
+        coordinate[self.up] = if self.positive {
+            layer
+        } else {
+            grid.size[self.up] - 1 - layer
+        };
+        coordinate[self.plane[0]] = a;
+        coordinate[self.plane[1]] = b;
+        grid.index(coordinate[0], coordinate[1], coordinate[2])
+    }
+}
+
+/// 支持の有無と、bridgeで渡せる区間の判定結果。
+struct Support {
+    /// 直下に材料があるcell。
+    supported: Vec<bool>,
+    /// 支持は無いが、両端を支持されたbridgeで渡せるcell。
+    bridged: Vec<bool>,
+}
+
+impl Grid {
+    /// 層ごとに直下の材料を探し、支持の有無を求める。
+    ///
+    /// 直下が支持されているかは問わない。支持の要否は層ごとに独立して評価し、
+    /// 1箇所のoverhangがその上の全体を未支持にすることを避ける。
+    fn support(
+        &self,
+        direction: Direction,
+        overhang_angle_deg: f64,
+        bridge_max_mm: f64,
+    ) -> Support {
+        let frame = Layered::new(direction);
+        let layers = self.size[frame.up];
+        let extent = [self.size[frame.plane[0]], self.size[frame.plane[1]]];
+        // 傾斜角tanが、1層あたりに許す水平方向のずれになる。tan(45°)は浮動小数点で
+        // 1をわずかに下回るため、切り捨てではなく許容を持たせて比較する。
+        let radius = overhang_angle_deg.to_radians().tan();
+        let limit = radius * radius + 1e-9;
+        let reach = radius.ceil() as isize;
+        let offsets: Vec<(isize, isize)> = (-reach..=reach)
+            .flat_map(|da| (-reach..=reach).map(move |db| (da, db)))
+            .filter(|(da, db)| ((da * da + db * db) as f64) <= limit)
+            .collect();
+
+        let mut supported = vec![false; self.occupied.len()];
+        // gridは外周にpaddingを持つため、最初の層は空である。材料が最初に現れる層が
+        // build plateに接する。
+        let mut material_below = false;
+        for layer in 0..layers {
+            let mut material_here = false;
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let index = frame.cell(self, layer, a, b);
+                    if !self.occupied[index] {
+                        continue;
+                    }
+                    material_here = true;
+                    supported[index] = !material_below
+                        || offsets.iter().any(|(da, db)| {
+                            let (Some(na), Some(nb)) = (
+                                checked_step(a, *da as i32, extent[0]),
+                                checked_step(b, *db as i32, extent[1]),
+                            ) else {
+                                return false;
+                            };
+                            self.occupied[frame.cell(self, layer - 1, na, nb)]
+                        });
+                }
+            }
+            material_below |= material_here;
+        }
+
+        // 未支持の区間は、同じ層で両端を支持された材料に挟まれていれば渡せる。
+        let limit = (bridge_max_mm / self.pitch).floor() as usize;
+        let mut bridged = vec![false; self.occupied.len()];
+        for layer in 0..layers {
+            for (axis, (length, other)) in [(extent[0], extent[1]), (extent[1], extent[0])]
+                .into_iter()
+                .enumerate()
+            {
+                for fixed in 0..other {
+                    let at = |k: usize| {
+                        if axis == 0 {
+                            frame.cell(self, layer, k, fixed)
+                        } else {
+                            frame.cell(self, layer, fixed, k)
+                        }
+                    };
+                    let mut start: Option<usize> = None;
+                    for k in 0..length {
+                        let index = at(k);
+                        let open = self.occupied[index] && !supported[index];
+                        if open {
+                            start.get_or_insert(k);
+                            continue;
+                        }
+                        if let Some(from) = start.take() {
+                            let anchored_before = from > 0 && supported[at(from - 1)];
+                            let anchored_after = supported[index];
+                            if anchored_before && anchored_after && k - from <= limit {
+                                for j in from..k {
+                                    bridged[at(j)] = true;
+                                }
+                            }
+                        }
+                    }
+                    // 端で終わる区間は片持ちであり、bridgeにならない。
+                }
+            }
+        }
+        Support { supported, bridged }
+    }
+}
+
 const NEIGHBOURS: [(i32, i32, i32); 6] = [
     (-1, 0, 0),
     (1, 0, 0),
@@ -468,6 +601,34 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
                 pitch
             ),
         ));
+
+        let support = grid.support(
+            policy.build_direction,
+            policy.overhang_angle_deg,
+            policy.bridge_max_mm,
+        );
+        let unsupported = grid
+            .occupied
+            .iter()
+            .zip(support.supported.iter())
+            .zip(support.bridged.iter())
+            .filter(|((solid, held), spanned)| **solid && !**held && !**spanned)
+            .count();
+        let spanned = support.bridged.iter().filter(|cell| **cell).count();
+        checks.push(check(
+            Rule::SupportFree,
+            &part.id,
+            unsupported == 0,
+            format!(
+                "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
+                unsupported as f64 * pitch.powi(3),
+                policy.overhang_angle_deg,
+                policy.build_direction,
+                spanned as f64 * pitch.powi(3),
+                policy.bridge_max_mm,
+                pitch
+            ),
+        ));
     }
     Ok(checks)
 }
@@ -523,6 +684,9 @@ mod tests {
             voxel_mm: pitch,
             min_wall_mm: min_wall,
             min_neck_mm: min_neck,
+            build_direction: Direction::PlusZ,
+            overhang_angle_deg: 45.0,
+            bridge_max_mm: 5.0,
             required: vec![],
         }
     }
@@ -643,6 +807,84 @@ mod tests {
                 "({x},{y},{z})"
             );
         }
+    }
+
+    /// 柱の上に片側だけ張り出した天板を載せる。張り出しがoverhangになる。
+    /// 四方へ張り出すと角が対角にずれ、45°では支持と判定されない。
+    fn table(overhang_mm: f64) -> Part {
+        part(vec![
+            add("leg", box_shape([0., 0., 0.], [4., 4., 6.])),
+            add("top", box_shape([0., 0., 6.], [4. + overhang_mm, 4., 8.])),
+        ])
+    }
+
+    #[test]
+    fn flat_bottom_is_supported() {
+        let block = part(vec![add("body", box_shape([0.; 3], [10., 10., 10.]))]);
+        let checks = evaluate(&model_with(block, policy(2.0, 2.0, 0.5))).unwrap();
+        assert_eq!(status(&checks, Rule::SupportFree), Status::Pass);
+    }
+
+    #[test]
+    fn long_overhang_needs_support() {
+        // 8 mm張り出した天板は、45°則でも5 mmのbridgeでも渡せない。
+        let checks = evaluate(&model_with(table(8.0), policy(1.0, 1.0, 0.5))).unwrap();
+        assert_eq!(status(&checks, Rule::SupportFree), Status::Fail);
+    }
+
+    #[test]
+    fn short_overhang_is_carried_by_a_bridge() {
+        // 2 mmの張り出しは両端を柱に支えられ、5 mmのbridgeで渡せる。
+        let bridged = part(vec![
+            add("left", box_shape([0., 0., 0.], [4., 4., 6.])),
+            add("right", box_shape([6., 0., 0.], [10., 4., 6.])),
+            add("deck", box_shape([0., 0., 6.], [10., 4., 8.])),
+        ]);
+        let checks = evaluate(&model_with(bridged, policy(1.0, 1.0, 0.5))).unwrap();
+        assert_eq!(status(&checks, Rule::SupportFree), Status::Pass);
+    }
+
+    #[test]
+    fn a_wide_gap_is_not_a_bridge() {
+        let spanning = part(vec![
+            add("left", box_shape([0., 0., 0.], [4., 4., 6.])),
+            add("right", box_shape([20., 0., 0.], [24., 4., 6.])),
+            add("deck", box_shape([0., 0., 6.], [24., 4., 8.])),
+        ]);
+        let checks = evaluate(&model_with(spanning, policy(1.0, 1.0, 0.5))).unwrap();
+        assert_eq!(status(&checks, Rule::SupportFree), Status::Fail);
+    }
+
+    #[test]
+    fn build_direction_changes_what_is_unsupported() {
+        // 片持ちの棚。+Zに積むと棚下が未支持になり、+Xに積むと積層方向が変わる。
+        let shelf = part(vec![
+            add("post", box_shape([0., 0., 0.], [4., 4., 20.])),
+            add("shelf", box_shape([4., 0., 14.], [16., 4., 18.])),
+        ]);
+        let upright = evaluate(&model_with(shelf.clone(), policy(1.0, 1.0, 0.5))).unwrap();
+        assert_eq!(status(&upright, Rule::SupportFree), Status::Fail);
+
+        let mut sideways = policy(1.0, 1.0, 0.5);
+        sideways.build_direction = Direction::PlusX;
+        let laid = evaluate(&model_with(shelf, sideways)).unwrap();
+        assert_eq!(status(&laid, Rule::SupportFree), Status::Pass);
+    }
+
+    #[test]
+    fn a_steeper_angle_accepts_more_overhang() {
+        // 0.5 mmの張り出しは0.5 mm格子で1 cell分ずれる。
+        let stepped = table(0.5);
+        let sloped = evaluate(&model_with(stepped.clone(), policy(0.5, 0.5, 0.5))).unwrap();
+        // 45°は1層あたり1 cellのずれまでを支持とみなす。
+        assert_eq!(status(&sloped, Rule::SupportFree), Status::Pass);
+
+        let mut narrow = policy(0.5, 0.5, 0.5);
+        narrow.overhang_angle_deg = 0.0;
+        narrow.bridge_max_mm = 0.0;
+        let vertical = evaluate(&model_with(stepped, narrow)).unwrap();
+        // 真下にしか支持を認めないと、同じ張り出しが未支持になる。
+        assert_eq!(status(&vertical, Rule::SupportFree), Status::Fail);
     }
 
     #[test]
