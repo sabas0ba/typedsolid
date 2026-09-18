@@ -15,7 +15,8 @@ Operation = Literal["add", "cut"]
 Rule = Literal[
     "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
-    "final_wall_thickness", "support_free", "strength", "thermal",
+    "final_wall_thickness", "neck_section", "closed_cavity",
+    "support_free", "strength", "thermal",
 ]
 
 
@@ -90,9 +91,16 @@ class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
     mesh_volume_tolerance: float = 0.01
+    # 最終形状をrasterizeする格子の間隔。細かいほど正確になり、cell数は3乗で増える。
+    voxel_mm: float = 0.2
+    # 最終形状に要求する最小肉厚。primitive寸法 (min_feature_mm) とは別に指定する。
+    min_wall_mm: float = 1.2
+    # 接続部に要求する最小断面。
+    min_neck_mm: float = 1.2
     required: tuple[Rule, ...] = (
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
+        "final_wall_thickness", "neck_section", "closed_cavity",
     )
 
 

@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use typedsolid_core::{Model, Report, mesh};
+use typedsolid_core::{Model, Report, mesh, voxel};
 
 #[pyfunction]
 fn normalize_model(json: &str) -> PyResult<String> {
@@ -13,6 +13,14 @@ fn preflight(json: &str) -> PyResult<String> {
     let model = Model::from_json(json).map_err(PyValueError::new_err)?;
     let report = model.preflight().map_err(PyValueError::new_err)?;
     serde_json::to_string(&report).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// 最終形状の肉厚・接続部・空洞の検査。IRから直接rasterizeするためbackendに依存しない。
+#[pyfunction]
+fn evaluate_voxels(json: &str) -> PyResult<String> {
+    let model = Model::from_json(json).map_err(PyValueError::new_err)?;
+    let checks = voxel::evaluate(&model).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// 出力STLの構造検査。解析失敗は例外にせず、failのcheckとして返す。
@@ -38,6 +46,7 @@ fn export_allowed(json: &str) -> PyResult<bool> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(normalize_model, module)?)?;
     module.add_function(wrap_pyfunction!(preflight, module)?)?;
+    module.add_function(wrap_pyfunction!(evaluate_voxels, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(export_allowed, module)?)?;
     Ok(())
