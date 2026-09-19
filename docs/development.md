@@ -49,6 +49,8 @@ make example       # .work/board-tray に出力。既存なら拒否
 
 Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative moduleを読み込む統合testで検証し、libpythonをリンクするembedding用Rust testとは分離する。bindingもworkspace全体のclippy検査に含める。
 
+`tests/test_enclosure_fixtures.py`は、開口を持つ筐体に既知の欠陥を1つずつ入れ、落ちるruleの集合が宣言と完全に一致することを見る。個々のruleは単純形状のtestが検証しており、ここで確かめるのは実形状での成立と過検出の不在である。詳細は [ロードマップ](roadmap.md) を参照する。
+
 別の出力先を使う場合:
 
 ```bash
