@@ -1,44 +1,50 @@
-"""上面から基板へアクセスできるトレイ。寸法は説明用で実基板の仕様ではない。"""
+"""catalogの基板寸法から組み立てる、上面アクセスのトレイ。"""
 
 import argparse
 from pathlib import Path
 
-from typedsolid import Box, Clearance, Feature, Keepout, Model, Part, boss, hole
+from typedsolid import Box, Clearance, Feature, Model, Part, board
 from typedsolid.cadquery import export
 
-# 4隅の支持pad中心。基板確保領域の四隅に合わせる。
-PAD_CENTRES = ((9, 9), (51, 9), (9, 31), (51, 31))
-PAD_DIAMETER_MM = 6.0
-# M3ネジの下穴。実機のネジ・インサート仕様は未確定である。
-SCREW_DIAMETER_MM = 2.5
+TRAY = (60.0, 40.0, 20.0)
+WALL_MM = 2.0
+FLOOR_MM = 2.0
+# 支持padの上面。基板下面はこの高さに接する。
+BOARD_Z_MM = 4.0
+PAD_DIAMETER_MM = 5.0
+# Pico 2の取付穴はφ2.1でM2相当。padへのネジ下穴として1.6を開ける。
+SCREW_DIAMETER_MM = 1.6
+# データシートは部品高さを与えないため、作例側で確保する高さを決める。
+BOARD_HEIGHT_MM = 5.0
 
 
 def board_tray() -> Model:
+    pico = board("raspberry_pi_pico_2")
+    length, width, height = TRAY
+    # 基板を平面の中央に置く。originは基板座標系の原点に対応するmodel座標。
+    origin = ((length - pico.length_mm) / 2.0, (width - pico.width_mm) / 2.0, BOARD_Z_MM)
+
     shell = (
-        Feature("floor", Box((0, 0, 0), (60, 40, 2)), "base"),
-        Feature("left", Box((0, 0, 0), (2, 40, 20)), "wall"),
-        Feature("right", Box((58, 0, 0), (60, 40, 20)), "wall"),
-        Feature("front", Box((0, 0, 0), (60, 2, 20)), "wall"),
-        Feature("back", Box((0, 38, 0), (60, 40, 20)), "wall"),
+        Feature("floor", Box((0, 0, 0), (length, width, FLOOR_MM)), "base"),
+        Feature("left", Box((0, 0, 0), (WALL_MM, width, height)), "wall"),
+        Feature("right", Box((length - WALL_MM, 0, 0), (length, width, height)), "wall"),
+        Feature("front", Box((0, 0, 0), (length, WALL_MM, height)), "wall"),
+        Feature("back", Box((0, width - WALL_MM, 0), (length, width, height)), "wall"),
     )
     # padは円柱、ネジ穴は底板を貫通するcut。Cutは全Addを結合した後に差し引く。
-    pads = tuple(
-        boss(f"pad_{name}", "z", centre, PAD_DIAMETER_MM, (0, 4))
-        for name, centre in zip("abcd", PAD_CENTRES)
-    )
-    screws = tuple(
-        hole(f"screw_{name}", "z", centre, SCREW_DIAMETER_MM, (-1, 4))
-        for name, centre in zip("abcd", PAD_CENTRES)
-    )
+    pads = pico.bosses((0.0, BOARD_Z_MM), PAD_DIAMETER_MM, origin)
+    screws = pico.pilot_holes((-1.0, BOARD_Z_MM), SCREW_DIAMETER_MM, origin)
+
     return Model(
         parts=(Part("board_tray", shell + pads + screws),),
         # 支持面への接触を許可するため下面のclearanceは0。他の面は0.5を確保する。
         keepouts=(
-            Keepout(
+            pico.keepout(
                 "pcb",
-                Box((8, 8, 4), (52, 32, 7)),
-                Clearance(default=0.5, minus_z=0.0),
-                ("plus_z",),
+                origin,
+                height_mm=BOARD_HEIGHT_MM,
+                clearance=Clearance(default=0.5, minus_z=0.0),
+                access=("plus_z",),
             ),
         ),
     )

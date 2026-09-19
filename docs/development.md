@@ -55,7 +55,7 @@ Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative modu
 .venv/bin/python examples/board_tray.py --output .work/board-tray-v2
 ```
 
-出力は`board_tray.stl`、`board_tray.step`、`model.json`、`report.json`。STLは1部品分。作例は60×40×20 mm、底・壁厚2 mm、φ6 mmの支持pad 4個と、それを貫くφ2.5 mmのネジ下穴を持つトレイである。44×24×3 mmの説明用基板領域をz=4 mmに確保し、+Zへ抜けることを検査する。支持面へ接触させるため下面のclearanceだけを0とし、他の面は0.5 mmを確保する。壁との間隔は6 mm以上ある。実基板寸法、ネジ・インサートの仕様、蓋は含まないため、完成した実機筐体ではない。
+出力は`board_tray.stl`、`board_tray.step`、`model.json`、`report.json`。STLは1部品分。作例は60×40×20 mm、底・壁厚2 mmのトレイで、収める基板は [部品catalog](catalog.md) のRaspberry Pi Pico 2である。catalogの取付穴位置にφ5 mmの支持pad 4個を立て、φ1.6 mmのネジ下穴で貫く。Pico 2の取付穴はφ2.1でM2相当である。基板の51×21 mmの領域をz=4 mmに確保し、+Zへ抜けることを検査する。支持面へ接触させるため下面のclearanceだけを0とし、他の面は0.5 mmを確保する。データシートは部品高さを与えないため、確保する高さ5 mmは作例側で決めている。ネジ・インサートの仕様と蓋は含まないため、完成した実機筐体ではない。
 
 ![最終形状と基板確保領域](assets/board-tray.svg)
 
@@ -81,7 +81,16 @@ print(model.preflight())
 export(model, ".work/plate")
 ```
 
-全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。サポート不要や応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+
+収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
+
+```python
+from typedsolid import board
+
+pico = board("raspberry_pi_pico_2")
+pads = pico.bosses((0.0, 4.0), 5.0, origin=(4.5, 9.5, 4.0))
+```
 
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
