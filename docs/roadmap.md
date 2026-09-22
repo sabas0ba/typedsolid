@@ -23,6 +23,21 @@ catalogは公式資料が寸法線として与える値だけを持ち、記載�
 
 合格条件: 開口を持つ筐体で、薄肉・折れやすい接続・孤立・支持不能箇所の既知の失敗fixtureを検出し、Tang Nano等の既存ケースへ適用して比較する。
 
+fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×26×14 mmの筐体を基準形状とし、欠陥を1つずつ入れて、落ちるruleの集合が宣言と完全に一致することを見る。検出漏れと過検出のどちらもこの比較で落ちる。
+
+| fixture | 欠陥 | 落ちるrule |
+| --- | --- | --- |
+| `baseline` | なし | なし |
+| `thin_wall` | 右壁の内側を削り残り1 mm | `final_wall_thickness` |
+| `narrow_neck` | 幅1.6 mmの桟だけで左右を繋ぐ | `neck_section` |
+| `severed_corner` | 同じスリットを桟を残さず通す | `single_solid`, `neck_section` |
+| `cantilever` | 壁から6 mm張り出す棚 | `support_free` |
+| `sealed_void` | 塊の内部に外へ通じない空洞 | `closed_cavity` |
+
+`min_neck_mm`は2.0とし、既定の`min_wall_mm` 1.2と分けている。両者が同じ値だと、断面が足りない箇所は必ず肉厚も足りず、2つのruleを区別できない。
+
+既存ケースへの適用は未実施である。第三者の筐体モデルを取り込むことになるため、出典と再配布条件を確認してから行う。
+
 ## M2: 組立と保守アクセス
 
 - 工具・ケーブル・コネクタ抜き差しの掃引領域
