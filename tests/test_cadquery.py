@@ -259,9 +259,10 @@ class CadQueryTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=".work") as root:
             output = Path(root) / "broken"
+            # patchは子processに及ばないため、同一processで実行する。
             with patch("cadquery.exporters.export", truncated):
                 with self.assertRaises(ValueError) as raised:
-                    export(block(), output)
+                    export(block(), output, isolated=False)
             self.assertIn("mesh_manifold", str(raised.exception))
             self.assertFalse(output.exists())
 

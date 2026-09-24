@@ -97,7 +97,11 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 永続的な意味IDはIRのPart/Featureに置き、face番号やedge列挙順に置かない。primitiveは軸平行のboxとcylinderに限定し、fragileなface selectorを使用しない。Boolean後のface→feature対応は現段階で保証しない。
 
-backend例外、無効形状、空形状をfailとして保持する。依存を固定し、版更新時は孤立・切断・空形状・干渉・アクセス・STEP再読込の回帰テストを行う。STLのバイト一致ではなく、寸法・体積・接続性と検査結果を比較する。カーネルのhard crashやhangはPython例外処理では隔離できないため、将来worker processとtimeoutを導入する。
+backend例外、無効形状、空形状をfailとして保持する。依存を固定し、版更新時は孤立・切断・空形状・干渉・アクセス・STEP再読込の回帰テストを行う。STLのバイト一致ではなく、寸法・体積・接続性と検査結果を比較する。
+
+カーネルのhard crashやhangはPython例外処理では隔離できない。`export`はbackendを子processで実行し、親がtimeoutで打ち切る。起動はspawnとし、OCCTが内部に持つthreadの状態を複製するforkは使わない。子の例外は同じ型で親へ戻し、結果を返さずに終了した子は`WorkerCrashed`とする。出力先のstagingは親が作成・破棄するため、打ち切られても残骸を残さない。`build`は形状を呼び出し側へ返すため同一processで動き、打ち切りの対象外である。
+
+部品単位の生成結果 (binary BREPとvoxel評価) は、指定した場合に限りcacheへ保存する。keyは部品のIR、voxel評価ではpolicyも含め、backendのsource、native module、CAD kernelの版から作るため、実装が変わると古い結果は参照されない。cacheから読んだ形状も新たに作った形状と同じ検査を通り、判定には関与しない。
 
 ## 解析への拡張
 
