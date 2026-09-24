@@ -129,7 +129,7 @@ PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テ
 
 ## 打ち切りと再開
 
-`export`は既定で子processにbackendを隔離し、`timeout_s` (既定600秒) を超えると`WorkerTimeout`を送出する。出力先は作られず、stagingも残らない。進行は`progress`に渡した関数へ、経過秒付きの段階名で届く。
+`export`は既定で子processにbackendを隔離し、`timeout_s` (既定600秒) を超えると`WorkerTimeout`を送出する。呼び出し元のscriptは子で読み込み直さないため、`if __name__ == "__main__"`による保護は不要で、notebookや標準入力からも呼べる。出力先は作られず、stagingも残らない。進行は`progress`に渡した関数へ、経過秒付きの段階名で届く。
 
 ```python
 import sys

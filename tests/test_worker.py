@@ -2,7 +2,10 @@
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import textwrap
 import time
 import unittest
 
@@ -13,7 +16,7 @@ from typedsolid.cadquery import build, export
 from typedsolid.worker import WorkerCrashed, WorkerTimeout, run
 
 
-# spawnした子processが名前で引けるよう、targetはmodule直下に置く。
+# 子processが名前で引けるよう、targetはmodule直下に置く。
 def echo(progress, value):
     progress("echoing")
     return {"value": value, "pid": os.getpid()}
@@ -77,6 +80,62 @@ class WorkerTests(unittest.TestCase):
         for value in (0, -1):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 run(echo, None, timeout_s=value)
+
+    def test_target_must_be_importable_by_name(self):
+        def local(progress):
+            return None
+
+        for target in (local, lambda progress: None):
+            with self.subTest(target=target.__qualname__), self.assertRaises(ValueError):
+                run(target, timeout_s=60)
+
+
+# 呼び出し元のscriptを子が読み込み直さないことを、実際のinterpreterで確かめる。
+# spawnを使っていた版では、guardの無いscriptと標準入力からの実行が失敗した。
+UNGUARDED_SCRIPT = textwrap.dedent("""
+    import sys
+    from typedsolid import Box, Feature, Model, Part
+    from typedsolid.cadquery import export
+
+    print("script body executed")
+    model = Model((Part("block", (Feature("body", Box((0, 0, 0), (10, 10, 10))),)),))
+    export(model, sys.argv[1])
+    print("export finished")
+""")
+
+
+class CallerTests(unittest.TestCase):
+    def setUp(self):
+        Path(".work").mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(dir=".work"))
+
+    def tearDown(self):
+        for path in sorted(self.root.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        self.root.rmdir()
+
+    def assert_exported_once(self, completed, output):
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.count("script body executed"), 1, completed.stdout)
+        self.assertIn("export finished", completed.stdout)
+        self.assertTrue((output / "report.json").exists())
+
+    def test_script_without_main_guard(self):
+        script = self.root / "unguarded.py"
+        script.write_text(UNGUARDED_SCRIPT, encoding="utf-8")
+        output = self.root / "from-script"
+        completed = subprocess.run(
+            [sys.executable, str(script), str(output)], capture_output=True, text=True, timeout=300,
+        )
+        self.assert_exported_once(completed, output)
+
+    def test_script_from_standard_input(self):
+        output = self.root / "from-stdin"
+        completed = subprocess.run(
+            [sys.executable, "-", str(output)], input=UNGUARDED_SCRIPT,
+            capture_output=True, text=True, timeout=300,
+        )
+        self.assert_exported_once(completed, output)
 
 
 class CacheTests(unittest.TestCase):
@@ -155,7 +214,7 @@ class IsolatedExportTests(unittest.TestCase):
         self.assertEqual(isolated["model_sha256"], local["model_sha256"])
 
     def test_timeout_leaves_no_output_or_staging(self):
-        # spawnとcadqueryのimportだけで1秒以上かかるため、0.2秒では必ず打ち切られる。
+        # interpreterの起動とcadqueryのimportだけで1秒以上かかるため、0.2秒では必ず打ち切られる。
         with self.assertRaises(WorkerTimeout):
             export(block(), self.root / "late", timeout_s=0.2)
         self.assertEqual(list(self.root.iterdir()), [])
