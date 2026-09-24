@@ -4,7 +4,7 @@ export PYO3_PYTHON := $(CURDIR)/.venv/bin/python
 export VIRTUAL_ENV := $(CURDIR)/.venv
 export TMPDIR := $(CURDIR)/.work/tmp
 
-.PHONY: check rust-check python-build python-test example fmt audit
+.PHONY: check rust-check python-build python-test example clean-cache fmt audit
 
 check: rust-check python-test
 
@@ -23,6 +23,9 @@ python-test: python-build
 
 example: python-build
 	python examples/board_tray.py --output .work/board-tray
+
+clean-cache:
+	python -m typedsolid.cache clear .work/cache
 
 fmt:
 	cargo fmt --all

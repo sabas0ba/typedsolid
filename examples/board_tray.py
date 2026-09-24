@@ -2,9 +2,10 @@
 
 import argparse
 from pathlib import Path
+import sys
 
 from typedsolid import Box, Clearance, Feature, Model, Part, board
-from typedsolid.cadquery import export
+from typedsolid.cadquery import DEFAULT_TIMEOUT_S, export
 
 TRAY = (60.0, 40.0, 20.0)
 WALL_MM = 2.0
@@ -53,7 +54,12 @@ def board_tray() -> Model:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path(".work/board-tray"))
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="打ち切りまでの秒数")
+    parser.add_argument("--cache", type=Path, default=Path(".work/cache"), help="部品単位の結果を置く場所")
     args = parser.parse_args()
-    manifest = export(board_tray(), args.output)
+    manifest = export(
+        board_tray(), args.output, timeout_s=args.timeout, cache_dir=args.cache,
+        progress=lambda stage: print(stage, file=sys.stderr),
+    )
     print(f"Exported board_tray.stl and board_tray.step to {args.output}")
     print("Unevaluated: " + ", ".join(c["rule"] for c in manifest["report"]["checks"] if c["status"] == "not_evaluated"))

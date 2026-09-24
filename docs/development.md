@@ -44,7 +44,8 @@ make check
 make rust-check    # fmt / clippy / Rust tests
 make python-test   # native module build / Python integration tests
 make check         # 両方
-make example       # .work/board-tray に出力。既存なら拒否
+make example       # .work/board-tray に出力。既存なら拒否。cacheは.work/cache
+make clean-cache   # 生成cacheを消す
 ```
 
 Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative moduleを読み込む統合testで検証し、libpythonをリンクするembedding用Rust testとは分離する。bindingもworkspace全体のclippy検査に含める。
@@ -125,6 +126,35 @@ Rustのtransitive依存更新も`Cargo.lock`を差分レビューし、auditに�
 ## CI方針
 
 PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テストを含む検査を行う。CadQueryはVTK等の大きな依存を持つため、通常のPRごとに取得・統合buildを強制しない。初回PRはローカルの統合テスト結果を添付する。Windows/macOS jobと自動publishは追加しない。
+
+## 打ち切りと再開
+
+`export`は既定で子processにbackendを隔離し、`timeout_s` (既定600秒) を超えると`WorkerTimeout`を送出する。呼び出し元のscriptは子で読み込み直さないため、`if __name__ == "__main__"`による保護は不要で、notebookや標準入力からも呼べる。出力先は作られず、stagingも残らない。進行は`progress`に渡した関数へ、経過秒付きの段階名で届く。
+
+```python
+import sys
+from typedsolid.cadquery import export
+
+export(model, ".work/out", timeout_s=120, cache_dir=".work/cache",
+       progress=lambda stage: print(stage, file=sys.stderr))
+```
+
+```
+[    0.1 s] part board_tray: building shape
+[    0.3 s] keepout, access and interference checks
+[    0.3 s] part board_tray: voxel evaluation
+[    7.5 s] part board_tray: writing stl
+```
+
+`cache_dir`を与えると、部品ごとの形状とvoxel評価を保存し、再実行では変わっていない部品を再利用する。打ち切られた実行も、完了した部品の分だけ次回が短くなる。作例は`.work/cache`を使い、cacheなしで約12秒、cacheありで約4.5秒かかる。残りは親子2つのprocessでのcadquery読み込みである。
+
+```bash
+make clean-cache   # .work/cache/typedsolid-v1 の項目だけを消す
+```
+
+cacheのkeyはbackendのsourceとnative moduleを含むため、コードを変更すると古い項目は使われずに残る。容量が気になれば消す。書き込みは一時fileのrenameで行い、読み出し時にdigestを照合するため、中断で壊れた項目は使われない。
+
+`export(..., isolated=False)`は同一processで実行し、`timeout_s`を使わない。debuggerでbackendを追う場合と、`unittest.mock.patch`でbackendを差し替えるtestに使う。
 
 ## 作業データ
 
