@@ -158,10 +158,11 @@ def _without_unset(value: Any) -> Any:
 class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
-    assembly: Assembly = field(default_factory=Assembly)
     policy: Policy = field(default_factory=Policy)
     schema_version: int = 3
     units: Literal["mm"] = "mm"
+    # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
+    assembly: Assembly = field(default_factory=Assembly)
 
     def to_json(self) -> str:
         return _native.normalize_model(json.dumps(_without_unset(asdict(self)), allow_nan=False))

@@ -93,6 +93,14 @@ class ModelTests(unittest.TestCase):
         self.assertNotIn("fit_clearance_mm", data["steps"][0])
         self.assertEqual(data["steps"][1]["fit_clearance_mm"], 0.3)
 
+    def test_positional_arguments_keep_their_meaning(self):
+        """assemblyの追加前と同じく、3番目の位置引数はpolicyに入る。"""
+        policy = Policy(voxel_mm=0.5)
+        model = Model(block().parts, (), policy)
+        self.assertIs(model.policy, policy)
+        self.assertEqual(model.assembly, Assembly())
+        self.assertEqual(json.loads(model.to_json())["policy"]["voxel_mm"], 0.5)
+
     def test_invalid_assembly_is_rejected(self):
         lid = Part("lid", (Feature("panel", Box((0, 0, 10), (10, 10, 12))),))
         two = replace(block(), parts=(*block().parts, lid))
