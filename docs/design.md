@@ -35,10 +35,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v2
+## IR v3
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換・材料はまだ扱わない。
-- `Model`は`schema_version=2`、`parts`、`keepouts`、`policy`を持つ。
+- `Model`は`schema_version=3`、`parts`、`keepouts`、`assembly`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
@@ -50,23 +50,50 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - keepoutはboxに限る。面別clearanceと6方向accessはboxの面を前提とするため、cylinderのkeepoutは受理しない。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
 - `Policy`は`min_feature_mm`のほか、最終形状の検査に`voxel_mm`、`min_wall_mm`、`min_neck_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
-- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・合計1000feature・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- `assembly`は分解手順を持つ。IRに記述した部品位置を組立完了の状態とし、`steps`を順に実行して分解する。各stepは`parts`を一体として、軸平行の直線区間を連ねた`path`に沿って動かし、以降の状態から除く。組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
+- 区間の`distance_mm`は正の数値か`"exit"`とする。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離を表し、最後の区間に限る。
+- `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0は硬い干渉だけを見る。
+- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
-### v1からの昇格
+### 旧版からの昇格
 
-`schema_version=1`のJSONは読み込み時にv2へ変換する。v1は軸平行box、一様clearance、単一accessだけを表現できるため、対応は一意に定まる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。出力は常にv2で、v1では書き出さない。
+`schema_version=1`のJSONはv2を経てv3へ、v2はv3へ、読み込み時に変換する。いずれも対応は一意に定まる。
+
+- v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
+- v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
+
+出力は常にv3で、旧版では書き出さない。
 
 ## 検査と出力
 
 検査は`pass / fail / not_evaluated`の3状態とし、rule ID・target ID・理由を保持する。1件でもfailがある場合、またはrequiredルールが全件passでない場合、出力を拒否する。preflightだけでは標準policyの出力条件を満たさない。
 
-標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・access・部品間干渉検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
+標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・access・部品間干渉検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
 `strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
 交差体積は1e-7 mm³を許容差とし、面接触は許容する。印刷公差や嵌合clearanceと、この数値誤差の許容差を混同しない。極小の干渉、STL meshのmanifold性、slicer上の層島・bridge・supportは別の検査が必要である。
 
 `valid_solid`の空判定には接触判定の許容差を流用せず、1e-12 mm³を下限とする。最小box寸法0.001 mmの立方体は1e-9 mm³であり、接触許容差を空判定に使うと正当な最小形状を無効と扱うためである。
+
+## 着脱の検査
+
+分解stepごとに、動かす部品の最終形状を区間ごとに掃引し、残っている部品との共通体積を求める。判定はOCCTのBooleanで行う。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。
+
+| rule | 内容 |
+| --- | --- |
+| `disassembly_path` | 各区間の掃引体積が、残っている部品と共通体積を持たない |
+| `disassembly_separation` | 最後の区間の方向へ外まで動かし続けても干渉しない。部品が経路の終端で外れていることを表す |
+
+`disassembly_separation`はAABBの分離では判定しない。L字の土台の切り欠きから横へ抜く場合のように、外れた部品がAABBの内側に残る形があるためである。
+
+**はめ合い隙間**は距離ではなく体積で判定する。最短距離では、蓋が壁の上に載る接触も距離0となり、正しい設計まで落ちる。動かす部品を移動方向に垂直な2軸にだけ`fit_clearance_mm`広げてから掃引し、共通体積を見る。移動方向の手前にある載置面の接触は体積0のまま残り、横ですれ違う面の隙間不足だけが検出される。広げる形は辺長2·clearanceの正方形とのMinkowski和で、円とのMinkowski和より保守的である。
+
+隙間の要求は移動方向に平行な面すべてに掛かる。スライドする蓋が載っている面を滑る場合、その面も隙間を要求される。載置面を滑る区間を持つstepでは、そのstepの`fit_clearance_mm`を0とする。
+
+**掃引体積**は、元の形状、終点の形状、移動方向と平行でない各faceのprismの和として作る。OCCTはsolidのprismを扱わない。境界を横切る線分は移動方向と交差するfaceを通るため、この和は測度0の差を除いて掃引体積に一致する。閉じた円筒面を垂直方向に押し出すと自己交差するため、円筒軸を通り移動方向に垂直な平面で先に分割し、各半面の法線が移動方向に対して一定の向きを持つようにする。cutを反映した最終形状そのものを掃引するため、蓋の穴を柱が通る形も正しく扱う。穴あき板と円柱の掃引体積が解析値と小数第6位まで一致することをtestで確認している。
+
+keepoutの取り出しを分解stepに組み込むことは後続の掃引PRで扱う。現在の`access`は組立完了の状態で評価する。
 
 ## 最終形状の検査
 

@@ -16,7 +16,7 @@ Rule = Literal[
     "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
-    "support_free", "strength", "thermal",
+    "support_free", "disassembly_path", "disassembly_separation", "strength", "thermal",
 ]
 
 
@@ -87,6 +87,37 @@ class Keepout:
 
 
 @dataclass(frozen=True)
+class Move:
+    """軸平行の直線区間。"exit"は残っている部品のAABBの外まで動かす。最後の区間に限る。"""
+
+    direction: Direction
+    distance_mm: float | Literal["exit"] = "exit"
+
+
+@dataclass(frozen=True)
+class Step:
+    """分解の1手順。partsを一体として経路に沿って動かし、以降の状態から除く。"""
+
+    id: str
+    parts: tuple[str, ...]
+    path: tuple[Move, ...]
+    # Noneならassemblyの値を使う。
+    fit_clearance_mm: float | None = None
+
+
+@dataclass(frozen=True)
+class Assembly:
+    """記述した部品位置を組立完了の状態とし、stepsを順に実行して分解する。
+
+    組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
+    fit_clearance_mmは移動方向に垂直な向きに要求する隙間で、0は硬い干渉だけを見る。
+    """
+
+    steps: tuple[Step, ...] = ()
+    fit_clearance_mm: float = 0.0
+
+
+@dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
@@ -107,11 +138,12 @@ class Policy:
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
         "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
+        "disassembly_path", "disassembly_separation",
     )
 
 
 def _without_unset(value: Any) -> Any:
-    """未指定の面別clearanceをJSONから除く。Noneを持つfieldは他に無い。
+    """未指定の値をJSONから除く。対象は面別clearanceとstepのfit_clearance_mmである。
 
     asdictはtupleをtupleのまま返すため、listと同じに扱わないと入れ子を降りられない。
     """
@@ -127,8 +159,10 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 2
+    schema_version: int = 3
     units: Literal["mm"] = "mm"
+    # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
+    assembly: Assembly = field(default_factory=Assembly)
 
     def to_json(self) -> str:
         return _native.normalize_model(json.dumps(_without_unset(asdict(self)), allow_nan=False))

@@ -8,12 +8,18 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
 /// primitiveの最小寸法。単位はmm。
 const MINIMUM_EXTENT_MM: f64 = 0.001;
+/// 分解stepの上限。部品数の上限と揃える。
+const MAX_STEPS: usize = 100;
+/// 1 stepの経路区間の上限。
+const MAX_SEGMENTS: usize = 16;
+/// はめ合い隙間の上限。単位はmm。
+const MAX_FIT_CLEARANCE_MM: f64 = 100.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -314,6 +320,127 @@ pub struct Keepout {
     pub access: Vec<Direction>,
 }
 
+/// 経路区間の移動量を数値以外で指定する語。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistanceKeyword {
+    /// 残っている部品のAABBの外まで動かす。
+    Exit,
+}
+
+/// 経路区間の移動量。数値はmm。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Distance {
+    Millimetres(f64),
+    Keyword(DistanceKeyword),
+}
+
+/// 軸平行の直線区間。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Move {
+    pub direction: Direction,
+    pub distance_mm: Distance,
+}
+
+/// 分解の1手順。partsを一体として経路に沿って動かし、以降の状態から除く。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Step {
+    pub id: String,
+    pub parts: Vec<String>,
+    pub path: Vec<Move>,
+    /// assemblyの値をこのstepだけ上書きする。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_clearance_mm: Option<f64>,
+}
+
+/// IRに記述した部品位置を組立完了の状態とし、stepsを順に実行して分解する。
+/// 組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Assembly {
+    /// 移動方向に垂直な向きに要求する隙間。単位はmm。0は硬い干渉だけを見る。
+    #[serde(default)]
+    pub fit_clearance_mm: f64,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+fn fit_clearance(value: f64, owner: &str) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=MAX_FIT_CLEARANCE_MM).contains(&value) {
+        return Err(format!(
+            "{owner}: fit_clearance_mm must be finite and in [0, {MAX_FIT_CLEARANCE_MM}]"
+        ));
+    }
+    Ok(())
+}
+
+impl Assembly {
+    fn validate(&self, part_ids: &BTreeSet<&String>) -> Result<(), String> {
+        fit_clearance(self.fit_clearance_mm, "assembly")?;
+        if self.steps.len() > MAX_STEPS {
+            return Err(format!(
+                "at most {MAX_STEPS} disassembly steps are supported"
+            ));
+        }
+        let mut step_ids = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        for step in &self.steps {
+            if !identifier(&step.id) || !step_ids.insert(&step.id) {
+                return Err(format!("invalid or duplicate step id: {}", step.id));
+            }
+            if let Some(value) = step.fit_clearance_mm {
+                fit_clearance(value, &step.id)?;
+            }
+            if step.parts.is_empty() {
+                return Err(format!("step {} moves no parts", step.id));
+            }
+            for part in &step.parts {
+                if !part_ids.contains(part) {
+                    return Err(format!("step {} refers to unknown part {part}", step.id));
+                }
+                // 取り除いた部品は以降の状態に無い。同じstep内の重複も同じ扱いとする。
+                if !removed.insert(part) {
+                    return Err(format!(
+                        "step {} moves part {part} that is already removed",
+                        step.id
+                    ));
+                }
+            }
+            if step.path.is_empty() || step.path.len() > MAX_SEGMENTS {
+                return Err(format!(
+                    "step {} requires 1..{MAX_SEGMENTS} path segments",
+                    step.id
+                ));
+            }
+            let last = step.path.len() - 1;
+            for (index, segment) in step.path.iter().enumerate() {
+                match segment.distance_mm {
+                    Distance::Millimetres(value) => {
+                        if !value.is_finite() || value <= 0.0 || value > 2.0 * COORDINATE_LIMIT_MM {
+                            return Err(format!(
+                                "step {} segment {index}: distance_mm must be positive and finite",
+                                step.id
+                            ));
+                        }
+                    }
+                    // 外へ出た後に続く区間は意味を持たない。
+                    Distance::Keyword(DistanceKeyword::Exit) if index != last => {
+                        return Err(format!(
+                            "step {} segment {index}: exit is allowed only on the last segment",
+                            step.id
+                        ));
+                    }
+                    Distance::Keyword(DistanceKeyword::Exit) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Units {
     #[serde(rename = "mm")]
@@ -343,12 +470,14 @@ pub enum Rule {
     NeckSection,
     ClosedCavity,
     SupportFree,
+    DisassemblyPath,
+    DisassemblySeparation,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -361,6 +490,8 @@ impl Rule {
         Self::NeckSection,
         Self::ClosedCavity,
         Self::SupportFree,
+        Self::DisassemblyPath,
+        Self::DisassemblySeparation,
         Self::Strength,
         Self::Thermal,
     ];
@@ -438,6 +569,8 @@ pub struct Model {
     pub units: Units,
     pub parts: Vec<Part>,
     pub keepouts: Vec<Keepout>,
+    #[serde(default)]
+    pub assembly: Assembly,
     pub policy: Policy,
 }
 
@@ -474,7 +607,7 @@ fn upgrade_bounds(value: &mut Value) -> Result<(), String> {
 /// 表現できるため、対応は一意に定まる。
 fn upgrade_v1(value: &mut Value) -> Result<(), String> {
     let root = value.as_object_mut().ok_or("model must be a JSON object")?;
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(2));
     if let Some(parts) = root.get_mut("parts").and_then(Value::as_array_mut) {
         for part in parts {
             let features = part
@@ -507,6 +640,17 @@ fn upgrade_v1(value: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+/// schema v2のJSONをv3へ変換する。v2は分解手順を持たないため、空のassemblyを補う。
+fn upgrade_v2(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if root.contains_key("assembly") {
+        return Err("schema_version 2 does not define assembly".into());
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("assembly".into(), json!(Assembly::default()));
+    Ok(())
+}
+
 impl Model {
     pub fn from_json(json: &str) -> Result<Self, String> {
         if json.len() > 1_000_000 {
@@ -514,11 +658,15 @@ impl Model {
         }
         let mut value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         match value.get("schema_version").and_then(Value::as_u64) {
-            Some(1) => upgrade_v1(&mut value)?,
+            Some(1) => {
+                upgrade_v1(&mut value)?;
+                upgrade_v2(&mut value)?;
+            }
+            Some(2) => upgrade_v2(&mut value)?,
             Some(version) if version == u64::from(SCHEMA_VERSION) => {}
             _ => {
                 return Err(format!(
-                    "unsupported schema_version; this build reads 1 and {SCHEMA_VERSION}"
+                    "unsupported schema_version; this build reads 1 to {SCHEMA_VERSION}"
                 ));
             }
         }
@@ -628,7 +776,7 @@ impl Model {
                 }
             }
         }
-        Ok(())
+        self.assembly.validate(&part_ids)
     }
 
     pub fn preflight(&self) -> Result<Report, String> {
@@ -717,6 +865,7 @@ mod tests {
                 }],
             }],
             keepouts: vec![],
+            assembly: Assembly::default(),
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
@@ -823,7 +972,7 @@ mod tests {
     #[test]
     fn unknown_fields_and_version_rejected() {
         let mut m = model();
-        m.schema_version = 3;
+        m.schema_version = SCHEMA_VERSION + 1;
         assert!(m.validate().is_err());
         assert!(
             serde_json::from_str::<Shape>(r#"{"kind":"box","min":[0,0,0],"max":[1,1,1],"typo":1}"#)
@@ -1002,13 +1151,227 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "3", "\"2\""] {
+        for version in ["0", "4", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
             );
             assert!(Model::from_json(&json).is_err(), "{version}");
         }
+    }
+
+    fn two_parts() -> Model {
+        let mut m = model();
+        m.parts.push(Part {
+            id: "lid".into(),
+            features: vec![Feature {
+                id: "panel".into(),
+                role: Role::Generic,
+                operation: Operation::Add,
+                shape: Shape::Box {
+                    min: [0., 0., 2.],
+                    max: [10., 10., 4.],
+                },
+            }],
+        });
+        m
+    }
+
+    fn step(id: &str, parts: &[&str], path: Vec<Move>) -> Step {
+        Step {
+            id: id.into(),
+            parts: parts.iter().map(|p| (*p).into()).collect(),
+            path,
+            fit_clearance_mm: None,
+        }
+    }
+
+    fn segment(direction: Direction, distance: Distance) -> Move {
+        Move {
+            direction,
+            distance_mm: distance,
+        }
+    }
+
+    const EXIT: Distance = Distance::Keyword(DistanceKeyword::Exit);
+
+    #[test]
+    fn schema_v2_is_upgraded_with_an_empty_assembly() {
+        let v2 = r#"{
+            "schema_version": 2,
+            "units": "mm",
+            "parts": [{"id":"base","features":[
+                {"id":"plate","role":"base","operation":"add",
+                 "shape":{"kind":"box","min":[0,0,0],"max":[10,10,2]}}
+            ]}],
+            "keepouts": [],
+            "policy": {"min_feature_mm":1.2,"required":["single_solid"]}
+        }"#;
+        let model = Model::from_json(v2).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.assembly.steps.is_empty());
+        assert_eq!(model.assembly.fit_clearance_mm, 0.0);
+        // v2はassemblyを定義していない。昇格前の入力に現れたら拒否する。
+        let with_assembly = v2.replace(r#""keepouts": [],"#, r#""keepouts": [], "assembly": {},"#);
+        assert!(Model::from_json(&with_assembly).is_err());
+    }
+
+    #[test]
+    fn assembly_round_trips_numbers_and_exit() {
+        let mut m = two_parts();
+        m.assembly.fit_clearance_mm = 0.2;
+        m.assembly.steps.push(Step {
+            fit_clearance_mm: Some(0.3),
+            ..step(
+                "open_lid",
+                &["lid"],
+                vec![
+                    segment(Direction::PlusX, Distance::Millimetres(5.0)),
+                    segment(Direction::PlusZ, EXIT),
+                ],
+            )
+        });
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""distance_mm":5.0"#), "{json}");
+        assert!(json.contains(r#""distance_mm":"exit""#), "{json}");
+        let back = Model::from_json(&json).unwrap();
+        assert_eq!(back.assembly.steps[0].path[1].distance_mm, EXIT);
+        assert_eq!(back.assembly.steps[0].fit_clearance_mm, Some(0.3));
+    }
+
+    #[test]
+    fn assembly_without_steps_omits_nothing_and_validates() {
+        let m = model();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(r#""assembly":{"fit_clearance_mm":0.0,"steps":[]}"#),
+            "{json}"
+        );
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_steps_are_rejected() {
+        let lift = || vec![segment(Direction::PlusZ, EXIT)];
+        let cases: Vec<(&str, Vec<Step>, f64)> = vec![
+            ("unknown part", vec![step("a", &["ghost"], lift())], 0.0),
+            ("empty parts", vec![step("a", &[], lift())], 0.0),
+            ("empty path", vec![step("a", &["lid"], vec![])], 0.0),
+            (
+                "duplicate step id",
+                vec![step("a", &["lid"], lift()), step("a", &["base"], lift())],
+                0.0,
+            ),
+            (
+                "removed twice",
+                vec![step("a", &["lid"], lift()), step("b", &["lid"], lift())],
+                0.0,
+            ),
+            (
+                "duplicate within a step",
+                vec![step("a", &["lid", "lid"], lift())],
+                0.0,
+            ),
+            ("invalid step id", vec![step("../a", &["lid"], lift())], 0.0),
+            (
+                "exit before the last segment",
+                vec![step(
+                    "a",
+                    &["lid"],
+                    vec![
+                        segment(Direction::PlusZ, EXIT),
+                        segment(Direction::PlusX, Distance::Millimetres(1.0)),
+                    ],
+                )],
+                0.0,
+            ),
+            (
+                "zero distance",
+                vec![step(
+                    "a",
+                    &["lid"],
+                    vec![segment(Direction::PlusZ, Distance::Millimetres(0.0))],
+                )],
+                0.0,
+            ),
+            (
+                "negative distance",
+                vec![step(
+                    "a",
+                    &["lid"],
+                    vec![segment(Direction::PlusZ, Distance::Millimetres(-1.0))],
+                )],
+                0.0,
+            ),
+            (
+                "non-finite distance",
+                vec![step(
+                    "a",
+                    &["lid"],
+                    vec![segment(
+                        Direction::PlusZ,
+                        Distance::Millimetres(f64::INFINITY),
+                    )],
+                )],
+                0.0,
+            ),
+            (
+                "too many segments",
+                vec![step(
+                    "a",
+                    &["lid"],
+                    vec![segment(Direction::PlusZ, Distance::Millimetres(1.0)); MAX_SEGMENTS + 1],
+                )],
+                0.0,
+            ),
+            (
+                "negative clearance",
+                vec![step("a", &["lid"], lift())],
+                -0.1,
+            ),
+            (
+                "non-finite clearance",
+                vec![step("a", &["lid"], lift())],
+                f64::NAN,
+            ),
+        ];
+        for (name, steps, clearance) in cases {
+            let mut m = two_parts();
+            m.assembly.steps = steps;
+            m.assembly.fit_clearance_mm = clearance;
+            assert!(m.validate().is_err(), "{name}");
+        }
+        let mut m = two_parts();
+        m.assembly.steps = vec![Step {
+            fit_clearance_mm: Some(-1.0),
+            ..step("a", &["lid"], lift())
+        }];
+        assert!(m.validate().is_err(), "negative step clearance");
+    }
+
+    #[test]
+    fn every_part_may_be_removed() {
+        let mut m = two_parts();
+        m.assembly.steps = vec![
+            step("a", &["lid"], vec![segment(Direction::PlusZ, EXIT)]),
+            step(
+                "b",
+                &["base"],
+                vec![segment(Direction::MinusZ, Distance::Millimetres(3.0))],
+            ),
+        ];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_distance_keyword_is_rejected() {
+        let json = serde_json::to_string(&two_parts())
+            .unwrap()
+            .replace(
+                r#""steps":[]"#,
+                r#""steps":[{"id":"a","parts":["lid"],"path":[{"direction":"plus_z","distance_mm":"far"}]}]"#,
+            );
+        assert!(Model::from_json(&json).is_err());
     }
 
     #[test]
