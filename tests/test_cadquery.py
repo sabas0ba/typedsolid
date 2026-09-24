@@ -162,7 +162,8 @@ class CadQueryTests(unittest.TestCase):
         self.assertTrue(opened.export_allowed, opened.report)
         blocked = build(replace(block(), keepouts=(replace(keepout, access=("plus_x",)),)))
         self.assertTrue(failures(blocked, "access_clearance"))
-        self.assertEqual(failures(blocked, "access_clearance")[0]["target"], "pcb/block/plus_x")
+        # accessは<keepout>_<direction>の掃引に展開される。
+        self.assertEqual(failures(blocked, "access_clearance")[0]["target"], "pcb_plus_x/block")
 
     def test_access_blocked_even_when_keepout_is_empty(self):
         model = board_tray()

@@ -1,10 +1,11 @@
 from .catalog import Board, MountingHole, Source, board, board_ids
 from .model import (
-    Assembly, Box, Clearance, Cylinder, Feature, Keepout, Model, Move, Part, Policy, Step, boss, hole,
+    Assembly, Box, Clearance, Cylinder, Feature, Keepout, Model, Move, Part, Policy, Step, Sweep,
+    boss, hole,
 )
 
 __all__ = [
     "Assembly", "Board", "Box", "Clearance", "Cylinder", "Feature", "Keepout", "Model", "Move",
-    "MountingHole", "Part", "Policy", "Source", "Step",
+    "MountingHole", "Part", "Policy", "Source", "Step", "Sweep",
     "board", "board_ids", "boss", "hole",
 ]

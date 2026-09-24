@@ -673,6 +673,7 @@ mod tests {
             units: Units::Mm,
             parts: vec![part],
             keepouts: vec![],
+            sweeps: vec![],
             assembly: crate::Assembly::default(),
             policy,
         }

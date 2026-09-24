@@ -40,8 +40,8 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 ## M2: 組立と保守アクセス
 
-- 工具・ケーブル・コネクタ抜き差しの掃引領域
-- lid取り外し等のassembly state、着脱順序、複数軸のアクセス (分解stepと着脱検査は対応済み。keepoutの取り出しは掃引とあわせて後続)
+- 工具・ケーブル・コネクタ抜き差しの掃引領域 (対応済み)
+- lid取り外し等のassembly state、着脱順序、複数軸のアクセス (対応済み。keepoutと部品の取付関係は後続)
 - snap fitと任意ネジ固定、材料・積層方向を含む設計profile
 - backendをworker processへ隔離し、timeout・再開可能な生成を導入 (対応済み)
 
