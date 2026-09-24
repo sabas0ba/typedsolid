@@ -2,7 +2,7 @@ from dataclasses import replace
 import json
 import unittest
 
-from typedsolid import Box, Clearance, Cylinder, Feature, Keepout, Model, Part, Policy, hole
+from typedsolid import Assembly, Box, Clearance, Cylinder, Feature, Keepout, Model, Move, Part, Policy, Step, hole
 from typedsolid import _native
 
 
@@ -63,10 +63,49 @@ class ModelTests(unittest.TestCase):
             "policy": {"min_feature_mm": 1.2, "required": ["single_solid"]},
         }
         upgraded = json.loads(_native.normalize_model(json.dumps(v1)))
-        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["schema_version"], 3)
+        self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
         self.assertEqual(upgraded["parts"][0]["features"][0]["shape"]["kind"], "box")
         self.assertEqual(upgraded["keepouts"][0]["clearance_mm"], {"default": 0.25})
         self.assertEqual(upgraded["keepouts"][0]["access"], ["plus_z"])
+
+    def test_schema_v2_gains_an_empty_assembly(self):
+        data = json.loads(block().to_json())
+        data["schema_version"] = 2
+        del data["assembly"]
+        upgraded = json.loads(_native.normalize_model(json.dumps(data)))
+        self.assertEqual(upgraded["schema_version"], 3)
+        self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
+
+    def test_assembly_serializes_exit_and_omits_unset_clearance(self):
+        lid = Part("lid", (Feature("panel", Box((0, 0, 10), (10, 10, 12))),))
+        steps = (
+            Step("open_lid", ("lid",), (Move("plus_x", 2.0), Move("plus_z"))),
+            Step("lift_base", ("block",), (Move("plus_z", 5.0),), fit_clearance_mm=0.3),
+        )
+        model = replace(block(), parts=(*block().parts, lid), assembly=Assembly(steps, 0.2))
+        data = json.loads(model.to_json())["assembly"]
+        self.assertEqual(data["fit_clearance_mm"], 0.2)
+        self.assertEqual(data["steps"][0]["path"], [
+            {"direction": "plus_x", "distance_mm": 2.0},
+            {"direction": "plus_z", "distance_mm": "exit"},
+        ])
+        self.assertNotIn("fit_clearance_mm", data["steps"][0])
+        self.assertEqual(data["steps"][1]["fit_clearance_mm"], 0.3)
+
+    def test_invalid_assembly_is_rejected(self):
+        lid = Part("lid", (Feature("panel", Box((0, 0, 10), (10, 10, 12))),))
+        two = replace(block(), parts=(*block().parts, lid))
+        cases = {
+            "unknown part": Assembly((Step("a", ("ghost",), (Move("plus_z"),)),)),
+            "removed twice": Assembly((Step("a", ("lid",), (Move("plus_z"),)), Step("b", ("lid",), (Move("plus_z"),)))),
+            "exit not last": Assembly((Step("a", ("lid",), (Move("plus_z"), Move("plus_x", 1.0))),)),
+            "negative clearance": Assembly((Step("a", ("lid",), (Move("plus_z"),)),), -0.1),
+            "zero distance": Assembly((Step("a", ("lid",), (Move("plus_z", 0.0),)),)),
+        }
+        for name, assembly in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                replace(two, assembly=assembly).to_json()
 
     def test_preflight_does_not_approve_geometry(self):
         self.assertFalse(_native.export_allowed(json.dumps(block().preflight())))
@@ -88,6 +127,6 @@ class ModelTests(unittest.TestCase):
             _native.normalize_model(json.dumps(data))
 
     def test_wrong_units_and_schema_rejected(self):
-        for model in [replace(block(), units="in"), replace(block(), schema_version=3)]:
+        for model in [replace(block(), units="in"), replace(block(), schema_version=4)]:
             with self.assertRaises(ValueError):
                 model.to_json()

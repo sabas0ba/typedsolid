@@ -23,6 +23,8 @@ import tempfile
 from typing import Any
 
 import cadquery as cq
+from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+from OCP.gp import gp_Vec
 
 from . import _native, worker
 from .cache import Cache
@@ -42,7 +44,10 @@ EXIT_MARGIN_MM = 2.0
 DEFAULT_TIMEOUT_S = 600.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
+    "disassembly_path", "disassembly_separation",
 )
+# face法線と移動方向の内積をこれ以下とみなす面は、移動方向と平行として扱う。
+PARALLEL_TOLERANCE = 1e-9
 # 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
 MESH_RULES = ("mesh_manifold", "mesh_volume")
 # IRから直接rasterizeして判定する。backendのtopologyに依存しない。
@@ -131,6 +136,165 @@ def _model_bounds(data: dict) -> tuple[list[float], list[float]]:
     )
 
 
+def _vector(axis: int, distance: float) -> cq.Vector:
+    components = [0.0, 0.0, 0.0]
+    components[axis] = distance
+    return cq.Vector(*components)
+
+
+def _prism(face: cq.Face, vector: cq.Vector) -> list[cq.Solid]:
+    maker = BRepPrimAPI_MakePrism(face.wrapped, gp_Vec(vector.x, vector.y, vector.z))
+    maker.Build()
+    return cq.Shape.cast(maker.Shape()).Solids()
+
+
+def _split_coordinates(features: list[dict], axis: int, offset: list[float]) -> list[float]:
+    """axisに垂直な分割平面の位置。axisと異なる軸を持つ円柱ごとに、その中心を通す。"""
+    coordinates = set()
+    for feature in features:
+        shape = feature["shape"]
+        if shape["kind"] != "cylinder":
+            continue
+        cylinder_axis = AXES.index(shape["axis"])
+        if cylinder_axis == axis:
+            continue
+        slot = _perpendicular(cylinder_axis).index(axis)
+        coordinates.add(shape["center"][slot] + offset[axis])
+    return sorted(coordinates)
+
+
+def _swept(shape: cq.Shape, axis: int, distance: float, coordinates: list[float]) -> cq.Shape:
+    """shapeを軸方向にdistanceだけ掃引した立体。
+
+    OCCTはsolidのprismを扱わない。掃引体積は、元の形状、終点の形状、移動方向と
+    平行でない各faceのprismの和に等しい (測度0の差を除く)。境界を横切る線分は
+    移動方向と交差するfaceを通るためである。閉じた円筒面を垂直方向に押し出すと
+    自己交差するため、円筒軸を通り移動方向に垂直な平面で先に分割し、各半面の
+    法線が移動方向に対して一定の向きを持つようにする。
+    """
+    vector = _vector(axis, distance)
+    bounds = shape.BoundingBox()
+    size = 2.0 * bounds.DiagonalLength + 10.0
+    planes = []
+    for coordinate in coordinates:
+        base = [bounds.center.x, bounds.center.y, bounds.center.z]
+        base[axis] = coordinate
+        planes.append(cq.Face.makePlane(size, size, basePnt=cq.Vector(*base), dir=_vector(axis, 1.0)))
+    pieces = shape.split(*planes) if planes else shape
+    threshold = PARALLEL_TOLERANCE * abs(distance)
+    solids = [shape.translate(vector)]
+    for face in pieces.Faces():
+        if abs(face.normalAt().dot(vector)) > threshold:
+            solids += _prism(face, vector)
+    return shape.fuse(*solids).clean()
+
+
+def _laterally_expanded(
+    shape: cq.Shape, axis: int, clearance: float, features: list[dict], offset: list[float],
+) -> cq.Shape:
+    """移動軸に垂直な2軸にだけclearanceだけ広げる。辺長2·clearanceの正方形とのMinkowski和。
+
+    移動方向の手前にある載置面の接触は体積0のまま残り、横ですれ違う面の隙間
+    不足だけが共通体積として現れる。
+    """
+    if clearance == 0.0:
+        return shape
+    for lateral in _perpendicular(axis):
+        shifted = list(offset)
+        shifted[lateral] -= clearance
+        shape = _swept(
+            shape.translate(_vector(lateral, -clearance)), lateral, 2.0 * clearance,
+            _split_coordinates(features, lateral, shifted),
+        )
+    return shape
+
+
+def _add_bounds(parts: list[dict], offset: list[float]) -> tuple[list[float], list[float]] | None:
+    boxes = [
+        _aabb(feature["shape"])
+        for part in parts
+        for feature in part["features"]
+        if feature["operation"] == "add"
+    ]
+    if not boxes:
+        return None
+    return (
+        [min(box[0][i] for box in boxes) + offset[i] for i in range(3)],
+        [max(box[1][i] for box in boxes) + offset[i] for i in range(3)],
+    )
+
+
+def _exit_distance(
+    moving: tuple[list[float], list[float]],
+    remaining: tuple[list[float], list[float]] | None,
+    direction: str,
+) -> float:
+    """残っている部品のAABBの外へ、EXIT_MARGIN_MMの余裕をもって出る距離。"""
+    if remaining is None:
+        return EXIT_MARGIN_MM
+    axis = AXES.index(direction[-1])
+    if direction.startswith("plus"):
+        gap = remaining[1][axis] - moving[0][axis]
+    else:
+        gap = moving[1][axis] - remaining[0][axis]
+    return max(gap, 0.0) + EXIT_MARGIN_MM
+
+
+def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -> list[dict]:
+    """分解stepを順に実行し、移動中の干渉と、経路の終端で外れることを検査する。"""
+    parts = {part["id"]: part for part in data["parts"]}
+    assembly = data["assembly"]
+    present = dict(shapes)
+    checks: list[dict] = []
+    for step in assembly["steps"]:
+        progress(f"step {step['id']}: disassembly")
+        clearance = step.get("fit_clearance_mm", assembly["fit_clearance_mm"])
+        moving_ids = step["parts"]
+        label = f"{step['id']}/{'+'.join(moving_ids)}"
+        moving_shape = present.pop(moving_ids[0])
+        for part_id in moving_ids[1:]:
+            moving_shape = moving_shape.fuse(present.pop(part_id))
+        features = [feature for part_id in moving_ids for feature in parts[part_id]["features"]]
+        remaining_ids = list(present)
+        remaining_bounds = _add_bounds([parts[part_id] for part_id in remaining_ids], [0.0, 0.0, 0.0])
+        offset = [0.0, 0.0, 0.0]
+
+        def sweep_overlaps(direction: str, distance: float) -> dict[str, float]:
+            axis = AXES.index(direction[-1])
+            signed = distance if direction.startswith("plus") else -distance
+            start = moving_shape.translate(cq.Vector(*offset))
+            expanded = _laterally_expanded(start, axis, clearance, features, offset)
+            region = _swept(expanded, axis, signed, _split_coordinates(features, axis, offset))
+            offset[axis] += signed
+            return {part_id: _overlap(region, present[part_id]) for part_id in remaining_ids}
+
+        for index, segment in enumerate(step["path"]):
+            direction = segment["direction"]
+            distance = segment["distance_mm"]
+            if distance == "exit":
+                distance = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, direction)
+            overlaps = sweep_overlaps(direction, distance)
+            if not overlaps:
+                checks.append(_check("disassembly_path", f"{label}/{index}", True, f"{direction} {distance:.6g} mm; no remaining parts"))
+            for part_id, overlap in overlaps.items():
+                checks.append(_check("disassembly_path", f"{label}/{index}/{part_id}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm with fit clearance {clearance} mm: overlap {overlap:.9g} mm³"))
+
+        # 最後の区間の方向へ外まで動かし続けられれば、部品は外れている。
+        last = step["path"][-1]
+        if last["distance_mm"] == "exit":
+            checks.append(_check("disassembly_separation", label, True, f"last segment exits along {last['direction']}"))
+            continue
+        continuation = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, last["direction"])
+        overlaps = sweep_overlaps(last["direction"], continuation)
+        blocking = {part_id: overlap for part_id, overlap in overlaps.items() if overlap > VOLUME_TOLERANCE}
+        message = (
+            f"continuing {continuation:.6g} mm along {last['direction']} "
+            + ("is clear" if not blocking else "is blocked by " + ", ".join(f"{p} ({v:.9g} mm³)" for p, v in blocking.items()))
+        )
+        checks.append(_check("disassembly_separation", label, not blocking, message))
+    return checks
+
+
 def _check(rule: str, target: str, passed: bool, message: str) -> dict:
     return {"rule": rule, "target": target, "status": "pass" if passed else "fail", "message": message}
 
@@ -188,7 +352,7 @@ def _part_shape(part: dict, cache: Cache | None, progress: Progress) -> cq.Shape
 
 
 def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[dict]:
-    """部品ごとにvoxel評価する。評価は部品単位で独立しており、keepoutを使わない。"""
+    """部品ごとにvoxel評価する。評価は部品単位で独立しており、keepoutとassemblyを使わない。"""
     checks: list[dict] = []
     for part in data["parts"]:
         key = "" if cache is None else cache.key("voxel", {"part": part, "policy": data["policy"]})
@@ -198,7 +362,11 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        single = json.dumps({**data, "parts": [part], "keepouts": []}, allow_nan=False)
+        # 単部品のモデルとして評価する。分解stepは他の部品を参照するため除く。
+        single = json.dumps(
+            {**data, "parts": [part], "keepouts": [], "assembly": {"fit_clearance_mm": 0.0, "steps": []}},
+            allow_nan=False,
+        )
         result = json.loads(_native.evaluate_voxels(single))
         if cache is not None:
             cache.put(key, json.dumps(result).encode())
@@ -256,6 +424,7 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
         for (left, a), (right, b) in combinations(shapes.items(), 2):
             overlap = _overlap(a, b)
             geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³"))
+        geometry += _disassembly_checks(data, shapes, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):
                 geometry.append(_check(rule, "model", True, "no applicable declared targets"))

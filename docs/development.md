@@ -86,6 +86,22 @@ export(model, ".work/plate")
 
 全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
 
+分解手順は`Assembly`に書く。記述した位置を組立完了の状態とし、stepを上から順に実行する。
+
+```python
+from typedsolid import Assembly, Model, Move, Step
+
+model = Model(
+    parts=(tray, lid),
+    assembly=Assembly(
+        steps=(Step("open_lid", ("lid",), (Move("minus_x", 4.0), Move("plus_z"))),),
+        fit_clearance_mm=0.2,
+    ),
+)
+```
+
+`Move("plus_z")`は残っている部品の外まで動かす。数値を与えるとその距離だけ動かす。`disassembly_path`は各区間の干渉を、`disassembly_separation`は最後の方向へ動かし続けて外れることを検査する。
+
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
 ```python
