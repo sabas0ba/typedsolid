@@ -16,7 +16,7 @@ Rule = Literal[
     "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
-    "support_free", "disassembly_path", "disassembly_separation", "fastener_fit",
+    "support_free", "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
     "strength", "thermal",
 ]
 
@@ -64,6 +64,21 @@ def boss(id: str, axis: Axis, center: Vec2, diameter: float, span: Vec2, role: R
 class Part:
     id: str
     features: tuple[Feature, ...]
+    # Model.materialsのid。snap fitを持つ部品では必須。
+    material: str | None = None
+
+
+@dataclass(frozen=True)
+class Material:
+    """材料。値は利用者が与え、sourceに出典 (データシートの版、試験記録など) を書く。
+
+    allowable_strainは曲げの許容ひずみ (無次元) で、snap fitを持つ部品の材料では必須。
+    """
+
+    id: str
+    name: str
+    source: str
+    allowable_strain: float | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +207,26 @@ class Fastener:
 
 
 @dataclass(frozen=True)
+class SnapFit:
+    """矩形断面の片持ち梁によるsnap fit。
+
+    beamとhookはpartのadd boxのfeature id。length_directionは梁の根元から先端への向き、
+    deflectionは外すときにフックが動く向きで、deflection_mmだけたわませると外れる。
+    stepはpartかmateの一方を動かし、この結合を外す分解stepである。
+    """
+
+    id: str
+    part: str
+    beam: str
+    hook: str
+    length_direction: Direction
+    deflection: Direction
+    deflection_mm: float
+    mate: str
+    step: str
+
+
+@dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
@@ -212,12 +247,13 @@ class Policy:
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
         "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
-        "disassembly_path", "disassembly_separation", "fastener_fit",
+        "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
     )
 
 
 def _without_unset(value: Any) -> Any:
-    """未指定の値をJSONから除く。対象は面別clearance、stepのfit_clearance_mm、Sweepの省略可能な値である。
+    """未指定の値をJSONから除く。対象は面別clearance、stepのfit_clearance_mm、Sweepの省略可能な値、
+    部品のmaterial、材料のallowable_strainである。
 
     asdictはtupleをtupleのまま返すため、listと同じに扱わないと入れ子を降りられない。
     """
@@ -245,12 +281,14 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 5
+    schema_version: int = 6
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
     sweeps: tuple[Sweep, ...] = ()
     fasteners: tuple[Fastener, ...] = ()
+    materials: tuple[Material, ...] = ()
+    snap_fits: tuple[SnapFit, ...] = ()
 
     def to_json(self) -> str:
         data = _expand_access(_without_unset(asdict(self)))

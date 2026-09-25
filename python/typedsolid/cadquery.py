@@ -44,7 +44,7 @@ EXIT_MARGIN_MM = 2.0
 DEFAULT_TIMEOUT_S = 600.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
-    "disassembly_path", "disassembly_separation", "fastener_fit",
+    "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
 )
 # ネジの頭の座面として、座面からclamp側へ材料を要求する深さ。単位はmm。clampが薄ければその厚みまでとする。
 BEARING_DEPTH_MM = 0.5
@@ -217,14 +217,75 @@ def _exit_distance(
     return max(gap, 0.0) + EXIT_MARGIN_MM
 
 
-def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -> list[dict]:
-    """分解stepを順に実行し、移動中の干渉と、経路の終端で外れることを検査する。"""
+@dataclass(frozen=True)
+class _Snap:
+    """snap fit 1件の形状。
+
+    hookとbeamはcutを反映した実体、deflectedはフックをたわませた位置に置いたもの、
+    envelopeは梁をたわむ向きへdeflection_mmだけ掃引した、曲がった梁を含む包絡である。
+    """
+
+    data: dict
+    hook: cq.Shape
+    beam: cq.Shape
+    rest: cq.Shape | None
+    deflected: cq.Shape
+    envelope: cq.Shape
+
+
+def _snap_shapes(data: dict, shapes: dict[str, cq.Shape]) -> list[_Snap]:
+    """snap fitごとに、フックと梁の実体、それらを除いた部品、たわんだフックと梁の包絡を作る。
+
+    フックは梁の根元を支点に曲がるが、たわみの分だけ平行に動かして近似する。
+    曲がった梁は、梁を同じ量だけ平行に掃引した包絡に含まれる。根元は実際には
+    動かないため、この包絡は保守側である。
+    """
+    parts = {part["id"]: part for part in data["parts"]}
+    result = []
+    for snap in data["snap_fits"]:
+        features = parts[snap["part"]]["features"]
+        by_id = {feature["id"]: feature for feature in features}
+        shape = shapes[snap["part"]]
+        hook = shape.intersect(_solid(by_id[snap["hook"]]["shape"]))
+        beam = shape.intersect(_solid(by_id[snap["beam"]]["shape"]))
+        others = [f for f in features if f["id"] not in (snap["beam"], snap["hook"])]
+        rest = _shape_of(others) if any(f["operation"] == "add" for f in others) else None
+        axis = AXES.index(snap["deflection"][-1])
+        signed = snap["deflection_mm"] if snap["deflection"].startswith("plus") else -snap["deflection_mm"]
+        envelope = _swept(beam, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        result.append(_Snap(snap, hook, beam, rest, hook.translate(_vector(axis, signed)), envelope))
+    return result
+
+
+def _released(part: dict, snaps: list[_Snap]) -> cq.Shape:
+    """同じstepで外すsnap fitのフックをすべてたわませ、梁の包絡を加えた部品。
+
+    経路に沿って掃引されるため、途中の障害物も曲がった梁との干渉として検出する。
+    """
+    hooks = {snap.data["hook"] for snap in snaps}
+    shape = _shape_of([f for f in part["features"] if f["id"] not in hooks])
+    for snap in snaps:
+        shape = shape.fuse(snap.envelope).fuse(snap.deflected)
+    return shape.clean()
+
+
+def _disassembly_checks(
+    data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], progress: Progress,
+) -> list[dict]:
+    """分解stepを順に実行し、移動中の干渉と、経路の終端で外れることを検査する。
+
+    snap fitを外すstepでは、フックをたわませた部品で経路を掃引する。あわせて、
+    たわませないフックがそのstepの経路を塞ぐこと (保持) を検査する。
+    """
     parts = {part["id"]: part for part in data["parts"]}
     assembly = data["assembly"]
     present = dict(shapes)
     checks: list[dict] = []
     for step in assembly["steps"]:
         progress(f"step {step['id']}: disassembly")
+        releasing = [snap for snap in snaps if snap.data["step"] == step["id"]]
+        for part_id in {snap.data["part"] for snap in releasing}:
+            present[part_id] = _released(parts[part_id], [snap for snap in releasing if snap.data["part"] == part_id])
         clearance = step.get("fit_clearance_mm", assembly["fit_clearance_mm"])
         moving_ids = step["parts"]
         label = f"{step['id']}/{'+'.join(moving_ids)}"
@@ -235,6 +296,7 @@ def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progr
         remaining_ids = list(present)
         remaining_bounds = _add_bounds([parts[part_id] for part_id in remaining_ids], [0.0, 0.0, 0.0])
         offset = [0.0, 0.0, 0.0]
+        segments: list[tuple[str, float]] = []
 
         def sweep_overlaps(direction: str, distance: float) -> dict[str, float]:
             axis = AXES.index(direction[-1])
@@ -250,6 +312,7 @@ def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progr
             distance = segment["distance_mm"]
             if distance == "exit":
                 distance = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, direction)
+            segments.append((direction, distance))
             overlaps = sweep_overlaps(direction, distance)
             if not overlaps:
                 checks.append(_check("disassembly_path", f"{label}/{index}", True, f"{direction} {distance:.6g} mm; no remaining parts"))
@@ -260,16 +323,47 @@ def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progr
         last = step["path"][-1]
         if last["distance_mm"] == "exit":
             checks.append(_check("disassembly_separation", label, True, f"last segment exits along {last['direction']}"))
-            continue
-        continuation = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, last["direction"])
-        overlaps = sweep_overlaps(last["direction"], continuation)
-        blocking = {part_id: overlap for part_id, overlap in overlaps.items() if overlap > VOLUME_TOLERANCE}
-        message = (
-            f"continuing {continuation:.6g} mm along {last['direction']} "
-            + ("is clear" if not blocking else "is blocked by " + ", ".join(f"{p} ({v:.9g} mm³)" for p, v in blocking.items()))
-        )
-        checks.append(_check("disassembly_separation", label, not blocking, message))
+        else:
+            continuation = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, last["direction"])
+            overlaps = sweep_overlaps(last["direction"], continuation)
+            blocking = {part_id: overlap for part_id, overlap in overlaps.items() if overlap > VOLUME_TOLERANCE}
+            message = (
+                f"continuing {continuation:.6g} mm along {last['direction']} "
+                + ("is clear" if not blocking else "is blocked by " + ", ".join(f"{p} ({v:.9g} mm³)" for p, v in blocking.items()))
+            )
+            checks.append(_check("disassembly_separation", label, not blocking, message))
+
+        for snap in releasing:
+            checks.append(_retention_check(snap, shapes, parts, moving_ids, segments))
+            # stepの後に残る部品では、フックは元の位置へ戻る。
+            if snap.data["part"] in present:
+                present[snap.data["part"]] = shapes[snap.data["part"]]
     return checks
+
+
+def _retention_check(
+    snap: _Snap, shapes: dict[str, cq.Shape], parts: dict[str, dict], moving_ids: list[str],
+    segments: list[tuple[str, float]],
+) -> dict:
+    """たわませないフックとmateの相対運動がstepの経路で干渉する。干渉しなければ保持していない。"""
+    mate_id = snap.data["mate"]
+    # Rust coreの検証により、stepはpartとmateの一方だけを動かす。
+    if snap.data["part"] in moving_ids:
+        piece, obstacle, features = snap.hook, shapes[mate_id], []
+    else:
+        piece, obstacle, features = shapes[mate_id], snap.hook, parts[mate_id]["features"]
+    offset = [0.0, 0.0, 0.0]
+    total = 0.0
+    for direction, distance in segments:
+        axis = AXES.index(direction[-1])
+        signed = distance if direction.startswith("plus") else -distance
+        region = _swept(piece.translate(cq.Vector(*offset)), axis, signed, _split_coordinates(features, axis, offset))
+        total += _overlap(region, obstacle)
+        offset[axis] += signed
+    return _check(
+        "snap_fit", f"{snap.data['id']}/retention", total > VOLUME_TOLERANCE,
+        f"undeflected hook against {mate_id} along step {snap.data['step']}: overlap {total:.9g} mm³",
+    )
 
 
 def _present_after(data: dict, step_id: str | None) -> list[str]:
@@ -281,6 +375,53 @@ def _present_after(data: dict, step_id: str | None) -> list[str]:
             if step["id"] == step_id:
                 break
     return [part["id"] for part in data["parts"] if part["id"] not in removed]
+
+
+def _present_before(data: dict, step_id: str) -> list[str]:
+    """step_idを始める直前に残っている部品。"""
+    removed: set[str] = set()
+    for step in data["assembly"]["steps"]:
+        if step["id"] == step_id:
+            break
+        removed.update(step["parts"])
+    return [part["id"] for part in data["parts"] if part["id"] not in removed]
+
+
+def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], progress: Progress) -> list[dict]:
+    """snap fitの梁とフックが実形状にあり、外すstepの直前の状態でたわむ空間が空いている。
+
+    たわむ空間は、梁とフックをdeflection_mmだけ平行に動かした掃引で表す。根元は実際には
+    動かないため、根元付近では保守側の判定になる。
+    """
+    parts = {part["id"]: part for part in data["parts"]}
+    checks: list[dict] = []
+    for snap in snaps:
+        snap_id, part_id = snap.data["id"], snap.data["part"]
+        progress(f"snap fit {snap_id}")
+        features = parts[part_id]["features"]
+        by_id = {feature["id"]: feature for feature in features}
+        boxes = _solid(by_id[snap.data["beam"]]["shape"]).fuse(_solid(by_id[snap.data["hook"]]["shape"]))
+        expected = sum(abs(s.Volume()) for s in boxes.Solids())
+        filled = _overlap(boxes, shapes[part_id])
+        passed = expected - filled <= max(VOLUME_TOLERANCE, FILL_TOLERANCE * expected)
+        checks.append(_check("snap_fit", f"{snap_id}/beam", passed, f"{filled / expected:.6%} of the beam and hook boxes is material of {part_id}"))
+
+        axis = AXES.index(snap.data["deflection"][-1])
+        signed = snap.data["deflection_mm"] if snap.data["deflection"].startswith("plus") else -snap.data["deflection_mm"]
+        hook_region = _swept(snap.hook, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        region = snap.envelope.fuse(hook_region)
+        obstacles = {} if snap.rest is None else {part_id: snap.rest}
+        for other in _present_before(data, snap.data["step"]):
+            if other != part_id:
+                obstacles[other] = shapes[other]
+        blocking = {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
+        blocking = {name: overlap for name, overlap in blocking.items() if overlap > VOLUME_TOLERANCE}
+        message = (
+            f"deflecting {snap.data['deflection_mm']} mm along {snap.data['deflection']} before {snap.data['step']} "
+            + ("is clear" if not blocking else "hits " + ", ".join(f"{name} ({overlap:.9g} mm³)" for name, overlap in blocking.items()))
+        )
+        checks.append(_check("snap_fit", f"{snap_id}/deflection_space", not blocking, message))
+    return checks
 
 
 def _sweep_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -> list[dict]:
@@ -440,6 +581,18 @@ def _open(cache_dir: str | Path | None) -> Cache | None:
     return None if cache_dir is None else Cache(cache_dir)
 
 
+def _shape_of(features: list[dict]) -> cq.Shape:
+    """全Addの和から全Cutを引く。Addを1つ以上含むこと。"""
+    additives = [_solid(f["shape"]) for f in features if f["operation"] == "add"]
+    shape: cq.Shape = additives[0]
+    for additive in additives[1:]:
+        shape = shape.fuse(additive)
+    for feature in features:
+        if feature["operation"] == "cut":
+            shape = shape.cut(_solid(feature["shape"]))
+    return shape.clean()
+
+
 def _part_shape(part: dict, cache: Cache | None, progress: Progress) -> cq.Shape:
     """部品の最終形状。cacheにあればbinary BREPから復元する。"""
     key = "" if cache is None else cache.key("brep", part)
@@ -448,14 +601,7 @@ def _part_shape(part: dict, cache: Cache | None, progress: Progress) -> cq.Shape
         progress(f"part {part['id']}: shape reused")
         return cq.Shape.importBin(io.BytesIO(content))
     progress(f"part {part['id']}: building shape")
-    additives = [_solid(f["shape"]) for f in part["features"] if f["operation"] == "add"]
-    shape: cq.Shape = additives[0]
-    for additive in additives[1:]:
-        shape = shape.fuse(additive)
-    for feature in part["features"]:
-        if feature["operation"] == "cut":
-            shape = shape.cut(_solid(feature["shape"]))
-    shape = shape.clean()
+    shape = _shape_of(part["features"])
     if cache is not None:
         buffer = io.BytesIO()
         shape.exportBin(buffer)
@@ -474,11 +620,11 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定は他の部品やkeepoutを参照するため除く。
+        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定、snap fitは他の部品やkeepoutを参照するため除く。
         single = json.dumps(
             {
                 **data, "parts": [part], "keepouts": [], "sweeps": [],
-                "assembly": {"fit_clearance_mm": 0.0, "steps": []}, "fasteners": [],
+                "assembly": {"fit_clearance_mm": 0.0, "steps": []}, "fasteners": [], "snap_fits": [],
             },
             allow_nan=False,
         )
@@ -531,10 +677,14 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
         for (left, a), (right, b) in combinations(shapes.items(), 2):
             overlap = _overlap(a, b)
             geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³"))
-        geometry += _disassembly_checks(data, shapes, progress)
+        snaps = _snap_shapes(data, shapes)
+        geometry += _disassembly_checks(data, shapes, snaps, progress)
         # 経路上に別部品がある場合も検査するため、残っている部品の外まで掃引する。
         geometry += _sweep_checks(data, shapes, progress)
         geometry += _fastener_checks(data, shapes, progress)
+        # ひずみと積層方向は寸法だけで決まるため、判定をRust coreに置く。
+        geometry += json.loads(_native.evaluate_snap_fits(model_json))
+        geometry += _snap_checks(data, shapes, snaps, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):
                 geometry.append(_check(rule, "model", True, "no applicable declared targets"))

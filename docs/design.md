@@ -18,6 +18,7 @@
 | 基板等のスペース確保 | clearanceで拡張したkeepoutと最終形状の交差体積を評価 | 軸平行box、面ごとのclearance |
 | アクセスの確保 | 部品・工具の移動領域と形状の干渉検査 | 全部品に対する6方向の直線経路 |
 | ネジ固定 | ネジ・インサートの寸法と実形状の整合を検査 | 貫通穴、座面、かかり長さ、先端の逃げ、bossの肉厚 |
+| snap fit | 梁のひずみ、積層方向、たわむ空間、保持、外れる経路を検査 | 矩形断面の片持ち梁 |
 | サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 印刷方向、overhang、bridge |
 | 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 未対応 |
 
@@ -36,10 +37,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v5
+## IR v6
 
-- 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換・材料はまだ扱わない。
-- `Model`は`schema_version=5`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`policy`を持つ。
+- 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
+- `Model`は`schema_version=6`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
@@ -57,24 +58,28 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0は硬い干渉だけを見る。
 - `Fastener`はネジ1本の固定を表し、`clamp`の部品を`base`の部品へ締める。`direction`は締め込む向き (頭から先端へ)、`center`は軸に垂直な面上の座標、`seat_mm`は頭の座面、`joint_mm`はclampとbaseの境目の軸方向の座標である。`screw`は長さ (座面から先端)、ねじ部の外径、頭の外径を、`through_mm`はclampの貫通穴の径を持つ。`anchor`は`self_tapping` (`pilot_mm`: 下穴径) か`insert` (`hole_mm`: 圧入前の下穴径、`length_mm`: インサート長。境目と面一に埋める) である。要求値として`min_engagement_mm`と`min_boss_wall_mm`を持つ。
 - ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
-- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`とはめ合い隙間を作る入力に留める。
+- `SnapFit`は矩形断面の片持ち梁によるsnap fitを表す。`part`の2つのadd box feature を`beam`と`hook`として参照し、`length_direction` (梁の根元から先端への向き)、`deflection` (外すときにフックが動く向き)、`deflection_mm`、フックが掛かる`mate`、外す分解`step`を持つ。梁の寸法はboxから求め、IRに重ねて持たない。
+- Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かし、両者ともそれ以前のstepで取り外されていない。
+- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・100材料・1000 snap fit・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
 ### 旧版からの昇格
 
-`schema_version`が1〜4のJSONは、読み込み時に順に昇格してv5へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜5のJSONは、読み込み時に順に昇格してv6へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
 - v3→v4: keepoutの`access`の各方向を、組立完了の状態で外まで抜く`Sweep`へ移す。idは`<keepout>_<direction>`とし、idの規則を満たさない場合は昇格を拒否してkeepout idの短縮を求める。v3の入力に`sweeps`が現れた場合は拒否する。
 - v4→v5: v4はネジ固定を持たないため、空の`fasteners`を補う。v4の入力に`fasteners`が現れた場合は拒否する。
+- v5→v6: v5は材料とsnap fitを持たないため、空の`materials`と`snap_fits`を補う。部品の`material`は省略可能であり、v5の部品はそのまま読める。v5の入力にこれらが現れた場合は拒否する。
 
-出力は常にv5で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv6で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
 検査は`pass / fail / not_evaluated`の3状態とし、rule ID・target ID・理由を保持する。1件でもfailがある場合、またはrequiredルールが全件passでない場合、出力を拒否する。preflightだけでは標準policyの出力条件を満たさない。
 
-標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定の検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
+標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit/snap_fit`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定・snap fitの検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
 `strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
@@ -157,6 +162,28 @@ backend例外、無効形状、空形状をfailとして保持する。依存を
 カーネルのhard crashやhangはPython例外処理では隔離できない。`export`はbackendを子processで実行し、親がtimeoutで打ち切る。子は`python -m typedsolid._worker_entry`として新しいinterpreterで起動し、targetをmodule名と関数名で受け取る。OCCTが内部に持つthreadの状態を複製するforkは使わない。multiprocessingのspawnも使わない。spawnは子の起動時に呼び出し元の`__main__`を読み込み直すため、`if __name__ == "__main__"`の無いscriptでは子が同じscriptを再実行し、標準入力から実行した場合は読み込み自体に失敗する。親子の通信は専用のpipeで行い、標準出力は使わない。POSIXに限る。子の例外は同じ型で親へ戻し、結果を返さずに終了した子は`WorkerCrashed`とする。出力先のstagingは親が作成・破棄するため、打ち切られても残骸を残さない。`build`は形状を呼び出し側へ返すため同一processで動き、打ち切りの対象外である。
 
 部品単位の生成結果 (binary BREPとvoxel評価) は、指定した場合に限りcacheへ保存する。keyは部品のIR、voxel評価ではpolicyも含め、backendのsource、native module、CAD kernelの版から作るため、実装が変わると古い結果は参照されない。cacheから読んだ形状も新たに作った形状と同じ検査を通り、判定には関与しない。
+
+## snap fitの検査
+
+`snap_fit`はsnap fitごとに次の5項目を`<snap fit>/<項目>`のtargetで報告する。`strain`と`layer`は寸法だけで決まるためRust coreが判定し、他はbackendがOCCTのBooleanで判定する。
+
+| 項目 | 内容 |
+| --- | --- |
+| `strain` | 梁の根元のひずみ ε = 1.5·t·y/L² が材料の`allowable_strain`以下 |
+| `layer` | 梁の長さ方向が`policy.build_direction`と平行でない |
+| `beam` | 梁とフックのboxが部品の最終形状の材料で埋まっている。cutで削られていない |
+| `deflection_space` | 外すstepの直前の状態で、梁とフックを`deflection_mm`だけたわむ向きへ動かした掃引が、同じ部品の他の部分と他の部品に干渉しない |
+| `retention` | たわませないフックと`mate`の相対運動が、外すstepの経路で干渉する。干渉しなければフックは何も保持していない |
+
+**ひずみ**は、先端荷重を受ける一様矩形断面の片持ち梁で求める。たわみ δ = F·L³/(3·E·I) と根元の曲げ応力 σ = F·L·(t/2)/I から ε = σ/E = 3·t·δ/(2·L²) である。tはたわむ向きの厚み、yは`deflection_mm`、Lは根元からフックの根元側の端までの長さとする。荷重点を最も根元側に置くため、フックの範囲で荷重点が動く場合に対して保守側となる。根元の応力集中、テーパ梁、大変形は扱わない。応力集中を避ける根元の丸みは面取りと同じくedge選択に依存するため導入していない。
+
+**積層方向**は、梁の長さ方向が積層方向と平行な場合をfailとする。このとき根元の曲げ応力は層間を引き離す向きに掛かり、強度が一般に層内より低い層間の強度で決まるためである。
+
+**外れる経路**は分解の検査が見る。外すstepでは、フックを`deflection_mm`だけたわむ向きへ平行に動かし、梁を同じ量だけ掃引した包絡を加えた部品で`disassembly_path`と`disassembly_separation`を評価する。曲がった梁はこの包絡に含まれ、経路に沿って掃引されるため、途中の障害物との干渉も検出する。根元は実際には動かないため保守側である。同じstepで同じ部品の複数のsnap fitを外す場合は、すべてのフックをたわませる。stepの後に部品が残る場合、フックは元の位置へ戻る。
+
+分解stepに`fit_clearance_mm`を要求すると、たわんだフックと爪の横方向の隙間もその値を要求される。フックの張り出しと同じ`deflection_mm`では隙間が0となるため、張り出しにclearanceを加えた値を与えるか、そのstepの`fit_clearance_mm`を0とする。
+
+Python APIの`snap_fit`は、根元の面の中心、寸法、向きから梁とフックのfeatureと`SnapFit`を作る。
 
 ## 解析への拡張
 
