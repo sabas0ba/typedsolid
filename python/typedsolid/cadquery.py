@@ -44,8 +44,14 @@ EXIT_MARGIN_MM = 2.0
 DEFAULT_TIMEOUT_S = 600.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
-    "disassembly_path", "disassembly_separation",
+    "disassembly_path", "disassembly_separation", "fastener_fit",
 )
+# ネジの頭の座面として、座面からclamp側へ材料を要求する深さ。単位はmm。clampが薄ければその厚みまでとする。
+BEARING_DEPTH_MM = 0.5
+# 領域全体が材料であることの判定で許す不足体積の相対量。円筒面の一致による演算誤差を吸収する。
+FILL_TOLERANCE = 1e-6
+# 体積を断面積で割って得るかかり長さの比較で許す誤差。単位はmm。
+LENGTH_TOLERANCE = 1e-6
 # face法線と移動方向の内積をこれ以下とみなす面は、移動方向と平行として扱う。
 PARALLEL_TOLERANCE = 1e-9
 # 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
@@ -313,6 +319,94 @@ def _sweep_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -
     return checks
 
 
+def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -> list[dict]:
+    """ネジ固定の寸法が実形状と整合する。組立完了の状態で、ネジ1本ごとに5項目を見る。
+
+    through: clampの貫通穴の径にclampの材料がない。
+    bearing: 頭の座面の輪帯がclampの材料で埋まっている。
+    engagement: ねじ山がかかる長さが要求以上ある。
+    clear_tip: 下穴とインサート穴、インサートより先のねじ部の経路にbaseの材料がない。
+    boss_wall: 下穴またはインサート穴の周囲にmin_boss_wall_mmの肉がある。
+    """
+    checks: list[dict] = []
+    for fastener in data["fasteners"]:
+        fastener_id = fastener["id"]
+        progress(f"fastener {fastener_id}")
+        direction = fastener["direction"]
+        sign = 1.0 if direction.startswith("plus") else -1.0
+        seat, joint = fastener["seat_mm"], fastener["joint_mm"]
+        screw, anchor = fastener["screw"], fastener["anchor"]
+        major = screw["major_mm"]
+        tip = seat + sign * screw["length_mm"]
+        base = shapes[fastener["base"]]
+
+        def cylinder(diameter: float, start: float, end: float) -> cq.Solid:
+            shape = {
+                "kind": "cylinder", "axis": direction[-1], "center": fastener["center"],
+                "radius": diameter / 2.0, "span": [min(start, end), max(start, end)],
+            }
+            return _solid(shape)
+
+        def filled(inner: float, outer: float, start: float, end: float, material: cq.Shape) -> tuple[bool, float]:
+            """輪帯のうち材料で埋まっている割合。"""
+            ring = cylinder(outer, start, end).cut(cylinder(inner, start, end))
+            expected = math.pi * (outer**2 - inner**2) / 4.0 * abs(end - start)
+            present = _overlap(ring, material)
+            return expected - present <= max(VOLUME_TOLERANCE, FILL_TOLERANCE * expected), present / expected
+
+        def record(aspect: str, passed: bool, message: str) -> None:
+            checks.append(_check("fastener_fit", f"{fastener_id}/{aspect}", passed, message))
+
+        if not fastener["clamp"]:
+            for aspect in ("through", "bearing"):
+                record(aspect, True, "no clamp part declared; the clamped object is not modelled")
+        else:
+            clamp = shapes[fastener["clamp"][0]]
+            for part_id in fastener["clamp"][1:]:
+                clamp = clamp.fuse(shapes[part_id])
+            through = fastener["through_mm"]
+            overlap = _overlap(cylinder(through, seat, joint), clamp)
+            record("through", overlap <= VOLUME_TOLERANCE, f"clamp material inside the {through} mm through hole: {overlap:.9g} mm³")
+            depth = min(BEARING_DEPTH_MM, sign * (joint - seat))
+            passed, fraction = filled(through, screw["head_mm"], seat, seat + sign * depth, clamp)
+            record("bearing", passed, f"{fraction:.6%} of the ring between {through} and {screw['head_mm']} mm, {depth:.6g} mm under the head, is clamp material")
+
+        reach = sign * (tip - joint)
+        if anchor["kind"] == "self_tapping":
+            bore = anchor["pilot_mm"]
+            span = reach
+            if reach > 0.0:
+                area = math.pi * (major**2 - bore**2) / 4.0
+                ring = cylinder(major, joint, tip).cut(cylinder(bore, joint, tip))
+                engaged = _overlap(ring, base) / area
+                blocked = _overlap(cylinder(bore, joint, tip), base)
+            else:
+                engaged, blocked = 0.0, 0.0
+            engagement = f"thread between {bore} and {major} mm engages {engaged:.6g} mm of base over a reach of {reach:.6g} mm"
+        else:
+            bore, length = anchor["hole_mm"], anchor["length_mm"]
+            span = length
+            engaged = min(max(reach, 0.0), length)
+            bottom = joint + sign * length
+            blocked = _overlap(cylinder(bore, joint, bottom), base)
+            if reach > length:
+                blocked += _overlap(cylinder(major, bottom, tip), base)
+            engagement = f"screw reaches {reach:.6g} mm past the joint into a {length} mm insert; engages {engaged:.6g} mm"
+        required = fastener["min_engagement_mm"]
+        record("engagement", engaged >= required - LENGTH_TOLERANCE, f"{engagement}; required {required} mm")
+        record("clear_tip", blocked <= VOLUME_TOLERANCE, f"base material in the bore and the screw path: {blocked:.9g} mm³")
+        wall = fastener["min_boss_wall_mm"]
+        if span > 0.0:
+            passed, fraction = filled(bore, bore + 2.0 * wall, joint, joint + sign * span, base)
+            record("boss_wall", passed, f"{fraction:.6%} of a {wall} mm wall around the {bore} mm bore over {span:.6g} mm is base material")
+        else:
+            checks.append({
+                "rule": "fastener_fit", "target": f"{fastener_id}/boss_wall", "status": "not_evaluated",
+                "message": "the screw does not reach past the joint; no bore span to evaluate",
+            })
+    return checks
+
+
 def _check(rule: str, target: str, passed: bool, message: str) -> dict:
     return {"rule": rule, "target": target, "status": "pass" if passed else "fail", "message": message}
 
@@ -380,11 +474,11 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        # 単部品のモデルとして評価する。掃引と分解stepは他の部品やkeepoutを参照するため除く。
+        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定は他の部品やkeepoutを参照するため除く。
         single = json.dumps(
             {
                 **data, "parts": [part], "keepouts": [], "sweeps": [],
-                "assembly": {"fit_clearance_mm": 0.0, "steps": []},
+                "assembly": {"fit_clearance_mm": 0.0, "steps": []}, "fasteners": [],
             },
             allow_nan=False,
         )
@@ -440,6 +534,7 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
         geometry += _disassembly_checks(data, shapes, progress)
         # 経路上に別部品がある場合も検査するため、残っている部品の外まで掃引する。
         geometry += _sweep_checks(data, shapes, progress)
+        geometry += _fastener_checks(data, shapes, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):
                 geometry.append(_check(rule, "model", True, "no applicable declared targets"))

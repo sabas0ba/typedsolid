@@ -119,6 +119,44 @@ sweeps = (
 
 `Move("plus_z")`は残っている部品の外まで動かす。数値を与えるとその距離だけ動かす。`disassembly_path`は各区間の干渉を、`disassembly_separation`は最後の方向へ動かし続けて外れることを検査する。
 
+ネジ固定は`screw_fixing`で作る。ネジとインサートの寸法は規格表や実測から与え、`source`に出典を書く。返り値のfeatureを各部品に加え、掃引と`Fastener`をモデルに渡す。
+
+```python
+from typedsolid import Box, Feature, Model, Part, ScrewSpec, screw_fixing
+
+m2 = ScrewSpec("m2x8_tapping", "手持ちのネジの実測", length_mm=8.0, major_mm=2.0,
+               head_mm=3.8, through_mm=2.4, driver_mm=3.0, pilot_mm=1.6)
+# 蓋 (z=10〜12) を上から、床から立つφ6のbossへ締める。
+corner = screw_fixing(
+    "corner_a", m2, base="tray", clamp=("lid",), direction="minus_z", center=(6.0, 6.0),
+    seat_mm=12.0, joint_mm=10.0, boss_diameter_mm=6.0, boss_from_mm=0.0,
+    tip_clearance_mm=1.0, min_engagement_mm=4.0, min_boss_wall_mm=1.5,
+)
+tray = Part("tray", (Feature("floor", Box((0, 0, 0), (40, 30, 2))),) + corner.base_features)
+lid = Part("lid", (Feature("panel", Box((0, 0, 10), (40, 30, 12))),) + corner.clamp_features)
+model = Model(parts=(tray, lid), sweeps=(corner.sweep,), fasteners=(corner.fastener,))
+```
+
+熱圧入インサートを使う場合は`insert=InsertSpec(name, source, hole_mm, length_mm)`を与える。インサートは境目と面一に埋め、下穴はネジの先端と`tip_clearance_mm`の分まで延ばす。検査項目は [設計](design.md#ネジ固定の検査) を参照する。
+
+材料と印刷機の値は`Profile`にまとめ、`Policy`と`Assembly`を作る。profileはIRに現れない。値はすべて必須で、既定値はない。
+
+```python
+from typedsolid import Material, Printer, Profile
+
+profile = Profile(
+    material=Material("pla_lot_a", "社内の曲げ試験記録", allowable_strain=0.02),
+    printer=Printer("printer_a", nozzle_mm=0.4, layer_mm=0.2, fit_clearance_mm=0.2),
+    min_wall_mm=1.6, min_neck_mm=2.0, min_feature_mm=0.8,
+    overhang_angle_deg=45.0, bridge_max_mm=5.0, build_direction="plus_z",
+)
+model = Model(parts=(tray, lid), policy=profile.policy(voxel_mm=0.4),
+              assembly=profile.assembly(steps), sweeps=(corner.sweep,),
+              fasteners=(corner.fastener,))
+```
+
+`allowable_strain`は後続のsnap fitの検査で使う。
+
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
 ```python
