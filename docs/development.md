@@ -100,6 +100,23 @@ model = Model(
 )
 ```
 
+工具・ケーブル・コネクタの通り道と、keepoutの取り出しは`Sweep`に書く。`after_step`を与えると、そのstepを終えた状態で評価する。
+
+```python
+from typedsolid import Box, Cylinder, Sweep
+
+sweeps = (
+    # 蓋を閉じたまま、右壁の開口へUSBプラグを差し込む。
+    Sweep("usb_plug", "minus_x", shape=Box((42, 11, 6), (55, 19, 9)), distance_mm=10.0),
+    # 蓋を外した後、ネジ受けの真上からドライバを抜き差しする。
+    Sweep("driver", "plus_z", shape=Cylinder("z", (10, 15), 1.5, (8, 12)), after_step="open_lid"),
+    # 蓋を外した後、基板を上へ抜く。
+    Sweep("pcb_out", "plus_z", keepout="pcb", after_step="open_lid"),
+)
+```
+
+`Keepout(access=("plus_z",))`は、組立完了の状態で外まで抜く`Sweep("pcb_plus_z", "plus_z", keepout="pcb")`の省略形である。
+
 `Move("plus_z")`は残っている部品の外まで動かす。数値を与えるとその距離だけ動かす。`disassembly_path`は各区間の干渉を、`disassembly_separation`は最後の方向へ動かし続けて外れることを検査する。
 
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
@@ -157,7 +174,7 @@ export(model, ".work/out", timeout_s=120, cache_dir=".work/cache",
 
 ```
 [    0.1 s] part board_tray: building shape
-[    0.3 s] keepout, access and interference checks
+[    0.3 s] keepout and interference checks
 [    0.3 s] part board_tray: voxel evaluation
 [    7.5 s] part board_tray: writing stl
 ```

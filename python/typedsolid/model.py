@@ -80,10 +80,33 @@ class Clearance:
 
 @dataclass(frozen=True)
 class Keepout:
+    """確保領域。accessは組立完了の状態で外まで抜く掃引の省略形である。
+
+    to_jsonはaccessの各方向を、idが`<keepout>_<direction>`のSweepへ展開する。
+    分解stepの後で抜く場合や距離を限る場合は、Sweepを直接書く。
+    """
+
     id: str
     shape: Shape
     clearance_mm: Clearance = field(default_factory=Clearance)
     access: tuple[Direction, ...] = ()
+
+
+@dataclass(frozen=True)
+class Sweep:
+    """工具・ケーブル・コネクタ、またはkeepoutを取り出す際に通る領域。
+
+    形状はshapeで直接与えるか、keepoutのidを与えてそのclearance込みのboxを使う。
+    形状は包絡であり、指の入る余地などの余裕を含める。after_stepを与えると
+    そのstepを終えた状態で評価し、取り外した部品は障害物にならない。
+    """
+
+    id: str
+    direction: Direction
+    shape: Shape | None = None
+    keepout: str | None = None
+    distance_mm: float | Literal["exit"] = "exit"
+    after_step: str | None = None
 
 
 @dataclass(frozen=True)
@@ -143,7 +166,7 @@ class Policy:
 
 
 def _without_unset(value: Any) -> Any:
-    """未指定の値をJSONから除く。対象は面別clearanceとstepのfit_clearance_mmである。
+    """未指定の値をJSONから除く。対象は面別clearance、stepのfit_clearance_mm、Sweepの省略可能な値である。
 
     asdictはtupleをtupleのまま返すため、listと同じに扱わないと入れ子を降りられない。
     """
@@ -154,18 +177,32 @@ def _without_unset(value: Any) -> Any:
     return value
 
 
+def _expand_access(data: dict) -> dict:
+    """keepoutのaccessをSweepへ展開する。Rust側がv3のaccessを昇格する規則と同じ順とする。"""
+    derived = []
+    for keepout in data["keepouts"]:
+        for direction in keepout.pop("access"):
+            derived.append({
+                "id": f"{keepout['id']}_{direction}", "keepout": keepout["id"],
+                "direction": direction, "distance_mm": "exit",
+            })
+    return {**data, "sweeps": derived + list(data["sweeps"])}
+
+
 @dataclass(frozen=True)
 class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 3
+    schema_version: int = 4
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
+    sweeps: tuple[Sweep, ...] = ()
 
     def to_json(self) -> str:
-        return _native.normalize_model(json.dumps(_without_unset(asdict(self)), allow_nan=False))
+        data = _expand_access(_without_unset(asdict(self)))
+        return _native.normalize_model(json.dumps(data, allow_nan=False))
 
     def preflight(self) -> dict:
         return json.loads(_native.preflight(self.to_json()))

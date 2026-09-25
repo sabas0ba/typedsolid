@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -20,6 +20,8 @@ const MAX_STEPS: usize = 100;
 const MAX_SEGMENTS: usize = 16;
 /// はめ合い隙間の上限。単位はmm。
 const MAX_FIT_CLEARANCE_MM: f64 = 100.0;
+/// 掃引の上限。v3のaccessからの昇格で1 keepoutあたり最大6件生じる。
+const MAX_SWEEPS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,7 +171,7 @@ impl Shape {
         Ok(())
     }
 
-    /// 軸平行境界box。keepoutの膨張やaccessの掃引はこれを基準にする。
+    /// 軸平行境界box。keepoutの膨張や掃引はこれを基準にする。
     pub fn aabb(&self) -> ([f64; 3], [f64; 3]) {
         match self {
             Self::Box { min, max } => (*min, *max),
@@ -317,7 +319,6 @@ pub struct Keepout {
     pub id: String,
     pub shape: Shape,
     pub clearance_mm: Clearance,
-    pub access: Vec<Direction>,
 }
 
 /// 経路区間の移動量を数値以外で指定する語。
@@ -417,27 +418,91 @@ impl Assembly {
             }
             let last = step.path.len() - 1;
             for (index, segment) in step.path.iter().enumerate() {
-                match segment.distance_mm {
-                    Distance::Millimetres(value) => {
-                        if !value.is_finite() || value <= 0.0 || value > 2.0 * COORDINATE_LIMIT_MM {
-                            return Err(format!(
-                                "step {} segment {index}: distance_mm must be positive and finite",
-                                step.id
-                            ));
-                        }
-                    }
-                    // 外へ出た後に続く区間は意味を持たない。
-                    Distance::Keyword(DistanceKeyword::Exit) if index != last => {
-                        return Err(format!(
-                            "step {} segment {index}: exit is allowed only on the last segment",
-                            step.id
-                        ));
-                    }
-                    Distance::Keyword(DistanceKeyword::Exit) => {}
+                segment
+                    .distance_mm
+                    .validate()
+                    .map_err(|e| format!("step {} segment {index}: {e}", step.id))?;
+                // 外へ出た後に続く区間は意味を持たない。
+                if index != last && segment.distance_mm == EXIT {
+                    return Err(format!(
+                        "step {} segment {index}: exit is allowed only on the last segment",
+                        step.id
+                    ));
                 }
             }
         }
         Ok(())
+    }
+}
+
+const EXIT: Distance = Distance::Keyword(DistanceKeyword::Exit);
+
+impl Distance {
+    fn validate(self) -> Result<(), String> {
+        match self {
+            Self::Millimetres(value)
+                if !value.is_finite() || value <= 0.0 || value > 2.0 * COORDINATE_LIMIT_MM =>
+            {
+                Err("distance_mm must be positive and finite".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// 工具・ケーブル・コネクタ、またはkeepoutを取り出す際に通る領域。
+///
+/// 形状は`shape`で直接与えるか、`keepout`を参照してそのclearance込みのboxを使う。
+/// `after_step`を与えるとそのstepを終えた状態で評価し、取り外した部品は障害物に
+/// ならない。省略すると組立完了の状態で評価する。形状は工具などの包絡であり、
+/// 指の入る余地などの余裕を含める。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sweep {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<Shape>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepout: Option<String>,
+    pub direction: Direction,
+    pub distance_mm: Distance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_step: Option<String>,
+}
+
+impl Sweep {
+    fn validate(
+        &self,
+        keepout_ids: &BTreeSet<&String>,
+        step_ids: &BTreeSet<&String>,
+    ) -> Result<(), String> {
+        match (&self.shape, &self.keepout) {
+            (Some(shape), None) => shape
+                .validate()
+                .map_err(|e| format!("sweep {}: {e}", self.id))?,
+            (None, Some(keepout)) => {
+                if !keepout_ids.contains(keepout) {
+                    return Err(format!(
+                        "sweep {} refers to unknown keepout {keepout}",
+                        self.id
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "sweep {} requires exactly one of shape and keepout",
+                    self.id
+                ));
+            }
+        }
+        if let Some(step) = &self.after_step
+            && !step_ids.contains(step)
+        {
+            return Err(format!("sweep {} refers to unknown step {step}", self.id));
+        }
+        self.distance_mm
+            .validate()
+            .map_err(|e| format!("sweep {}: {e}", self.id))
     }
 }
 
@@ -570,6 +635,8 @@ pub struct Model {
     pub parts: Vec<Part>,
     pub keepouts: Vec<Keepout>,
     #[serde(default)]
+    pub sweeps: Vec<Sweep>,
+    #[serde(default)]
     pub assembly: Assembly,
     pub policy: Policy,
 }
@@ -646,8 +713,51 @@ fn upgrade_v2(value: &mut Value) -> Result<(), String> {
     if root.contains_key("assembly") {
         return Err("schema_version 2 does not define assembly".into());
     }
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(3));
     root.insert("assembly".into(), json!(Assembly::default()));
+    Ok(())
+}
+
+/// schema v3のJSONをv4へ変換する。keepoutの`access`は、組立完了の状態で外まで
+/// 掃引する`sweeps`へ移す。idは`<keepout>_<direction>`とする。
+fn upgrade_v3(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if root.contains_key("sweeps") {
+        return Err("schema_version 3 does not define sweeps".into());
+    }
+    let mut sweeps = Vec::new();
+    if let Some(keepouts) = root.get_mut("keepouts").and_then(Value::as_array_mut) {
+        for keepout in keepouts {
+            let object = keepout
+                .as_object_mut()
+                .ok_or("keepout entries must be JSON objects")?;
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("keepout requires a string id")?
+                .to_owned();
+            let access = object.remove("access").unwrap_or(json!([]));
+            let directions = access
+                .as_array()
+                .ok_or_else(|| format!("keepout {id}: access must be an array"))?;
+            for direction in directions {
+                let name = direction
+                    .as_str()
+                    .ok_or_else(|| format!("keepout {id}: access entries must be strings"))?;
+                let sweep_id = format!("{id}_{name}");
+                if !identifier(&sweep_id) {
+                    return Err(format!(
+                        "cannot upgrade access of keepout {id}: sweep id {sweep_id} exceeds the id rules; shorten the keepout id"
+                    ));
+                }
+                sweeps.push(json!({
+                    "id": sweep_id, "keepout": id, "direction": name, "distance_mm": "exit",
+                }));
+            }
+        }
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("sweeps".into(), Value::Array(sweeps));
     Ok(())
 }
 
@@ -661,8 +771,13 @@ impl Model {
             Some(1) => {
                 upgrade_v1(&mut value)?;
                 upgrade_v2(&mut value)?;
+                upgrade_v3(&mut value)?;
             }
-            Some(2) => upgrade_v2(&mut value)?,
+            Some(2) => {
+                upgrade_v2(&mut value)?;
+                upgrade_v3(&mut value)?;
+            }
+            Some(3) => upgrade_v3(&mut value)?,
             Some(version) if version == u64::from(SCHEMA_VERSION) => {}
             _ => {
                 return Err(format!(
@@ -760,23 +875,26 @@ impl Model {
                 return Err(format!("invalid or duplicate keepout id: {}", keepout.id));
             }
             keepout.shape.validate()?;
-            // 面別clearanceと6方向accessはboxの面を前提とする。cylinderのkeepoutは
-            // 対応する面が定まらないため受理しない。
+            // 面別clearanceと、それを掃引に使うkeepout参照はboxの面を前提とする。
+            // cylinderのkeepoutは対応する面が定まらないため受理しない。
             if !keepout.shape.is_box() {
                 return Err(format!("keepout {} must be a box", keepout.id));
             }
             keepout.clearance_mm.validate()?;
-            let mut directions = BTreeSet::new();
-            for direction in &keepout.access {
-                if !directions.insert(direction) {
-                    return Err(format!(
-                        "duplicate access direction in keepout {}",
-                        keepout.id
-                    ));
-                }
-            }
         }
-        self.assembly.validate(&part_ids)
+        self.assembly.validate(&part_ids)?;
+        if self.sweeps.len() > MAX_SWEEPS {
+            return Err(format!("at most {MAX_SWEEPS} sweeps are supported"));
+        }
+        let step_ids: BTreeSet<&String> = self.assembly.steps.iter().map(|s| &s.id).collect();
+        let mut sweep_ids = BTreeSet::new();
+        for sweep in &self.sweeps {
+            if !identifier(&sweep.id) || !sweep_ids.insert(&sweep.id) {
+                return Err(format!("invalid or duplicate sweep id: {}", sweep.id));
+            }
+            sweep.validate(&ids, &step_ids)?;
+        }
+        Ok(())
     }
 
     pub fn preflight(&self) -> Result<Report, String> {
@@ -865,6 +983,7 @@ mod tests {
                 }],
             }],
             keepouts: vec![],
+            sweeps: vec![],
             assembly: Assembly::default(),
             policy: Policy {
                 min_feature_mm: 1.2,
@@ -1071,7 +1190,6 @@ mod tests {
                 default: 0.5,
                 faces: BTreeMap::new(),
             },
-            access: vec![],
         });
         assert!(m.validate().is_err());
     }
@@ -1097,8 +1215,7 @@ mod tests {
         assert!(serde_json::from_str::<Clearance>(r#"{"default":0.5,"typo":0.0}"#).is_err());
     }
 
-    #[test]
-    fn duplicate_access_rejected() {
+    fn with_keepout() -> Model {
         let mut m = model();
         m.keepouts.push(Keepout {
             id: "pcb".into(),
@@ -1107,9 +1224,162 @@ mod tests {
                 default: 0.5,
                 faces: BTreeMap::new(),
             },
-            access: vec![Direction::PlusZ, Direction::PlusZ],
         });
-        assert!(m.validate().is_err());
+        m
+    }
+
+    fn sweep(id: &str) -> Sweep {
+        Sweep {
+            id: id.into(),
+            shape: None,
+            keepout: Some("pcb".into()),
+            direction: Direction::PlusZ,
+            distance_mm: EXIT,
+            after_step: None,
+        }
+    }
+
+    #[test]
+    fn sweeps_are_validated() {
+        let driver = Shape::Cylinder {
+            axis: Axis::Z,
+            center: [5., 5.],
+            radius: 1.,
+            span: [2., 6.],
+        };
+        let cases: Vec<(&str, Sweep)> = vec![
+            ("duplicate id", sweep("a")),
+            (
+                "unknown keepout",
+                Sweep {
+                    keepout: Some("ghost".into()),
+                    ..sweep("b")
+                },
+            ),
+            (
+                "both shape and keepout",
+                Sweep {
+                    shape: Some(driver.clone()),
+                    ..sweep("b")
+                },
+            ),
+            (
+                "neither shape nor keepout",
+                Sweep {
+                    keepout: None,
+                    ..sweep("b")
+                },
+            ),
+            (
+                "unknown step",
+                Sweep {
+                    after_step: Some("open_lid".into()),
+                    ..sweep("b")
+                },
+            ),
+            (
+                "zero distance",
+                Sweep {
+                    distance_mm: Distance::Millimetres(0.0),
+                    ..sweep("b")
+                },
+            ),
+            ("invalid id", sweep("../b")),
+            (
+                "invalid shape",
+                Sweep {
+                    shape: Some(Shape::Box {
+                        min: [0.; 3],
+                        max: [0.; 3],
+                    }),
+                    keepout: None,
+                    ..sweep("b")
+                },
+            ),
+        ];
+        for (name, bad) in cases {
+            let mut m = with_keepout();
+            m.sweeps = vec![sweep("a"), bad];
+            assert!(m.validate().is_err(), "{name}");
+        }
+        let mut m = with_keepout();
+        m.sweeps = vec![
+            sweep("a"),
+            Sweep {
+                shape: Some(driver),
+                keepout: None,
+                distance_mm: Distance::Millimetres(10.0),
+                ..sweep("driver")
+            },
+        ];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn sweep_after_a_step_refers_to_it() {
+        let mut m = two_parts();
+        m.keepouts = with_keepout().keepouts;
+        m.assembly.steps = vec![step(
+            "open_lid",
+            &["lid"],
+            vec![segment(Direction::PlusZ, EXIT)],
+        )];
+        m.sweeps = vec![Sweep {
+            after_step: Some("open_lid".into()),
+            ..sweep("pcb_out")
+        }];
+        assert!(m.validate().is_ok());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""after_step":"open_lid""#), "{json}");
+        assert!(!json.contains(r#""shape":null"#), "{json}");
+    }
+
+    #[test]
+    fn schema_v3_access_becomes_sweeps() {
+        let v3 = r#"{
+            "schema_version": 3,
+            "units": "mm",
+            "parts": [{"id":"base","features":[
+                {"id":"plate","role":"base","operation":"add",
+                 "shape":{"kind":"box","min":[0,0,0],"max":[10,10,2]}}
+            ]}],
+            "keepouts": [{"id":"pcb","shape":{"kind":"box","min":[1,1,1],"max":[2,2,2]},
+                          "clearance_mm":{"default":0.5},"access":["plus_z","minus_x"]},
+                         {"id":"cable","shape":{"kind":"box","min":[3,3,3],"max":[4,4,4]},
+                          "clearance_mm":{"default":0.5},"access":[]}],
+            "assembly": {"fit_clearance_mm":0.0,"steps":[]},
+            "policy": {"min_feature_mm":1.2,"required":["single_solid"]}
+        }"#;
+        let model = Model::from_json(v3).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        let ids: Vec<&str> = model.sweeps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["pcb_plus_z", "pcb_minus_x"]);
+        for sweep in &model.sweeps {
+            assert_eq!(sweep.keepout.as_deref(), Some("pcb"));
+            assert_eq!(sweep.distance_mm, EXIT);
+            assert!(sweep.after_step.is_none());
+        }
+        // 重複した方向は同じidの掃引となり、検証で拒否される。
+        let duplicated = v3.replace(r#"["plus_z","minus_x"]"#, r#"["plus_z","plus_z"]"#);
+        assert!(Model::from_json(&duplicated).is_err());
+        // v3はsweepsを定義していない。昇格前の入力に現れたら拒否する。
+        let with_sweeps = v3.replace(r#""assembly""#, r#""sweeps": [], "assembly""#);
+        assert!(Model::from_json(&with_sweeps).is_err());
+    }
+
+    #[test]
+    fn upgrade_rejects_an_access_id_that_would_be_too_long() {
+        let long = "k".repeat(60);
+        let v3 = format!(
+            r#"{{"schema_version":3,"units":"mm",
+                "parts":[{{"id":"base","features":[{{"id":"plate","role":"base","operation":"add",
+                  "shape":{{"kind":"box","min":[0,0,0],"max":[10,10,2]}}}}]}}],
+                "keepouts":[{{"id":"{long}","shape":{{"kind":"box","min":[1,1,1],"max":[2,2,2]}},
+                  "clearance_mm":{{"default":0.5}},"access":["plus_z"]}}],
+                "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
+        );
+        let error = Model::from_json(&v3).unwrap_err();
+        assert!(error.contains("shorten the keepout id"), "{error}");
     }
 
     #[test]
@@ -1130,7 +1400,8 @@ mod tests {
         assert!(model.parts[0].features[0].shape.is_box());
         let keepout = &model.keepouts[0];
         assert_eq!(keepout.clearance_mm.for_face(Direction::PlusX), 0.25);
-        assert_eq!(keepout.access, vec![Direction::PlusZ]);
+        let ids: Vec<&str> = model.sweeps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["pcb_plus_z"]);
     }
 
     #[test]
@@ -1146,12 +1417,12 @@ mod tests {
                           "clearance_mm":0.5,"access":null}],
             "policy": {"min_feature_mm":1.2,"required":["single_solid"]}
         }"#;
-        assert!(Model::from_json(v1).unwrap().keepouts[0].access.is_empty());
+        assert!(Model::from_json(v1).unwrap().sweeps.is_empty());
     }
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "4", "\"2\""] {
+        for version in ["0", "5", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
@@ -1192,8 +1463,6 @@ mod tests {
             distance_mm: distance,
         }
     }
-
-    const EXIT: Distance = Distance::Keyword(DistanceKeyword::Exit);
 
     #[test]
     fn schema_v2_is_upgraded_with_an_empty_assembly() {

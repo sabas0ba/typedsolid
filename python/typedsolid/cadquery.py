@@ -38,7 +38,7 @@ VOLUME_TOLERANCE = 1e-7
 # 1e-9 mm³であり、接触判定の許容差を流用すると正当な最小形状を無効と判定するため、
 # 目的の異なる閾値として独立に定義する。
 EMPTY_VOLUME_TOLERANCE = 1e-12
-# accessの掃引をモデル境界の外へ出す余裕。単位はmm。
+# "exit"で残っている部品の外へ出るときの余裕。単位はmm。
 EXIT_MARGIN_MM = 2.0
 # exportの既定の制限時間。単位は秒。作例はcacheなしで約12秒で終わる。
 DEFAULT_TIMEOUT_S = 600.0
@@ -64,7 +64,7 @@ def _perpendicular(axis: int) -> list[int]:
 
 
 def _aabb(shape: dict) -> tuple[list[float], list[float]]:
-    """軸平行境界box。keepoutの膨張とaccessの掃引はこれを基準にする。"""
+    """軸平行境界box。keepoutの膨張と掃引の距離はこれを基準にする。"""
     if shape["kind"] == "box":
         return list(shape["min"]), list(shape["max"])
     axis = AXES.index(shape["axis"])
@@ -104,35 +104,6 @@ def _expanded(shape: dict, clearance: dict) -> tuple[list[float], list[float]]:
     return (
         [low[i] - clearance.get(NEGATIVE_FACES[i], default) for i in range(3)],
         [high[i] + clearance.get(POSITIVE_FACES[i], default) for i in range(3)],
-    )
-
-
-def _corridor(
-    bounds: tuple[list[float], list[float]],
-    direction: str,
-    model: tuple[list[float], list[float]],
-) -> tuple[tuple[list[float], list[float]], float]:
-    """指定方向へモデル境界の外まで掃引した領域と、その到達位置。"""
-    low, high = list(bounds[0]), list(bounds[1])
-    axis = AXES.index(direction[-1])
-    if direction.startswith("plus"):
-        high[axis] = max(model[1][axis] + EXIT_MARGIN_MM, high[axis])
-        return (low, high), high[axis]
-    low[axis] = min(model[0][axis] - EXIT_MARGIN_MM, low[axis])
-    return (low, high), low[axis]
-
-
-def _model_bounds(data: dict) -> tuple[list[float], list[float]]:
-    """全部品の付加形状を含むAABB。"""
-    boxes = [
-        _aabb(feature["shape"])
-        for part in data["parts"]
-        for feature in part["features"]
-        if feature["operation"] == "add"
-    ]
-    return (
-        [min(box[0][i] for box in boxes) for i in range(3)],
-        [max(box[1][i] for box in boxes) for i in range(3)],
     )
 
 
@@ -295,6 +266,53 @@ def _disassembly_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progr
     return checks
 
 
+def _present_after(data: dict, step_id: str | None) -> list[str]:
+    """step_idを終えた状態で残っている部品。Noneは組立完了の状態。"""
+    removed: set[str] = set()
+    if step_id is not None:
+        for step in data["assembly"]["steps"]:
+            removed.update(step["parts"])
+            if step["id"] == step_id:
+                break
+    return [part["id"] for part in data["parts"] if part["id"] not in removed]
+
+
+def _sweep_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -> list[dict]:
+    """工具・ケーブル・コネクタやkeepoutの掃引が、その状態で残っている部品と干渉しない。
+
+    keepoutを参照する掃引は、keepoutをclearanceの分だけ広げたboxを使う。
+    """
+    parts = {part["id"]: part for part in data["parts"]}
+    keepouts = {keepout["id"]: keepout for keepout in data["keepouts"]}
+    checks: list[dict] = []
+    for sweep in data["sweeps"]:
+        progress(f"sweep {sweep['id']}")
+        if "keepout" in sweep:
+            keepout = keepouts[sweep["keepout"]]
+            bounds = _expanded(keepout["shape"], keepout["clearance_mm"])
+            start = _box_solid(bounds)
+            features: list[dict] = []
+        else:
+            bounds = _aabb(sweep["shape"])
+            start = _solid(sweep["shape"])
+            features = [{"shape": sweep["shape"]}]
+        present = _present_after(data, sweep.get("after_step"))
+        state = sweep.get("after_step", "assembly")
+        direction = sweep["direction"]
+        distance = sweep["distance_mm"]
+        if distance == "exit":
+            distance = _exit_distance(bounds, _add_bounds([parts[p] for p in present], [0.0, 0.0, 0.0]), direction)
+        axis = AXES.index(direction[-1])
+        signed = distance if direction.startswith("plus") else -distance
+        region = _swept(start, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        if not present:
+            checks.append(_check("access_clearance", sweep["id"], True, f"{direction} {distance:.6g} mm after {state}; no remaining parts"))
+        for part_id in present:
+            overlap = _overlap(region, shapes[part_id])
+            checks.append(_check("access_clearance", f"{sweep['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm after {state}: overlap {overlap:.9g} mm³"))
+    return checks
+
+
 def _check(rule: str, target: str, passed: bool, message: str) -> dict:
     return {"rule": rule, "target": target, "status": "pass" if passed else "fail", "message": message}
 
@@ -352,7 +370,7 @@ def _part_shape(part: dict, cache: Cache | None, progress: Progress) -> cq.Shape
 
 
 def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[dict]:
-    """部品ごとにvoxel評価する。評価は部品単位で独立しており、keepoutとassemblyを使わない。"""
+    """部品ごとにvoxel評価する。評価は部品単位で独立しており、keepout、掃引、assemblyを使わない。"""
     checks: list[dict] = []
     for part in data["parts"]:
         key = "" if cache is None else cache.key("voxel", {"part": part, "policy": data["policy"]})
@@ -362,9 +380,12 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        # 単部品のモデルとして評価する。分解stepは他の部品を参照するため除く。
+        # 単部品のモデルとして評価する。掃引と分解stepは他の部品やkeepoutを参照するため除く。
         single = json.dumps(
-            {**data, "parts": [part], "keepouts": [], "assembly": {"fit_clearance_mm": 0.0, "steps": []}},
+            {
+                **data, "parts": [part], "keepouts": [], "sweeps": [],
+                "assembly": {"fit_clearance_mm": 0.0, "steps": []},
+            },
             allow_nan=False,
         )
         result = json.loads(_native.evaluate_voxels(single))
@@ -404,9 +425,7 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
             geometry.append(_check("single_solid", part["id"], len(solids) == 1, f"final solid count: {len(solids)}"))
             shapes[part["id"]] = shape
 
-        # モデル全体の外まで掃引することで、経路上に別部品がある場合も検査する。
-        progress("keepout, access and interference checks")
-        model_bounds = _model_bounds(data)
+        progress("keepout and interference checks")
         for keepout in data["keepouts"]:
             clearance = keepout["clearance_mm"]
             bounds = _expanded(keepout["shape"], clearance)
@@ -415,16 +434,12 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
             for part_id, shape in shapes.items():
                 overlap = _overlap(shape, volume_shape)
                 geometry.append(_check("keepout_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³; clearance: {clearance_text}"))
-            for direction in keepout["access"]:
-                corridor, exit_at = _corridor(bounds, direction, model_bounds)
-                sweep = _box_solid(corridor)
-                for part_id, shape in shapes.items():
-                    overlap = _overlap(shape, sweep)
-                    geometry.append(_check("access_clearance", f"{keepout['id']}/{part_id}/{direction}", overlap <= VOLUME_TOLERANCE, f"{direction} straight access overlap: {overlap:.9g} mm³; exit at {exit_at} mm"))
         for (left, a), (right, b) in combinations(shapes.items(), 2):
             overlap = _overlap(a, b)
             geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³"))
         geometry += _disassembly_checks(data, shapes, progress)
+        # 経路上に別部品がある場合も検査するため、残っている部品の外まで掃引する。
+        geometry += _sweep_checks(data, shapes, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):
                 geometry.append(_check(rule, "model", True, "no applicable declared targets"))
