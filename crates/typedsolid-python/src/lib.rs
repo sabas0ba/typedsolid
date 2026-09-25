@@ -23,6 +23,14 @@ fn evaluate_voxels(json: &str) -> PyResult<String> {
     serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// snap fitのうち寸法だけで決まる検査 (ひずみ、積層方向)。
+#[pyfunction]
+fn evaluate_snap_fits(json: &str) -> PyResult<String> {
+    let model = Model::from_json(json).map_err(PyValueError::new_err)?;
+    let checks = model.evaluate_snap_fits().map_err(PyValueError::new_err)?;
+    serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// 出力STLの構造検査。解析失敗は例外にせず、failのcheckとして返す。
 #[pyfunction]
 fn inspect_mesh(
@@ -47,6 +55,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(normalize_model, module)?)?;
     module.add_function(wrap_pyfunction!(preflight, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_voxels, module)?)?;
+    module.add_function(wrap_pyfunction!(evaluate_snap_fits, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(export_allowed, module)?)?;
     Ok(())

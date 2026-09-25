@@ -642,6 +642,7 @@ mod tests {
         Part {
             id: "block".into(),
             features,
+            material: None,
         }
     }
 
@@ -676,6 +677,8 @@ mod tests {
             sweeps: vec![],
             assembly: crate::Assembly::default(),
             fasteners: vec![],
+            materials: vec![],
+            snap_fits: vec![],
             policy,
         }
     }

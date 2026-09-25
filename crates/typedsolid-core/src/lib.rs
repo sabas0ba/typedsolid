@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -24,6 +24,10 @@ const MAX_FIT_CLEARANCE_MM: f64 = 100.0;
 const MAX_SWEEPS: usize = 1000;
 /// ネジ固定の上限。
 const MAX_FASTENERS: usize = 1000;
+/// 材料の上限。
+const MAX_MATERIALS: usize = 100;
+/// snap fitの上限。
+const MAX_SNAP_FITS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -287,6 +291,9 @@ pub struct Feature {
 pub struct Part {
     pub id: String,
     pub features: Vec<Feature>,
+    /// `materials`のid。材料に依存する検査 (snap fit) を持つ部品では必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
 }
 
 impl Part {
@@ -555,9 +562,7 @@ pub struct Fastener {
 
 fn positive_length(value: f64, name: &str, owner: &str) -> Result<(), String> {
     if !value.is_finite() || value <= 0.0 || value > COORDINATE_LIMIT_MM {
-        return Err(format!(
-            "fastener {owner}: {name} must be positive and finite"
-        ));
+        return Err(format!("{owner}: {name} must be positive and finite"));
     }
     Ok(())
 }
@@ -591,7 +596,7 @@ impl Fastener {
             ("min_engagement_mm", self.min_engagement_mm),
             ("min_boss_wall_mm", self.min_boss_wall_mm),
         ] {
-            positive_length(value, name, &self.id)?;
+            positive_length(value, name, &format!("fastener {}", self.id))?;
         }
         if self.through_mm < screw.major_mm || screw.head_mm <= self.through_mm {
             return Err(format!(
@@ -601,7 +606,7 @@ impl Fastener {
         }
         match self.anchor {
             Anchor::SelfTapping { pilot_mm } => {
-                positive_length(pilot_mm, "pilot_mm", &self.id)?;
+                positive_length(pilot_mm, "pilot_mm", &format!("fastener {}", self.id))?;
                 if pilot_mm >= screw.major_mm {
                     return Err(format!(
                         "fastener {}: pilot_mm must be below major_mm",
@@ -610,8 +615,8 @@ impl Fastener {
                 }
             }
             Anchor::Insert { hole_mm, length_mm } => {
-                positive_length(hole_mm, "hole_mm", &self.id)?;
-                positive_length(length_mm, "length_mm", &self.id)?;
+                positive_length(hole_mm, "hole_mm", &format!("fastener {}", self.id))?;
+                positive_length(length_mm, "length_mm", &format!("fastener {}", self.id))?;
                 if hole_mm <= screw.major_mm {
                     return Err(format!(
                         "fastener {}: insert hole_mm must exceed major_mm",
@@ -631,6 +636,175 @@ impl Fastener {
             return Err(format!(
                 "fastener {}: joint_mm must lie beyond seat_mm along the direction",
                 self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 材料。値は利用者が与え、sourceに出典を書く。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Material {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    /// 曲げの許容ひずみ (無次元)。snap fitを持つ部品の材料では必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowable_strain: Option<f64>,
+}
+
+impl Material {
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [("name", &self.name), ("source", &self.source)] {
+            if value.trim().is_empty() || value.len() > 256 {
+                return Err(format!(
+                    "material {}: {name} must be 1 to 256 bytes",
+                    self.id
+                ));
+            }
+        }
+        if let Some(strain) = self.allowable_strain
+            && (!strain.is_finite() || strain <= 0.0 || strain >= 1.0)
+        {
+            return Err(format!(
+                "material {}: allowable_strain must be in (0, 1)",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 矩形断面の片持ち梁によるsnap fit。
+///
+/// `beam`と`hook`は`part`のadd boxのfeatureである。`length_direction`は梁の根元から
+/// 先端への向き、`deflection`は外すときにフックが動く向きで、`deflection_mm`だけ
+/// たわませると外れる。`step`は`part`か`mate`の一方を動かし、この結合を外す分解stepである。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapFit {
+    pub id: String,
+    pub part: String,
+    pub beam: String,
+    pub hook: String,
+    pub length_direction: Direction,
+    pub deflection: Direction,
+    pub deflection_mm: f64,
+    pub mate: String,
+    pub step: String,
+}
+
+/// 梁の寸法。ひずみの計算に使う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeamGeometry {
+    /// 根元からフックの根元側の端までの長さ。荷重点を最も根元側に置くため保守側になる。
+    pub arm_mm: f64,
+    /// たわむ向きの厚み。
+    pub thickness_mm: f64,
+    /// 長さとたわみの両方に垂直な幅。
+    pub width_mm: f64,
+}
+
+fn box_bounds(part: &Part, feature_id: &str) -> Option<([f64; 3], [f64; 3])> {
+    part.features
+        .iter()
+        .find(|f| f.id == feature_id && f.operation == Operation::Add)
+        .and_then(|f| match f.shape {
+            Shape::Box { min, max } => Some((min, max)),
+            Shape::Cylinder { .. } => None,
+        })
+}
+
+impl SnapFit {
+    /// 梁の寸法。featureが見つからないか、フックが梁の範囲に収まらない場合はNone。
+    pub fn geometry(&self, part: &Part) -> Option<BeamGeometry> {
+        let (beam_min, beam_max) = box_bounds(part, &self.beam)?;
+        let (hook_min, hook_max) = box_bounds(part, &self.hook)?;
+        let along = self.length_direction.axis().index();
+        let across = self.deflection.axis().index();
+        let width = 3 - along - across;
+        let (root, hook_edge) = if self.length_direction.is_positive() {
+            (beam_min[along], hook_min[along])
+        } else {
+            (beam_max[along], hook_max[along])
+        };
+        // フックは梁の長さの範囲にあり、梁に接するか重なる。
+        let within = hook_min[along] >= beam_min[along] && hook_max[along] <= beam_max[along];
+        let touches = (0..3).all(|i| hook_min[i] <= beam_max[i] && hook_max[i] >= beam_min[i]);
+        let arm = (hook_edge - root).abs();
+        (within && touches && arm > 0.0).then_some(BeamGeometry {
+            arm_mm: arm,
+            thickness_mm: beam_max[across] - beam_min[across],
+            width_mm: beam_max[width] - beam_min[width],
+        })
+    }
+
+    /// 先端荷重を受ける一様矩形断面の片持ち梁の根元表面ひずみ。
+    ///
+    /// たわみ δ = F·L³/(3·E·I) と曲げ応力 σ = F·L·(t/2)/I から ε = σ/E = 3·t·δ/(2·L²)。
+    pub fn strain(&self, geometry: BeamGeometry) -> f64 {
+        1.5 * geometry.thickness_mm * self.deflection_mm / geometry.arm_mm.powi(2)
+    }
+
+    fn validate(
+        &self,
+        parts: &BTreeMap<&String, &Part>,
+        materials: &BTreeMap<&String, &Material>,
+        steps: &[Step],
+    ) -> Result<(), String> {
+        let id = &self.id;
+        let part = parts
+            .get(&self.part)
+            .ok_or_else(|| format!("snap fit {id} refers to unknown part {}", self.part))?;
+        let strain = part
+            .material
+            .as_ref()
+            .and_then(|m| materials.get(m))
+            .and_then(|m| m.allowable_strain);
+        if strain.is_none() {
+            return Err(format!(
+                "snap fit {id}: part {} needs a material with allowable_strain",
+                self.part
+            ));
+        }
+        if self.beam == self.hook
+            || box_bounds(part, &self.beam).is_none()
+            || box_bounds(part, &self.hook).is_none()
+        {
+            return Err(format!(
+                "snap fit {id}: beam and hook must be distinct add boxes of part {}",
+                self.part
+            ));
+        }
+        if self.length_direction.axis() == self.deflection.axis() {
+            return Err(format!(
+                "snap fit {id}: deflection must be perpendicular to the length"
+            ));
+        }
+        positive_length(
+            self.deflection_mm,
+            "deflection_mm",
+            &format!("snap fit {id}"),
+        )?;
+        if self.geometry(part).is_none() {
+            return Err(format!(
+                "snap fit {id}: the hook must lie along the beam, away from its root"
+            ));
+        }
+        if !parts.contains_key(&self.mate) || self.mate == self.part {
+            return Err(format!("snap fit {id} has an invalid mate {}", self.mate));
+        }
+        let step = steps
+            .iter()
+            .find(|s| s.id == self.step)
+            .ok_or_else(|| format!("snap fit {id} refers to unknown step {}", self.step))?;
+        let moves_part = step.parts.contains(&self.part);
+        let moves_mate = step.parts.contains(&self.mate);
+        if moves_part == moves_mate {
+            return Err(format!(
+                "snap fit {id}: step {} must move exactly one of {} and {}",
+                self.step, self.part, self.mate
             ));
         }
         Ok(())
@@ -669,12 +843,13 @@ pub enum Rule {
     DisassemblyPath,
     DisassemblySeparation,
     FastenerFit,
+    SnapFit,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -690,6 +865,7 @@ impl Rule {
         Self::DisassemblyPath,
         Self::DisassemblySeparation,
         Self::FastenerFit,
+        Self::SnapFit,
         Self::Strength,
         Self::Thermal,
     ];
@@ -773,6 +949,10 @@ pub struct Model {
     pub assembly: Assembly,
     #[serde(default)]
     pub fasteners: Vec<Fastener>,
+    #[serde(default)]
+    pub materials: Vec<Material>,
+    #[serde(default)]
+    pub snap_fits: Vec<SnapFit>,
     pub policy: Policy,
 }
 
@@ -902,8 +1082,31 @@ fn upgrade_v4(value: &mut Value) -> Result<(), String> {
     if root.contains_key("fasteners") {
         return Err("schema_version 4 does not define fasteners".into());
     }
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(5));
     root.insert("fasteners".into(), json!([]));
+    Ok(())
+}
+
+/// 1版分の昇格。
+type Upgrade = fn(&mut Value) -> Result<(), String>;
+
+/// schema v5のJSONをv6へ変換する。v5は材料とsnap fitを持たないため、空の配列を補う。
+/// 部品の`material`は省略可能であり、v5の部品はそのまま受理する。
+fn upgrade_v5(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    for key in ["materials", "snap_fits"] {
+        if root.contains_key(key) {
+            return Err(format!("schema_version 5 does not define {key}"));
+        }
+    }
+    if let Some(parts) = root.get("parts").and_then(Value::as_array)
+        && parts.iter().any(|p| p.get("material").is_some())
+    {
+        return Err("schema_version 5 does not define part material".into());
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("materials".into(), json!([]));
+    root.insert("snap_fits".into(), json!([]));
     Ok(())
 }
 
@@ -913,24 +1116,15 @@ impl Model {
             return Err("model exceeds 1 MB limit".into());
         }
         let mut value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
+        const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] =
+            [upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5];
         match value.get("schema_version").and_then(Value::as_u64) {
-            Some(1) => {
-                upgrade_v1(&mut value)?;
-                upgrade_v2(&mut value)?;
-                upgrade_v3(&mut value)?;
-                upgrade_v4(&mut value)?;
+            Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
+                for upgrade in &UPGRADES[version as usize - 1..] {
+                    upgrade(&mut value)?;
+                }
             }
-            Some(2) => {
-                upgrade_v2(&mut value)?;
-                upgrade_v3(&mut value)?;
-                upgrade_v4(&mut value)?;
-            }
-            Some(3) => {
-                upgrade_v3(&mut value)?;
-                upgrade_v4(&mut value)?;
-            }
-            Some(4) => upgrade_v4(&mut value)?,
-            Some(version) if version == u64::from(SCHEMA_VERSION) => {}
             _ => {
                 return Err(format!(
                     "unsupported schema_version; this build reads 1 to {SCHEMA_VERSION}"
@@ -1056,6 +1250,37 @@ impl Model {
             }
             fastener.validate(&part_ids)?;
         }
+        if self.materials.len() > MAX_MATERIALS {
+            return Err(format!("at most {MAX_MATERIALS} materials are supported"));
+        }
+        let mut materials = BTreeMap::new();
+        for material in &self.materials {
+            if !identifier(&material.id) || materials.insert(&material.id, material).is_some() {
+                return Err(format!("invalid or duplicate material id: {}", material.id));
+            }
+            material.validate()?;
+        }
+        for part in &self.parts {
+            if let Some(material) = &part.material
+                && !materials.contains_key(material)
+            {
+                return Err(format!(
+                    "part {} refers to unknown material {material}",
+                    part.id
+                ));
+            }
+        }
+        if self.snap_fits.len() > MAX_SNAP_FITS {
+            return Err(format!("at most {MAX_SNAP_FITS} snap fits are supported"));
+        }
+        let parts: BTreeMap<&String, &Part> = self.parts.iter().map(|p| (&p.id, p)).collect();
+        let mut snap_ids = BTreeSet::new();
+        for snap in &self.snap_fits {
+            if !identifier(&snap.id) || !snap_ids.insert(&snap.id) {
+                return Err(format!("invalid or duplicate snap fit id: {}", snap.id));
+            }
+            snap.validate(&parts, &materials, &self.assembly.steps)?;
+        }
         Ok(())
     }
 
@@ -1090,6 +1315,57 @@ impl Model {
             });
         }
         Ok(report)
+    }
+
+    /// snap fitのうち寸法だけで決まる2項目。形状との照合はbackendが行う。
+    ///
+    /// strain: 梁の根元のひずみが材料の許容ひずみ以下。
+    /// layer: 梁の長さ方向が印刷方向と平行でない。平行だと曲げが積層面を引き離す。
+    pub fn evaluate_snap_fits(&self) -> Result<Vec<Check>, String> {
+        self.validate()?;
+        let mut checks = Vec::new();
+        for snap in &self.snap_fits {
+            let part = self
+                .parts
+                .iter()
+                .find(|p| p.id == snap.part)
+                .ok_or("validated snap fit lost its part")?;
+            let geometry = snap
+                .geometry(part)
+                .ok_or("validated snap fit lost its beam")?;
+            let allowable = part
+                .material
+                .as_ref()
+                .and_then(|id| self.materials.iter().find(|m| &m.id == id))
+                .and_then(|m| m.allowable_strain)
+                .ok_or("validated snap fit lost its material")?;
+            let strain = snap.strain(geometry);
+            checks.push(Check {
+                rule: Rule::SnapFit,
+                status: if strain <= allowable { Status::Pass } else { Status::Fail },
+                target: format!("{}/strain", snap.id),
+                message: format!(
+                    "root strain 1.5·t·y/L² = {strain:.6} with t={} mm, y={} mm, L={} mm (root to hook); allowable {allowable}",
+                    geometry.thickness_mm, snap.deflection_mm, geometry.arm_mm
+                ),
+            });
+            let build = self.policy.build_direction.axis();
+            let along = snap.length_direction.axis();
+            checks.push(Check {
+                rule: Rule::SnapFit,
+                status: if along == build {
+                    Status::Fail
+                } else {
+                    Status::Pass
+                },
+                target: format!("{}/layer", snap.id),
+                message: format!(
+                    "beam length along {}; build direction {}",
+                    snap.length_direction, self.policy.build_direction
+                ),
+            });
+        }
+        Ok(checks)
     }
 }
 
@@ -1143,11 +1419,14 @@ mod tests {
                     operation: Operation::Add,
                     shape: plate(),
                 }],
+                material: None,
             }],
             keepouts: vec![],
             sweeps: vec![],
             assembly: Assembly::default(),
             fasteners: vec![],
+            materials: vec![],
+            snap_fits: vec![],
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
@@ -1585,7 +1864,7 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "6", "\"2\""] {
+        for version in ["0", "7", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
@@ -1607,6 +1886,7 @@ mod tests {
                     max: [10., 10., 4.],
                 },
             }],
+            material: None,
         });
         m
     }
@@ -1992,7 +2272,9 @@ mod tests {
     fn schema_v4_is_upgraded_with_no_fasteners() {
         let mut value = serde_json::to_value(model()).unwrap();
         let root = value.as_object_mut().unwrap();
-        root.remove("fasteners");
+        for key in ["fasteners", "materials", "snap_fits"] {
+            root.remove(key);
+        }
         root.insert("schema_version".into(), json!(4));
         let v4 = value.to_string();
         let model = Model::from_json(&v4).unwrap();
@@ -2004,6 +2286,172 @@ mod tests {
             .unwrap()
             .insert("fasteners".into(), json!([]));
         assert!(Model::from_json(&value.to_string()).is_err());
+    }
+
+    fn add_box(id: &str, min: [f64; 3], max: [f64; 3]) -> Feature {
+        Feature {
+            id: id.into(),
+            role: Role::Generic,
+            operation: Operation::Add,
+            shape: Shape::Box { min, max },
+        }
+    }
+
+    /// 蓋の上面から+Zへ立つ梁 (t=1.5 mm)。先端の-X側に1 mm張り出すフックを持つ。
+    fn with_snap() -> Model {
+        let mut m = two_parts();
+        m.materials = vec![Material {
+            id: "pla".into(),
+            name: "test PLA".into(),
+            source: "test fixture".into(),
+            allowable_strain: Some(0.04),
+        }];
+        let lid = &mut m.parts[1];
+        lid.material = Some("pla".into());
+        lid.features
+            .push(add_box("beam", [10., 4., 4.], [11.5, 6., 14.]));
+        lid.features
+            .push(add_box("hook", [9., 4., 12.], [10., 6., 14.]));
+        m.assembly.steps = vec![step(
+            "open_lid",
+            &["lid"],
+            vec![segment(Direction::PlusZ, EXIT)],
+        )];
+        m.snap_fits = vec![SnapFit {
+            id: "clip".into(),
+            part: "lid".into(),
+            beam: "beam".into(),
+            hook: "hook".into(),
+            length_direction: Direction::PlusZ,
+            deflection: Direction::PlusX,
+            deflection_mm: 1.0,
+            mate: "base".into(),
+            step: "open_lid".into(),
+        }];
+        m
+    }
+
+    #[test]
+    fn snap_fit_strain_follows_beam_theory() {
+        let mut m = with_snap();
+        m.policy.build_direction = Direction::PlusX;
+        let checks = m.evaluate_snap_fits().unwrap();
+        // L=12-4=8 mm、t=1.5 mm、y=1 mm: ε = 1.5·1.5·1/64。
+        let geometry = m.snap_fits[0].geometry(&m.parts[1]).unwrap();
+        assert_eq!(
+            geometry,
+            BeamGeometry {
+                arm_mm: 8.0,
+                thickness_mm: 1.5,
+                width_mm: 2.0,
+            }
+        );
+        assert_eq!(m.snap_fits[0].strain(geometry), 0.03515625);
+        let statuses: Vec<(&str, Status)> = checks
+            .iter()
+            .map(|c| (c.target.as_str(), c.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [("clip/strain", Status::Pass), ("clip/layer", Status::Pass)]
+        );
+        m.snap_fits[0].deflection_mm = 1.2;
+        assert_eq!(m.evaluate_snap_fits().unwrap()[0].status, Status::Fail);
+    }
+
+    #[test]
+    fn snap_fit_along_the_build_direction_fails_the_layer_check() {
+        let checks = with_snap().evaluate_snap_fits().unwrap();
+        assert_eq!(checks[1].target, "clip/layer");
+        assert_eq!(checks[1].status, Status::Fail);
+    }
+
+    #[test]
+    fn snap_fit_round_trips_with_materials() {
+        let json = serde_json::to_string(&with_snap()).unwrap();
+        assert!(json.contains(r#""material":"pla""#), "{json}");
+        assert!(json.contains(r#""allowable_strain":0.04"#), "{json}");
+        let back = Model::from_json(&json).unwrap();
+        assert_eq!(back.snap_fits.len(), 1);
+        // materialを持たない部品はfieldを出力しない。
+        let base = serde_json::to_value(&back.parts[0]).unwrap();
+        assert!(base.get("material").is_none(), "{base}");
+    }
+
+    #[test]
+    fn invalid_snap_fits_are_rejected() {
+        type Edit = fn(&mut Model);
+        let cases: Vec<(&str, Edit)> = vec![
+            ("no material", |m| m.parts[1].material = None),
+            ("material without strain", |m| {
+                m.materials[0].allowable_strain = None
+            }),
+            ("strain out of range", |m| {
+                m.materials[0].allowable_strain = Some(1.5)
+            }),
+            ("unknown material", |m| {
+                m.parts[1].material = Some("abs".into())
+            }),
+            ("duplicate material", |m| {
+                m.materials.push(m.materials[0].clone())
+            }),
+            ("empty material source", |m| {
+                m.materials[0].source = " ".into()
+            }),
+            ("beam is the hook", |m| m.snap_fits[0].hook = "beam".into()),
+            ("hook is not a feature", |m| {
+                m.snap_fits[0].hook = "ghost".into()
+            }),
+            ("hook is a cut", |m| {
+                m.parts[1].features[2].operation = Operation::Cut
+            }),
+            ("hook apart from the beam", |m| {
+                m.parts[1].features[2] = add_box("hook", [8., 4., 12.], [9., 6., 14.])
+            }),
+            ("hook at the root", |m| {
+                m.parts[1].features[2] = add_box("hook", [9., 4., 4.], [10., 6., 6.])
+            }),
+            ("hook beyond the tip", |m| {
+                m.parts[1].features[2] = add_box("hook", [9., 4., 13.], [10., 6., 15.])
+            }),
+            ("deflection along the length", |m| {
+                m.snap_fits[0].deflection = Direction::MinusZ
+            }),
+            ("zero deflection", |m| m.snap_fits[0].deflection_mm = 0.0),
+            ("unknown mate", |m| m.snap_fits[0].mate = "ghost".into()),
+            ("mate is the part", |m| m.snap_fits[0].mate = "lid".into()),
+            ("unknown step", |m| m.snap_fits[0].step = "ghost".into()),
+            ("step moves both", |m| {
+                m.assembly.steps[0].parts.push("base".into())
+            }),
+            ("duplicate id", |m| m.snap_fits.push(m.snap_fits[0].clone())),
+        ];
+        assert!(with_snap().validate().is_ok());
+        for (name, edit) in cases {
+            let mut m = with_snap();
+            edit(&mut m);
+            assert!(m.validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn schema_v5_is_upgraded_with_no_materials_or_snap_fits() {
+        let mut value = serde_json::to_value(model()).unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("materials");
+        root.remove("snap_fits");
+        root.insert("schema_version".into(), json!(5));
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.materials.is_empty() && model.snap_fits.is_empty());
+        for (key, entry) in [("materials", json!([])), ("snap_fits", json!([]))] {
+            let mut bad = value.clone();
+            bad.as_object_mut().unwrap().insert(key.into(), entry);
+            assert!(Model::from_json(&bad.to_string()).is_err(), "{key}");
+        }
+        let mut bad = value.clone();
+        bad["parts"][0]["material"] = json!("pla");
+        assert!(Model::from_json(&bad.to_string()).is_err());
     }
 
     #[test]

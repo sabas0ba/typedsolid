@@ -108,7 +108,7 @@ class HelperTests(unittest.TestCase):
 
 class ProfileTests(unittest.TestCase):
     PROFILE = Profile(
-        material=Material("test_pla", "test fixture", allowable_strain=0.02),
+        material=Material("test_pla", "test PLA", "test fixture", allowable_strain=0.02),
         printer=Printer("test_printer", nozzle_mm=0.4, layer_mm=0.2, fit_clearance_mm=0.2),
         min_wall_mm=1.6, min_neck_mm=2.0, min_feature_mm=0.8, overhang_angle_deg=50.0,
         bridge_max_mm=8.0, build_direction="plus_z",

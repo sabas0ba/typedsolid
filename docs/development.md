@@ -139,23 +139,42 @@ model = Model(parts=(tray, lid), sweeps=(corner.sweep,), fasteners=(corner.faste
 
 熱圧入インサートを使う場合は`insert=InsertSpec(name, source, hole_mm, length_mm)`を与える。インサートは境目と面一に埋め、下穴はネジの先端と`tip_clearance_mm`の分まで延ばす。検査項目は [設計](design.md#ネジ固定の検査) を参照する。
 
-材料と印刷機の値は`Profile`にまとめ、`Policy`と`Assembly`を作る。profileはIRに現れない。値はすべて必須で、既定値はない。
+材料と印刷機の値は`Profile`にまとめ、`Policy`と`Assembly`を作る。材料はIRの`Material`として`Model.materials`に渡し、部品の`material`で参照する。印刷機と設計値はIRに現れない。値はすべて必須で、既定値はない。
 
 ```python
 from typedsolid import Material, Printer, Profile
 
 profile = Profile(
-    material=Material("pla_lot_a", "社内の曲げ試験記録", allowable_strain=0.02),
+    material=Material("pla_a", "PLA lot A", "社内の曲げ試験記録", allowable_strain=0.02),
     printer=Printer("printer_a", nozzle_mm=0.4, layer_mm=0.2, fit_clearance_mm=0.2),
     min_wall_mm=1.6, min_neck_mm=2.0, min_feature_mm=0.8,
     overhang_angle_deg=45.0, bridge_max_mm=5.0, build_direction="plus_z",
 )
+lid = Part("lid", lid.features, material=profile.material.id)
 model = Model(parts=(tray, lid), policy=profile.policy(voxel_mm=0.4),
               assembly=profile.assembly(steps), sweeps=(corner.sweep,),
-              fasteners=(corner.fastener,))
+              fasteners=(corner.fastener,), materials=(profile.material,))
 ```
 
-`allowable_strain`は後続のsnap fitの検査で使う。
+snap fitは`snap_fit`で作る。梁の根元の面の中心、長さ、厚み (たわむ向き)、幅、フックの張り出しと長さを与えると、梁とフックのfeatureと`SnapFit`を返す。フックは外すときにたわむ向きと反対の側に付く。梁を持つ部品には`allowable_strain`を持つ材料を割り当てる。
+
+```python
+from typedsolid import Assembly, Box, Feature, Model, Move, Part, Step, snap_fit
+
+# 蓋の下面 (z=30) から垂れる梁。先端のフックが右壁の爪の下に掛かり、-Xへたわませて外す。
+clip = snap_fit(
+    "clip_right", part="lid", mate="tray", step="open_lid", root=(35.25, 10.0, 30.0),
+    length_direction="minus_z", deflection="minus_x", length_mm=20.0, thickness_mm=1.5,
+    width_mm=10.0, hook_mm=1.0, hook_length_mm=2.0,
+)
+panel = Feature("panel", Box((0, 0, 30), (40, 20, 32)))
+lid = Part("lid", (panel,) + clip.features, material=profile.material.id)
+model = Model(parts=(tray, lid), policy=profile.policy(build_direction="plus_y"),
+              assembly=Assembly((Step("open_lid", ("lid",), (Move("plus_z"),)),)),
+              materials=(profile.material,), snap_fits=(clip.snap,))
+```
+
+梁の長さ方向を印刷方向と平行にすると`layer`が落ちる。この例では梁が縦に立つため、印刷方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。検査項目は [設計](design.md#snap-fitの検査) を参照する。
 
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
