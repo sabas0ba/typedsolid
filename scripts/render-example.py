@@ -69,6 +69,8 @@ def render(example, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--example", choices=sorted(EXAMPLES), default="board_tray")
-    parser.add_argument("--output", type=Path, default=Path(".work/board-tray.svg"))
+    parser.add_argument("--output", type=Path, help="既定は.work/<作例名>.svg")
     args = parser.parse_args()
-    render(args.example, args.output)
+    # 作例ごとに既定の出力先を分け、別の作例のpreviewを上書きしない。
+    output = args.output or Path(".work") / f"{args.example.replace('_', '-')}.svg"
+    render(args.example, output)
