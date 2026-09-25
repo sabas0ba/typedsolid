@@ -219,20 +219,26 @@ def _exit_distance(
 
 @dataclass(frozen=True)
 class _Snap:
-    """snap fit 1件の形状。hookはcutを反映したフックの実体、deflectedはそれをたわませた位置に置いたもの。"""
+    """snap fit 1件の形状。
+
+    hookとbeamはcutを反映した実体、deflectedはフックをたわませた位置に置いたもの、
+    envelopeは梁をたわむ向きへdeflection_mmだけ掃引した、曲がった梁を含む包絡である。
+    """
 
     data: dict
     hook: cq.Shape
     beam: cq.Shape
     rest: cq.Shape | None
     deflected: cq.Shape
+    envelope: cq.Shape
 
 
 def _snap_shapes(data: dict, shapes: dict[str, cq.Shape]) -> list[_Snap]:
-    """snap fitごとに、フックと梁の実体、それらを除いた部品、フックをたわませた部品を作る。
+    """snap fitごとに、フックと梁の実体、それらを除いた部品、たわんだフックと梁の包絡を作る。
 
     フックは梁の根元を支点に曲がるが、たわみの分だけ平行に動かして近似する。
-    梁そのものが占める空間はdeflection_spaceで別に見る。
+    曲がった梁は、梁を同じ量だけ平行に掃引した包絡に含まれる。根元は実際には
+    動かないため、この包絡は保守側である。
     """
     parts = {part["id"]: part for part in data["parts"]}
     result = []
@@ -246,16 +252,20 @@ def _snap_shapes(data: dict, shapes: dict[str, cq.Shape]) -> list[_Snap]:
         rest = _shape_of(others) if any(f["operation"] == "add" for f in others) else None
         axis = AXES.index(snap["deflection"][-1])
         signed = snap["deflection_mm"] if snap["deflection"].startswith("plus") else -snap["deflection_mm"]
-        result.append(_Snap(snap, hook, beam, rest, hook.translate(_vector(axis, signed))))
+        envelope = _swept(beam, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        result.append(_Snap(snap, hook, beam, rest, hook.translate(_vector(axis, signed)), envelope))
     return result
 
 
 def _released(part: dict, snaps: list[_Snap]) -> cq.Shape:
-    """同じstepで外すsnap fitのフックをすべてたわませた部品。"""
+    """同じstepで外すsnap fitのフックをすべてたわませ、梁の包絡を加えた部品。
+
+    経路に沿って掃引されるため、途中の障害物も曲がった梁との干渉として検出する。
+    """
     hooks = {snap.data["hook"] for snap in snaps}
     shape = _shape_of([f for f in part["features"] if f["id"] not in hooks])
     for snap in snaps:
-        shape = shape.fuse(snap.deflected)
+        shape = shape.fuse(snap.envelope).fuse(snap.deflected)
     return shape.clean()
 
 
@@ -398,7 +408,8 @@ def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], pr
 
         axis = AXES.index(snap.data["deflection"][-1])
         signed = snap.data["deflection_mm"] if snap.data["deflection"].startswith("plus") else -snap.data["deflection_mm"]
-        region = _swept(snap.beam.fuse(snap.hook), axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        hook_region = _swept(snap.hook, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
+        region = snap.envelope.fuse(hook_region)
         obstacles = {} if snap.rest is None else {part_id: snap.rest}
         for other in _present_before(data, snap.data["step"]):
             if other != part_id:

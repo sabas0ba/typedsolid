@@ -795,10 +795,22 @@ impl SnapFit {
         if !parts.contains_key(&self.mate) || self.mate == self.part {
             return Err(format!("snap fit {id} has an invalid mate {}", self.mate));
         }
-        let step = steps
+        let index = steps
             .iter()
-            .find(|s| s.id == self.step)
+            .position(|s| s.id == self.step)
             .ok_or_else(|| format!("snap fit {id} refers to unknown step {}", self.step))?;
+        // 先のstepで取り外した部品は、この結合を外すstepの時点で残っていない。
+        for earlier in &steps[..index] {
+            for removed in [&self.part, &self.mate] {
+                if earlier.parts.contains(removed) {
+                    return Err(format!(
+                        "snap fit {id}: {removed} is removed by step {} before step {}",
+                        earlier.id, self.step
+                    ));
+                }
+            }
+        }
+        let step = &steps[index];
         let moves_part = step.parts.contains(&self.part);
         let moves_mate = step.parts.contains(&self.mate);
         if moves_part == moves_mate {
@@ -2425,6 +2437,24 @@ mod tests {
                 m.assembly.steps[0].parts.push("base".into())
             }),
             ("duplicate id", |m| m.snap_fits.push(m.snap_fits[0].clone())),
+            ("mate removed by an earlier step", |m| {
+                m.assembly.steps.insert(
+                    0,
+                    step(
+                        "take_base",
+                        &["base"],
+                        vec![segment(Direction::MinusZ, EXIT)],
+                    ),
+                )
+            }),
+            ("part removed by an earlier step", |m| {
+                m.assembly.steps[0].id = "lift_lid".into();
+                m.assembly.steps.push(step(
+                    "open_lid",
+                    &["base"],
+                    vec![segment(Direction::MinusZ, EXIT)],
+                ))
+            }),
         ];
         assert!(with_snap().validate().is_ok());
         for (name, edit) in cases {

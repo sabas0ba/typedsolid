@@ -132,6 +132,15 @@ class SnapFitTests(unittest.TestCase):
         self.assertEqual(failing(result, "disassembly_path"), set())
         self.assertIn("against base along step drop_base", snap_checks(result)["retention"]["message"])
 
+    def test_bent_beam_is_swept_along_the_path(self):
+        # 蓋を-Xへ3 mm滑らせてから上へ抜く。柱は、たわんだ梁の包絡 (x=30.5〜) だけが掃引で通る位置にある。
+        # 初期位置でのたわむ空間には入らず、たわまない梁と動かしたフックの掃引にも掛からない。
+        post = Feature("post", Box((30.6, 5, 12), (31.4, 15, 20)))
+        slide = Step("open_lid", ("lid",), (Move("minus_x", 3.0), Move("plus_z")))
+        result = build(model(base_extra=(post,), steps=(slide,)))
+        self.assertNotIn("clip/deflection_space", failing(result))
+        self.assertIn("open_lid/lid/0/base", failing(result, "disassembly_path"))
+
     def test_two_clips_on_one_part_release_together(self):
         # 左壁にも爪を設け、-Xへ張り出すフックを+Xへたわませて外す。
         left = clip(root=(4.75, 10.0, 30.0), deflection="plus_x")

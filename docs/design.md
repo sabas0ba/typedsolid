@@ -60,7 +60,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
 - `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`とはめ合い隙間を作る入力に留める。
 - `SnapFit`は矩形断面の片持ち梁によるsnap fitを表す。`part`の2つのadd box feature を`beam`と`hook`として参照し、`length_direction` (梁の根元から先端への向き)、`deflection` (外すときにフックが動く向き)、`deflection_mm`、フックが掛かる`mate`、外す分解`step`を持つ。梁の寸法はboxから求め、IRに重ねて持たない。
-- Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かす。
+- Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かし、両者ともそれ以前のstepで取り外されていない。
 - 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・100材料・1000 snap fit・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
 ### 旧版からの昇格
@@ -179,7 +179,7 @@ backend例外、無効形状、空形状をfailとして保持する。依存を
 
 **積層方向**は、梁の長さ方向が積層方向と平行な場合をfailとする。このとき根元の曲げ応力は層間を引き離す向きに掛かり、強度が一般に層内より低い層間の強度で決まるためである。
 
-**外れる経路**は分解の検査が見る。外すstepでは、フックを`deflection_mm`だけたわむ向きへ平行に動かした部品で`disassembly_path`と`disassembly_separation`を評価する。梁は曲がるがフックの外側の面は平行移動で近似し、梁が占める空間は`deflection_space`が別に見る。同じstepで同じ部品の複数のsnap fitを外す場合は、すべてのフックをたわませる。stepの後に部品が残る場合、フックは元の位置へ戻る。
+**外れる経路**は分解の検査が見る。外すstepでは、フックを`deflection_mm`だけたわむ向きへ平行に動かし、梁を同じ量だけ掃引した包絡を加えた部品で`disassembly_path`と`disassembly_separation`を評価する。曲がった梁はこの包絡に含まれ、経路に沿って掃引されるため、途中の障害物との干渉も検出する。根元は実際には動かないため保守側である。同じstepで同じ部品の複数のsnap fitを外す場合は、すべてのフックをたわませる。stepの後に部品が残る場合、フックは元の位置へ戻る。
 
 分解stepに`fit_clearance_mm`を要求すると、たわんだフックと爪の横方向の隙間もその値を要求される。フックの張り出しと同じ`deflection_mm`では隙間が0となるため、張り出しにclearanceを加えた値を与えるか、そのstepの`fit_clearance_mm`を0とする。
 
