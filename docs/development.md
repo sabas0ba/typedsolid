@@ -70,6 +70,30 @@ Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative modu
 
 作例を変更した場合はSVGを再生成する。ラスタ画像は変換ツールを開発依存に加えることになるため用意しない。
 
+### 開放筐体の作例
+
+`examples/electronics_enclosure.py`は80×55×24 mm、床・壁厚2 mmの上面開放の筐体を生成する。床から立つφ8 mmのboss 4個を上面z=6 mmの支持面とし、φ3 mmの穴で床とbossを貫く。前面にz=7 mmから上端までの幅20 mmのコネクタ用切り欠き、背面に3×10 mmの通気スリット5本を開ける。60×35×3 mmの基板領域をbossの上に確保し、+Zへ抜けることを検査する。寸法は説明用で、特定の基板やコネクタの仕様ではない。
+
+前面の開口は上端まで開けた切り欠きとしている。上端を閉じた窓にすると上辺が幅20 mmのbridgeとなり、既定の`bridge_max_mm` (5 mm) で`support_free`が落ちる。使用する印刷機がそれ以上を渡せることを確かめた場合は、`Policy(bridge_max_mm=...)`で指定して窓にできる。
+
+```bash
+.venv/bin/python examples/electronics_enclosure.py --output .work/electronics-enclosure
+.venv/bin/python scripts/render-example.py --example electronics_enclosure --output docs/assets/electronics-enclosure.svg
+```
+
+![開放筐体の最終形状と基板確保領域](assets/electronics-enclosure.svg)
+
+`tests/test_e2e.py`はこの作例を公開CLIとして子processで起動し、次を検証する。
+
+- 出力4 fileの生成と、report.jsonに記録したdigestとの一致
+- 必須ruleがすべてpassであり、未評価が`strength`と`thermal`だけであること
+- STEPを再読込した形状が単一の有効なsolidで、外形寸法と体積が設計値と一致すること
+- 穴、切り欠き、スリットの位置に材料がなく、その脇に材料が残っていること
+- STLの座標が有限で、外形が設計値と一致すること
+- 既存の出力先へ再実行した場合に拒否し、既存の出力を変えないこと
+
+slicer、実機印刷、強度・放熱はこのtestの対象外である。
+
 API使用例:
 
 ```python
