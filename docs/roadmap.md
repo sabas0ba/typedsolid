@@ -42,7 +42,8 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 - 工具・ケーブル・コネクタ抜き差しの掃引領域 (対応済み)
 - lid取り外し等のassembly state、着脱順序、複数軸のアクセス (対応済み。keepoutと部品の取付関係は後続)
-- snap fitと任意ネジ固定、材料・積層方向を含む設計profile
+- 任意ネジ固定 (セルフタップ、熱圧入インサート)、材料・積層方向を含む設計profile (対応済み)
+- snap fit
 - backendをworker processへ隔離し、timeout・再開可能な生成を導入 (対応済み)
 
 実装順はworker隔離、分解stepと着脱検査、掃引、profileとネジ固定、snap fitとする。状態ごとに評価が増えるため、打ち切りとcacheを先に入れる。
@@ -51,6 +52,8 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 - **干渉判定**: 着脱と掃引の干渉はOCCTのBooleanで判定し、clearanceは形状間の最短距離で見る。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。既存の`part_interference`と同じ方式になる。
 - **掃引**: 現在の`access`を一般化し、box又は軸平行cylinderの断面、方向、距離、必要となる分解stepを持つ`Sweep`とする。
 - **数値の出典**: 材料の許容ひずみ、ネジ・インサート寸法は型だけを用意し、値は利用者が与える。catalogと同じく根拠のない既定値を組み込まない。
+- **設計profile**: 材料、印刷機、設計値はPythonのhelperに留め、IRへ入れない。IRに現れるのは、profileから作った`Policy`とはめ合い隙間だけである。
+- **ネジ固定**: IRの`Fastener`がネジ・インサートの寸法を持ち、`fastener_fit`が貫通穴、座面、かかり長さ、先端の逃げ、bossの肉厚を実形状と照合する。締結力やねじ山の強度はM3の解析で扱う。
 - **snap fit**: 矩形断面の片持ち梁に限る。許容たわみははりの理論から求め、曲げが積層を剥がす向きでないことも検査する。
 
 ## M3: 解析連携

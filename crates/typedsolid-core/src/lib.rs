@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -22,6 +22,8 @@ const MAX_SEGMENTS: usize = 16;
 const MAX_FIT_CLEARANCE_MM: f64 = 100.0;
 /// 掃引の上限。v3のaccessからの昇格で1 keepoutあたり最大6件生じる。
 const MAX_SWEEPS: usize = 1000;
+/// ネジ固定の上限。
+const MAX_FASTENERS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -506,6 +508,135 @@ impl Sweep {
     }
 }
 
+/// ネジの寸法。値は利用者が与える。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Screw {
+    /// 頭の座面から先端までの長さ。
+    pub length_mm: f64,
+    /// ねじ部の外径。
+    pub major_mm: f64,
+    /// 頭の外径。
+    pub head_mm: f64,
+}
+
+/// 受け側でネジを保持する方式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Anchor {
+    /// 印刷した下穴へ直接ねじ込む。
+    SelfTapping { pilot_mm: f64 },
+    /// 熱圧入インサート。受け側の境目と面一に埋まる。
+    Insert { hole_mm: f64, length_mm: f64 },
+}
+
+/// ネジ固定。clampの部品をbaseの部品へ締める。
+///
+/// directionは締め込む向き (頭から先端へ)、centerは軸に垂直な面上の座標、
+/// seat_mmは頭が当たる面、joint_mmはclampとbaseの境目の軸方向の座標である。
+/// clampが空の場合、締める対象は部品として記述されていない (基板など)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fastener {
+    pub id: String,
+    pub base: String,
+    pub clamp: Vec<String>,
+    pub direction: Direction,
+    pub center: [f64; 2],
+    pub seat_mm: f64,
+    pub joint_mm: f64,
+    pub screw: Screw,
+    /// clampに開ける貫通穴の径。頭の座面の内径になる。
+    pub through_mm: f64,
+    pub anchor: Anchor,
+    pub min_engagement_mm: f64,
+    pub min_boss_wall_mm: f64,
+}
+
+fn positive_length(value: f64, name: &str, owner: &str) -> Result<(), String> {
+    if !value.is_finite() || value <= 0.0 || value > COORDINATE_LIMIT_MM {
+        return Err(format!(
+            "fastener {owner}: {name} must be positive and finite"
+        ));
+    }
+    Ok(())
+}
+
+impl Fastener {
+    fn validate(&self, part_ids: &BTreeSet<&String>) -> Result<(), String> {
+        if !part_ids.contains(&self.base) {
+            return Err(format!(
+                "fastener {} refers to unknown base part {}",
+                self.id, self.base
+            ));
+        }
+        let mut clamps = BTreeSet::new();
+        for part in &self.clamp {
+            if !part_ids.contains(part) || part == &self.base || !clamps.insert(part) {
+                return Err(format!(
+                    "fastener {} has an invalid clamp part {part}",
+                    self.id
+                ));
+            }
+        }
+        for value in [self.center[0], self.center[1], self.seat_mm, self.joint_mm] {
+            finite_coordinate(value).map_err(|e| format!("fastener {}: {e}", self.id))?;
+        }
+        let screw = &self.screw;
+        for (name, value) in [
+            ("length_mm", screw.length_mm),
+            ("major_mm", screw.major_mm),
+            ("head_mm", screw.head_mm),
+            ("through_mm", self.through_mm),
+            ("min_engagement_mm", self.min_engagement_mm),
+            ("min_boss_wall_mm", self.min_boss_wall_mm),
+        ] {
+            positive_length(value, name, &self.id)?;
+        }
+        if self.through_mm < screw.major_mm || screw.head_mm <= self.through_mm {
+            return Err(format!(
+                "fastener {}: requires major_mm <= through_mm < head_mm",
+                self.id
+            ));
+        }
+        match self.anchor {
+            Anchor::SelfTapping { pilot_mm } => {
+                positive_length(pilot_mm, "pilot_mm", &self.id)?;
+                if pilot_mm >= screw.major_mm {
+                    return Err(format!(
+                        "fastener {}: pilot_mm must be below major_mm",
+                        self.id
+                    ));
+                }
+            }
+            Anchor::Insert { hole_mm, length_mm } => {
+                positive_length(hole_mm, "hole_mm", &self.id)?;
+                positive_length(length_mm, "length_mm", &self.id)?;
+                if hole_mm <= screw.major_mm {
+                    return Err(format!(
+                        "fastener {}: insert hole_mm must exceed major_mm",
+                        self.id
+                    ));
+                }
+            }
+        }
+        // 締め込む向きに見て、頭の座面が境目より手前にある。clampがあれば厚みは正。
+        let sign = if self.direction.is_positive() {
+            1.0
+        } else {
+            -1.0
+        };
+        let thickness = sign * (self.joint_mm - self.seat_mm);
+        if thickness < 0.0 || (!self.clamp.is_empty() && thickness == 0.0) {
+            return Err(format!(
+                "fastener {}: joint_mm must lie beyond seat_mm along the direction",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Units {
     #[serde(rename = "mm")]
@@ -537,12 +668,13 @@ pub enum Rule {
     SupportFree,
     DisassemblyPath,
     DisassemblySeparation,
+    FastenerFit,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -557,6 +689,7 @@ impl Rule {
         Self::SupportFree,
         Self::DisassemblyPath,
         Self::DisassemblySeparation,
+        Self::FastenerFit,
         Self::Strength,
         Self::Thermal,
     ];
@@ -638,6 +771,8 @@ pub struct Model {
     pub sweeps: Vec<Sweep>,
     #[serde(default)]
     pub assembly: Assembly,
+    #[serde(default)]
+    pub fasteners: Vec<Fastener>,
     pub policy: Policy,
 }
 
@@ -756,8 +891,19 @@ fn upgrade_v3(value: &mut Value) -> Result<(), String> {
             }
         }
     }
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(4));
     root.insert("sweeps".into(), Value::Array(sweeps));
+    Ok(())
+}
+
+/// schema v4のJSONをv5へ変換する。v4はネジ固定を持たないため、空のfastenersを補う。
+fn upgrade_v4(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if root.contains_key("fasteners") {
+        return Err("schema_version 4 does not define fasteners".into());
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("fasteners".into(), json!([]));
     Ok(())
 }
 
@@ -772,12 +918,18 @@ impl Model {
                 upgrade_v1(&mut value)?;
                 upgrade_v2(&mut value)?;
                 upgrade_v3(&mut value)?;
+                upgrade_v4(&mut value)?;
             }
             Some(2) => {
                 upgrade_v2(&mut value)?;
                 upgrade_v3(&mut value)?;
+                upgrade_v4(&mut value)?;
             }
-            Some(3) => upgrade_v3(&mut value)?,
+            Some(3) => {
+                upgrade_v3(&mut value)?;
+                upgrade_v4(&mut value)?;
+            }
+            Some(4) => upgrade_v4(&mut value)?,
             Some(version) if version == u64::from(SCHEMA_VERSION) => {}
             _ => {
                 return Err(format!(
@@ -894,6 +1046,16 @@ impl Model {
             }
             sweep.validate(&ids, &step_ids)?;
         }
+        if self.fasteners.len() > MAX_FASTENERS {
+            return Err(format!("at most {MAX_FASTENERS} fasteners are supported"));
+        }
+        let mut fastener_ids = BTreeSet::new();
+        for fastener in &self.fasteners {
+            if !identifier(&fastener.id) || !fastener_ids.insert(&fastener.id) {
+                return Err(format!("invalid or duplicate fastener id: {}", fastener.id));
+            }
+            fastener.validate(&part_ids)?;
+        }
         Ok(())
     }
 
@@ -985,6 +1147,7 @@ mod tests {
             keepouts: vec![],
             sweeps: vec![],
             assembly: Assembly::default(),
+            fasteners: vec![],
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
@@ -1422,7 +1585,7 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "5", "\"2\""] {
+        for version in ["0", "6", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
@@ -1641,6 +1804,206 @@ mod tests {
                 r#""steps":[{"id":"a","parts":["lid"],"path":[{"direction":"plus_z","distance_mm":"far"}]}]"#,
             );
         assert!(Model::from_json(&json).is_err());
+    }
+
+    fn fastener(id: &str) -> Fastener {
+        Fastener {
+            id: id.into(),
+            base: "base".into(),
+            clamp: vec!["lid".into()],
+            direction: Direction::MinusZ,
+            center: [5., 5.],
+            seat_mm: 4.0,
+            joint_mm: 2.0,
+            screw: Screw {
+                length_mm: 6.0,
+                major_mm: 2.0,
+                head_mm: 3.8,
+            },
+            through_mm: 2.4,
+            anchor: Anchor::SelfTapping { pilot_mm: 1.6 },
+            min_engagement_mm: 3.0,
+            min_boss_wall_mm: 1.2,
+        }
+    }
+
+    #[test]
+    fn fasteners_round_trip_both_anchors() {
+        let mut m = two_parts();
+        m.fasteners = vec![
+            fastener("a"),
+            Fastener {
+                anchor: Anchor::Insert {
+                    hole_mm: 3.2,
+                    length_mm: 4.0,
+                },
+                ..fastener("b")
+            },
+        ];
+        assert!(m.validate().is_ok());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            json.contains(r#""anchor":{"kind":"self_tapping","pilot_mm":1.6}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""anchor":{"kind":"insert","hole_mm":3.2,"length_mm":4.0}"#),
+            "{json}"
+        );
+        let back = Model::from_json(&json).unwrap();
+        assert_eq!(back.fasteners.len(), 2);
+    }
+
+    #[test]
+    fn invalid_fasteners_are_rejected() {
+        let screw = |length_mm, major_mm, head_mm| Screw {
+            length_mm,
+            major_mm,
+            head_mm,
+        };
+        let cases: Vec<(&str, Fastener)> = vec![
+            ("duplicate id", fastener("a")),
+            ("invalid id", fastener("../b")),
+            (
+                "unknown base",
+                Fastener {
+                    base: "ghost".into(),
+                    ..fastener("b")
+                },
+            ),
+            (
+                "unknown clamp",
+                Fastener {
+                    clamp: vec!["ghost".into()],
+                    ..fastener("b")
+                },
+            ),
+            (
+                "clamp equals base",
+                Fastener {
+                    clamp: vec!["base".into()],
+                    ..fastener("b")
+                },
+            ),
+            (
+                "duplicate clamp",
+                Fastener {
+                    clamp: vec!["lid".into(), "lid".into()],
+                    ..fastener("b")
+                },
+            ),
+            (
+                "non-finite seat",
+                Fastener {
+                    seat_mm: f64::NAN,
+                    ..fastener("b")
+                },
+            ),
+            (
+                "zero length",
+                Fastener {
+                    screw: screw(0.0, 2.0, 3.8),
+                    ..fastener("b")
+                },
+            ),
+            (
+                "through below major",
+                Fastener {
+                    through_mm: 1.9,
+                    ..fastener("b")
+                },
+            ),
+            (
+                "head not above through",
+                Fastener {
+                    screw: screw(6.0, 2.0, 2.4),
+                    ..fastener("b")
+                },
+            ),
+            (
+                "pilot not below major",
+                Fastener {
+                    anchor: Anchor::SelfTapping { pilot_mm: 2.0 },
+                    ..fastener("b")
+                },
+            ),
+            (
+                "insert hole not above major",
+                Fastener {
+                    anchor: Anchor::Insert {
+                        hole_mm: 2.0,
+                        length_mm: 4.0,
+                    },
+                    ..fastener("b")
+                },
+            ),
+            (
+                "zero insert length",
+                Fastener {
+                    anchor: Anchor::Insert {
+                        hole_mm: 3.2,
+                        length_mm: 0.0,
+                    },
+                    ..fastener("b")
+                },
+            ),
+            (
+                "joint behind the seat",
+                Fastener {
+                    joint_mm: 5.0,
+                    ..fastener("b")
+                },
+            ),
+            (
+                "zero clamp thickness",
+                Fastener {
+                    joint_mm: 4.0,
+                    ..fastener("b")
+                },
+            ),
+            (
+                "negative wall",
+                Fastener {
+                    min_boss_wall_mm: -1.0,
+                    ..fastener("b")
+                },
+            ),
+        ];
+        for (name, bad) in cases {
+            let mut m = two_parts();
+            m.fasteners = vec![fastener("a"), bad];
+            assert!(m.validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn fastener_without_clamp_may_seat_on_the_joint() {
+        // 基板など部品として記述しない対象を締める場合、頭は境目に当たってよい。
+        let mut m = two_parts();
+        m.fasteners = vec![Fastener {
+            clamp: vec![],
+            seat_mm: 2.0,
+            ..fastener("a")
+        }];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn schema_v4_is_upgraded_with_no_fasteners() {
+        let mut value = serde_json::to_value(model()).unwrap();
+        let root = value.as_object_mut().unwrap();
+        root.remove("fasteners");
+        root.insert("schema_version".into(), json!(4));
+        let v4 = value.to_string();
+        let model = Model::from_json(&v4).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.fasteners.is_empty());
+        // v4はfastenersを定義していない。昇格前の入力に現れたら拒否する。
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("fasteners".into(), json!([]));
+        assert!(Model::from_json(&value.to_string()).is_err());
     }
 
     #[test]

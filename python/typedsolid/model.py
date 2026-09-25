@@ -16,7 +16,8 @@ Rule = Literal[
     "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
-    "support_free", "disassembly_path", "disassembly_separation", "strength", "thermal",
+    "support_free", "disassembly_path", "disassembly_separation", "fastener_fit",
+    "strength", "thermal",
 ]
 
 
@@ -141,6 +142,56 @@ class Assembly:
 
 
 @dataclass(frozen=True)
+class Screw:
+    """ネジの寸法。lengthは頭の座面から先端まで、majorはねじ部の外径、headは頭の外径。"""
+
+    length_mm: float
+    major_mm: float
+    head_mm: float
+
+
+@dataclass(frozen=True)
+class SelfTapping:
+    """印刷した下穴へ直接ねじ込む。"""
+
+    pilot_mm: float
+    kind: Literal["self_tapping"] = "self_tapping"
+
+
+@dataclass(frozen=True)
+class Insert:
+    """熱圧入インサート。baseの境目と面一に埋まる。holeは圧入前の下穴の径。"""
+
+    hole_mm: float
+    length_mm: float
+    kind: Literal["insert"] = "insert"
+
+
+@dataclass(frozen=True)
+class Fastener:
+    """ネジ固定。clampの部品をbaseの部品へ締める。組立完了の状態で評価する。
+
+    directionは締め込む向き (頭から先端へ)、centerは軸に垂直な面上の座標で
+    Cylinderと同じ順に並ぶ。seat_mmは頭が当たる面、joint_mmはclampとbaseの境目の
+    軸方向の座標である。clampが空の場合、締める対象は部品として記述されていない。
+    through_mmはclampに開ける貫通穴の径で、頭の座面の内径になる。
+    """
+
+    id: str
+    base: str
+    clamp: tuple[str, ...]
+    direction: Direction
+    center: Vec2
+    seat_mm: float
+    joint_mm: float
+    screw: Screw
+    through_mm: float
+    anchor: SelfTapping | Insert
+    min_engagement_mm: float
+    min_boss_wall_mm: float
+
+
+@dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
@@ -161,7 +212,7 @@ class Policy:
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
         "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
-        "disassembly_path", "disassembly_separation",
+        "disassembly_path", "disassembly_separation", "fastener_fit",
     )
 
 
@@ -194,11 +245,12 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 4
+    schema_version: int = 5
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
     sweeps: tuple[Sweep, ...] = ()
+    fasteners: tuple[Fastener, ...] = ()
 
     def to_json(self) -> str:
         data = _expand_access(_without_unset(asdict(self)))

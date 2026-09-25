@@ -675,6 +675,7 @@ mod tests {
             keepouts: vec![],
             sweeps: vec![],
             assembly: crate::Assembly::default(),
+            fasteners: vec![],
             policy,
         }
     }

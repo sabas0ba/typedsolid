@@ -17,6 +17,7 @@
 | 閉じた空洞を避ける | 最終形状の空領域が外部へ通じているかを検査 | 対応 |
 | 基板等のスペース確保 | clearanceで拡張したkeepoutと最終形状の交差体積を評価 | 軸平行box、面ごとのclearance |
 | アクセスの確保 | 部品・工具の移動領域と形状の干渉検査 | 全部品に対する6方向の直線経路 |
+| ネジ固定 | ネジ・インサートの寸法と実形状の整合を検査 | 貫通穴、座面、かかり長さ、先端の逃げ、bossの肉厚 |
 | サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 印刷方向、overhang、bridge |
 | 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 未対応 |
 
@@ -35,10 +36,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v4
+## IR v5
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換・材料はまだ扱わない。
-- `Model`は`schema_version=4`、`parts`、`keepouts`、`sweeps`、`assembly`、`policy`を持つ。
+- `Model`は`schema_version=5`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
@@ -54,23 +55,26 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `assembly`は分解手順を持つ。IRに記述した部品位置を組立完了の状態とし、`steps`を順に実行して分解する。各stepは`parts`を一体として、軸平行の直線区間を連ねた`path`に沿って動かし、以降の状態から除く。組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
 - 区間の`distance_mm`は正の数値か`"exit"`とする。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離を表し、最後の区間に限る。
 - `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0は硬い干渉だけを見る。
-- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- `Fastener`はネジ1本の固定を表し、`clamp`の部品を`base`の部品へ締める。`direction`は締め込む向き (頭から先端へ)、`center`は軸に垂直な面上の座標、`seat_mm`は頭の座面、`joint_mm`はclampとbaseの境目の軸方向の座標である。`screw`は長さ (座面から先端)、ねじ部の外径、頭の外径を、`through_mm`はclampの貫通穴の径を持つ。`anchor`は`self_tapping` (`pilot_mm`: 下穴径) か`insert` (`hole_mm`: 圧入前の下穴径、`length_mm`: インサート長。境目と面一に埋める) である。要求値として`min_engagement_mm`と`min_boss_wall_mm`を持つ。
+- ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
+- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
 ### 旧版からの昇格
 
-`schema_version`が1〜3のJSONは、読み込み時に順に昇格してv4へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜4のJSONは、読み込み時に順に昇格してv5へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
 - v3→v4: keepoutの`access`の各方向を、組立完了の状態で外まで抜く`Sweep`へ移す。idは`<keepout>_<direction>`とし、idの規則を満たさない場合は昇格を拒否してkeepout idの短縮を求める。v3の入力に`sweeps`が現れた場合は拒否する。
+- v4→v5: v4はネジ固定を持たないため、空の`fasteners`を補う。v4の入力に`fasteners`が現れた場合は拒否する。
 
-出力は常にv4で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv5で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
 検査は`pass / fail / not_evaluated`の3状態とし、rule ID・target ID・理由を保持する。1件でもfailがある場合、またはrequiredルールが全件passでない場合、出力を拒否する。preflightだけでは標準policyの出力条件を満たさない。
 
-標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解の検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
+標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定の検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
 `strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
@@ -100,6 +104,24 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 `access_clearance`は各掃引の領域が、その状態で残っている部品と共通体積を持たないことを見る。掃引体積は着脱の検査と同じ関数で作る。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離である。keepoutを参照する掃引は、v3までのaccessと同じくclearance込みのboxを外まで動かす。
 
 keepoutは部品の分解の障害物として扱わず、部品と一緒にも動かない。蓋を外す経路が基板の領域を通るか、トレイごと引き出すと基板も動くか、といった関係は、部品とkeepoutの取付関係をIRに持たせる後続の作業で扱う。
+
+## ネジ固定の検査
+
+`fastener_fit`は組立完了の状態で、ネジ1本ごとに次の5項目を`<fastener>/<項目>`のtargetで報告する。判定は着脱と同じくOCCTのBooleanで行う。下穴の径とねじ山の差は0.3〜0.5 mm程度で、voxelの量子化に埋もれるためである。
+
+| 項目 | 内容 |
+| --- | --- |
+| `through` | 座面から境目まで、貫通穴径の円柱にclampの材料がない。ネジがclampに噛むと締め付けにならないため、外径でなく貫通穴径で見る |
+| `bearing` | 貫通穴径から頭径までの輪帯が、座面から0.5 mm (clampがそれより薄ければその厚み) clampの材料で埋まっている |
+| `engagement` | セルフタップは、境目から先端までの下穴径〜外径の輪帯とbaseの共通体積を輪帯の断面積で割った長さ。インサートは、境目を越えたネジの長さとインサート長の小さい方。いずれも`min_engagement_mm`以上 |
+| `clear_tip` | 下穴 (インサートの場合はインサート穴と、その先のネジ外径の経路) にbaseの材料がない。先端が底に当たると締め付けにならない |
+| `boss_wall` | 下穴径またはインサート穴径の周囲`min_boss_wall_mm`の輪帯が、ねじ山のかかる範囲 (インサートはインサート長) でbaseの材料で埋まっている |
+
+「材料で埋まっている」は、不足体積が1e-7 mm³と期待体積の1e-6倍の大きい方以下であることとする。円筒面が一致する境界の演算誤差を吸収するためであり、穴や肉の寸法不足を許す値ではない。
+
+`clamp`が空の場合、`through`と`bearing`は対象が記述されていないことを明記してpassとする。ネジが境目を越えない場合、`boss_wall`は評価範囲がないため`not_evaluated`とし、出力を拒否する。
+
+検査するのは宣言した寸法と形状の整合であり、締結力、ねじ山の強度、インサートの引き抜き強度は評価しない。ドライバの通り道は`Sweep`として別に宣言し、`access_clearance`で検査する。Python APIの`screw_fixing`は、bossと下穴、貫通穴、ドライバの掃引、`Fastener`を同じ寸法から作る。
 
 ## 最終形状の検査
 
