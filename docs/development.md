@@ -139,6 +139,18 @@ sweeps = (
 )
 ```
 
+keepoutは分解経路の障害物になる。基板が部品に固定されている場合は`attached_to`でその部品を示すと、分解stepで部品と一緒に動く。
+
+```python
+from typedsolid import Box, Clearance, Keepout, Move, Step
+
+# 引き出し (tray) に載った基板。引き出しを前へ抜くと基板も一緒に出る。
+pcb = Keepout("pcb", Box((8, 8, 4), (32, 32, 10)), Clearance(default=0.5, minus_z=0.0), attached_to="tray")
+pull = Step("pull_tray", ("tray",), (Move("minus_y"),))
+```
+
+catalogの`board.keepout(..., attached_to="tray")`でも指定できる。取付先を省いたkeepoutは外部に固定されたものとして最後まで残り、そこを通る分解経路は`disassembly_path`で落ちる。
+
 `Keepout(access=("plus_z",))`は、組立完了の状態で外まで抜く`Sweep("pcb_plus_z", "plus_z", keepout="pcb")`の省略形である。
 
 `Move("plus_z")`は残っている部品の外まで動かす。数値を与えるとその距離だけ動かす。`disassembly_path`は各区間の干渉を、`disassembly_separation`は最後の方向へ動かし続けて外れることを検査する。

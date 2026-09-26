@@ -37,10 +37,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v6
+## IR v7
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
-- `Model`は`schema_version=6`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`policy`を持つ。
+- `Model`は`schema_version=7`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
@@ -49,6 +49,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - 最小feature寸法はprimitiveの寸法を測る。cylinderは直径と高さの小さい方とする。
 - `Keepout`は確保領域と面ごとのclearanceを持つ。`clearance_mm`は`default`と面名 (`minus_x`等) の上書きからなる。支持面へ接触させる面だけを0にでき、他の面の要求は残る。
 - keepoutはboxに限る。面別clearanceと、それを掃引に使うkeepout参照はboxの面を前提とするため、cylinderのkeepoutは受理しない。
+- `Keepout.attached_to`は、基板などが固定されている部品のidである。keepoutは分解経路の障害物となり、取付先の部品を動かすstepではその部品と一緒に動き、以降の状態から除かれる。省略すると外部に固定され、最後まで残る。
 - `Sweep`は工具・ケーブル・コネクタ、またはkeepoutを取り出す際に通る領域を表す。形状は`shape` (boxか軸平行cylinder) で直接与えるか、`keepout`を参照してそのclearance込みのboxを使う。どちらか一方に限る。`direction`、`distance_mm` (正の数値か`"exit"`) を持つ。形状は包絡であり、指の入る余地などの余裕を含める。掃引自体はclearanceを持たない。
 - `after_step`を与えた掃引は、そのstepを終えた状態で評価し、取り外した部品は障害物にならない。省略すると組立完了の状態で評価する。USBは蓋を閉じたまま抜き差しでき、ネジは蓋を外してから締める、といった区別をこれで表す。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
@@ -65,15 +66,16 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ### 旧版からの昇格
 
-`schema_version`が1〜5のJSONは、読み込み時に順に昇格してv6へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜6のJSONは、読み込み時に順に昇格してv7へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
 - v3→v4: keepoutの`access`の各方向を、組立完了の状態で外まで抜く`Sweep`へ移す。idは`<keepout>_<direction>`とし、idの規則を満たさない場合は昇格を拒否してkeepout idの短縮を求める。v3の入力に`sweeps`が現れた場合は拒否する。
 - v4→v5: v4はネジ固定を持たないため、空の`fasteners`を補う。v4の入力に`fasteners`が現れた場合は拒否する。
 - v5→v6: v5は材料とsnap fitを持たないため、空の`materials`と`snap_fits`を補う。部品の`material`は省略可能であり、v5の部品はそのまま読める。v5の入力にこれらが現れた場合は拒否する。
+- v6→v7: v6のkeepoutは取付先を持たないため、外部に固定されたものとしてそのまま受理する。v7からkeepoutは分解の障害物となるため、同じモデルでも`disassembly_path`の判定が厳しくなる場合がある。v6の入力に`attached_to`が現れた場合は拒否する。
 
-出力は常にv6で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv7で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
@@ -96,6 +98,8 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 | `disassembly_path` | 各区間の掃引体積が、残っている部品と共通体積を持たない |
 | `disassembly_separation` | 最後の区間の方向へ外まで動かし続けても干渉しない。部品が経路の終端で外れていることを表す |
 
+**keepout**は箱そのもの (clearanceを含まない) を障害物とする。clearanceは静止状態での設計余裕として`keepout_clearance`だけで使い、移動中の隙間は`fit_clearance_mm`で見る。両方を適用すると余裕を二重に取ることになるためである。取付先の部品を動かすstepでは、keepoutはその部品と一緒に動き、他の部品や残っているkeepoutとの干渉を検査する。targetでは`keepout:<id>`と書き、部品のidと区別する。`"exit"`の距離は残っているkeepoutの外までを含む。
+
 `disassembly_separation`はAABBの分離では判定しない。L字の土台の切り欠きから横へ抜く場合のように、外れた部品がAABBの内側に残る形があるためである。
 
 **はめ合い隙間**は距離ではなく体積で判定する。最短距離では、蓋が壁の上に載る接触も距離0となり、正しい設計まで落ちる。動かす部品を移動方向に垂直な2軸にだけ`fit_clearance_mm`広げてから掃引し、共通体積を見る。移動方向の手前にある載置面の接触は体積0のまま残り、横ですれ違う面の隙間不足だけが検出される。広げる形は辺長2·clearanceの正方形とのMinkowski和で、円とのMinkowski和より保守的である。
@@ -108,7 +112,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 `access_clearance`は各掃引の領域が、その状態で残っている部品と共通体積を持たないことを見る。掃引体積は着脱の検査と同じ関数で作る。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離である。keepoutを参照する掃引は、v3までのaccessと同じくclearance込みのboxを外まで動かす。
 
-keepoutは部品の分解の障害物として扱わず、部品と一緒にも動かない。蓋を外す経路が基板の領域を通るか、トレイごと引き出すと基板も動くか、といった関係は、部品とkeepoutの取付関係をIRに持たせる後続の作業で扱う。
+掃引は部品だけを障害物とし、keepoutを障害物としない。USBプラグのように、keepoutとして確保した基板上のコネクタへ差し込む掃引があるためである。keepoutを参照する掃引は、そのkeepoutが評価する状態で残っていることを要求する。取付先の部品を`after_step`までに外している場合は、keepoutも一緒に取り除かれているため、検証で拒否する。
 
 ## ネジ固定の検査
 

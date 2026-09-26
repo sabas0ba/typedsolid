@@ -63,7 +63,7 @@ class ModelTests(unittest.TestCase):
             "policy": {"min_feature_mm": 1.2, "required": ["single_solid"]},
         }
         upgraded = json.loads(_native.normalize_model(json.dumps(v1)))
-        self.assertEqual(upgraded["schema_version"], 6)
+        self.assertEqual(upgraded["schema_version"], 7)
         self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
         self.assertEqual(upgraded["parts"][0]["features"][0]["shape"]["kind"], "box")
         self.assertEqual(upgraded["keepouts"][0]["clearance_mm"], {"default": 0.25})
@@ -82,7 +82,7 @@ class ModelTests(unittest.TestCase):
         for keepout in data["keepouts"]:
             keepout["access"] = []
         upgraded = json.loads(_native.normalize_model(json.dumps(data)))
-        self.assertEqual(upgraded["schema_version"], 6)
+        self.assertEqual(upgraded["schema_version"], 7)
         self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
 
     def test_assembly_serializes_exit_and_omits_unset_clearance(self):
@@ -143,6 +143,6 @@ class ModelTests(unittest.TestCase):
             _native.normalize_model(json.dumps(data))
 
     def test_wrong_units_and_schema_rejected(self):
-        for model in [replace(block(), units="in"), replace(block(), schema_version=7)]:
+        for model in [replace(block(), units="in"), replace(block(), schema_version=8)]:
             with self.assertRaises(ValueError):
                 model.to_json()

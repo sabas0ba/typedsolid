@@ -97,13 +97,15 @@ class Board:
         height_mm: float | None = None,
         clearance: Clearance | None = None,
         access: tuple[Direction, ...] = (),
+        attached_to: str | None = None,
     ) -> Keepout:
-        """基板の占有領域をkeepoutとして返す。"""
+        """基板の占有領域をkeepoutとして返す。attached_toは基板を固定する部品のid。"""
         return Keepout(
             id,
             self.envelope(origin, height_mm),
             clearance if clearance is not None else Clearance(),
             access,
+            attached_to,
         )
 
     def mount_centers(self, origin: Vec3 = (0.0, 0.0, 0.0)) -> tuple[Vec2, ...]:

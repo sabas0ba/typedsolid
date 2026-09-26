@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -328,6 +328,10 @@ pub struct Keepout {
     pub id: String,
     pub shape: Shape,
     pub clearance_mm: Clearance,
+    /// 取り付けられている部品。分解stepでその部品と一緒に動き、以降の状態から除かれる。
+    /// 省略した場合は外部に固定され、最後まで残る。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<String>,
 }
 
 /// 経路区間の移動量を数値以外で指定する語。
@@ -1099,6 +1103,19 @@ fn upgrade_v4(value: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+/// schema v6のJSONをv7へ変換する。v7はkeepoutの取付先を加え、keepoutを分解の障害物とする。
+/// v6のkeepoutは取付先を持たないため、外部に固定されたものとしてそのまま受理する。
+fn upgrade_v6(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if let Some(keepouts) = root.get("keepouts").and_then(Value::as_array)
+        && keepouts.iter().any(|k| k.get("attached_to").is_some())
+    {
+        return Err("schema_version 6 does not define keepout attached_to".into());
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    Ok(())
+}
+
 /// 1版分の昇格。
 type Upgrade = fn(&mut Value) -> Result<(), String>;
 
@@ -1116,7 +1133,7 @@ fn upgrade_v5(value: &mut Value) -> Result<(), String> {
     {
         return Err("schema_version 5 does not define part material".into());
     }
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(6));
     root.insert("materials".into(), json!([]));
     root.insert("snap_fits".into(), json!([]));
     Ok(())
@@ -1129,8 +1146,9 @@ impl Model {
         }
         let mut value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
-        const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] =
-            [upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5];
+        const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] = [
+            upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6,
+        ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
                 for upgrade in &UPGRADES[version as usize - 1..] {
@@ -1239,6 +1257,14 @@ impl Model {
                 return Err(format!("keepout {} must be a box", keepout.id));
             }
             keepout.clearance_mm.validate()?;
+            if let Some(part) = &keepout.attached_to
+                && !part_ids.contains(part)
+            {
+                return Err(format!(
+                    "keepout {} is attached to unknown part {part}",
+                    keepout.id
+                ));
+            }
         }
         self.assembly.validate(&part_ids)?;
         if self.sweeps.len() > MAX_SWEEPS {
@@ -1251,6 +1277,7 @@ impl Model {
                 return Err(format!("invalid or duplicate sweep id: {}", sweep.id));
             }
             sweep.validate(&ids, &step_ids)?;
+            self.validate_sweep_state(sweep)?;
         }
         if self.fasteners.len() > MAX_FASTENERS {
             return Err(format!("at most {MAX_FASTENERS} fasteners are supported"));
@@ -1292,6 +1319,34 @@ impl Model {
                 return Err(format!("invalid or duplicate snap fit id: {}", snap.id));
             }
             snap.validate(&parts, &materials, &self.assembly.steps)?;
+        }
+        Ok(())
+    }
+
+    /// 掃引するkeepoutが、評価する状態でまだ存在することを確かめる。
+    /// 取付先の部品をafter_stepまでに外すと、keepoutも一緒に取り除かれている。
+    fn validate_sweep_state(&self, sweep: &Sweep) -> Result<(), String> {
+        let (Some(keepout_id), Some(after_step)) = (&sweep.keepout, &sweep.after_step) else {
+            return Ok(());
+        };
+        let Some(part) = self
+            .keepouts
+            .iter()
+            .find(|k| &k.id == keepout_id)
+            .and_then(|k| k.attached_to.as_ref())
+        else {
+            return Ok(());
+        };
+        for step in &self.assembly.steps {
+            if step.parts.contains(part) {
+                return Err(format!(
+                    "sweep {}: keepout {keepout_id} leaves with part {part} in step {}, before the state after {after_step}",
+                    sweep.id, step.id
+                ));
+            }
+            if &step.id == after_step {
+                break;
+            }
         }
         Ok(())
     }
@@ -1644,6 +1699,7 @@ mod tests {
                 default: 0.5,
                 faces: BTreeMap::new(),
             },
+            attached_to: None,
         });
         assert!(m.validate().is_err());
     }
@@ -1678,6 +1734,7 @@ mod tests {
                 default: 0.5,
                 faces: BTreeMap::new(),
             },
+            attached_to: None,
         });
         m
     }
@@ -1876,7 +1933,7 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "7", "\"2\""] {
+        for version in ["0", "8", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
@@ -2482,6 +2539,59 @@ mod tests {
         let mut bad = value.clone();
         bad["parts"][0]["material"] = json!("pla");
         assert!(Model::from_json(&bad.to_string()).is_err());
+    }
+
+    #[test]
+    fn keepout_attachment_is_validated() {
+        let mut m = two_parts();
+        m.keepouts = with_keepout().keepouts;
+        m.keepouts[0].attached_to = Some("lid".into());
+        assert!(m.validate().is_ok());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""attached_to":"lid""#), "{json}");
+        m.keepouts[0].attached_to = Some("ghost".into());
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn sweep_of_a_keepout_that_left_with_its_part_is_rejected() {
+        let mut m = two_parts();
+        m.keepouts = with_keepout().keepouts;
+        m.keepouts[0].attached_to = Some("lid".into());
+        m.assembly.steps = vec![
+            step("open_lid", &["lid"], vec![segment(Direction::PlusZ, EXIT)]),
+            step(
+                "lift_base",
+                &["base"],
+                vec![segment(Direction::PlusZ, EXIT)],
+            ),
+        ];
+        let after = |step_id: &str| Sweep {
+            after_step: Some(step_id.into()),
+            ..sweep("pcb_out")
+        };
+        m.sweeps = vec![after("open_lid")];
+        assert!(m.validate().is_err(), "removed in the same step");
+        m.sweeps = vec![after("lift_base")];
+        assert!(m.validate().is_err(), "removed in an earlier step");
+        // 組立完了の状態では、取付先と一緒にまだ残っている。
+        m.sweeps = vec![sweep("pcb_out")];
+        assert!(m.validate().is_ok());
+        // 取付先が残る状態なら、他の部品を外した後でも掃引できる。
+        m.keepouts[0].attached_to = Some("base".into());
+        m.sweeps = vec![after("open_lid")];
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn schema_v6_is_upgraded_with_fixed_keepouts() {
+        let mut value = serde_json::to_value(with_keepout()).unwrap();
+        value["schema_version"] = json!(6);
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.keepouts[0].attached_to.is_none());
+        value["keepouts"][0]["attached_to"] = json!("base");
+        assert!(Model::from_json(&value.to_string()).is_err());
     }
 
     #[test]
