@@ -403,6 +403,8 @@ def _present_before(data: dict, step_id: str) -> list[str]:
 def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], progress: Progress) -> list[dict]:
     """snap fitの梁とフックが実形状にあり、外すstepの直前の状態でたわむ空間が空いている。
 
+    たわむ空間は、残っている部品とkeepoutの箱 (clearanceを含まない) を障害物とする。
+
     たわむ空間は、梁とフックをdeflection_mmだけ平行に動かした掃引で表す。根元は実際には
     動かないため、根元付近では保守側の判定になる。
     """
@@ -424,9 +426,14 @@ def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], pr
         hook_region = _swept(snap.hook, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
         region = snap.envelope.fuse(hook_region)
         obstacles = {} if snap.rest is None else {part_id: snap.rest}
-        for other in _present_before(data, snap.data["step"]):
+        present = _present_before(data, snap.data["step"])
+        for other in present:
             if other != part_id:
                 obstacles[other] = shapes[other]
+        # keepoutは取付先がsnap fitを持つ部品でも、梁と一緒にはたわまない。
+        for keepout in data["keepouts"]:
+            if keepout.get("attached_to") in (None, *present):
+                obstacles[f"keepout:{keepout['id']}"] = _solid(keepout["shape"])
         blocking = {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
         blocking = {name: overlap for name, overlap in blocking.items() if overlap > VOLUME_TOLERANCE}
         message = (
