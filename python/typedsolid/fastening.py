@@ -7,7 +7,7 @@ baseのbossと下穴、clampの貫通穴、ドライバの掃引、IRのFastener
 
 from dataclasses import dataclass
 
-from .model import Cylinder, Direction, Fastener, Feature, Insert, Screw, SelfTapping, Sweep, Vec2
+from .model import Cylinder, Direction, Fastener, Feature, Insert, Release, Screw, SelfTapping, Sweep, Vec2
 
 # 穴のcutを境目と座面から外側へ延ばす長さ。単位はmm。端面をcut対象の面と一致させると、
 # 残るかどうかが演算誤差で決まる薄い膜が生じうるため、外側へ突き抜けさせる。
@@ -80,6 +80,8 @@ def screw_fixing(
     boss_from_mm: float | None = None,
     insert: InsertSpec | None = None,
     after_step: str | None = None,
+    release: Release | None = None,
+    clamp_keepouts: tuple[str, ...] = (),
 ) -> ScrewFixing:
     """clampをbaseへ締めるネジ1本分の形状とIR。
 
@@ -87,6 +89,8 @@ def screw_fixing(
     軸方向の座標である。bossはboss_from_mmからjoint_mmまでの円柱で、bossを使わず
     既存の肉に穴を開ける場合は省く。下穴はネジの先端からtip_clearance_mmだけ深くする。
     ドライバの掃引は、after_stepを終えた状態で座面から締め込みと逆向きに外まで抜く。
+    after_stepを省きreleaseを与えると、ネジを外す状態 (release.after_step) で掃引する。
+    clamp_keepoutsは、clampの部品の代わりや追加としてネジで締めるkeepoutのid。
     """
     if tip_clearance_mm < 0.0:
         raise ValueError(f"{id}: tip_clearance_mm must not be negative")
@@ -130,7 +134,7 @@ def screw_fixing(
     driver = Sweep(
         f"{id}_driver", _opposite(direction),
         shape=Cylinder(axis, center, radius, _span(seat_mm, seat_mm - sign * DRIVER_DISK_MM)),
-        after_step=after_step,
+        after_step=after_step if after_step is not None or release is None else release.after_step,
     )
     fastener = Fastener(
         id=id, base=base, clamp=clamp, direction=direction, center=center,
@@ -138,5 +142,6 @@ def screw_fixing(
         screw=Screw(screw.length_mm, screw.major_mm, screw.head_mm),
         through_mm=screw.through_mm, anchor=anchor,
         min_engagement_mm=min_engagement_mm, min_boss_wall_mm=min_boss_wall_mm,
+        release=release, clamp_keepouts=clamp_keepouts,
     )
     return ScrewFixing(base_features, clamp_features, driver, fastener)

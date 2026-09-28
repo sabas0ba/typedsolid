@@ -17,7 +17,7 @@ Rule = Literal[
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
     "support_free", "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
-    "strength", "thermal",
+    "fastener_release", "strength", "thermal",
 ]
 
 
@@ -187,13 +187,23 @@ class Insert:
 
 
 @dataclass(frozen=True)
+class Release:
+    """ネジを外す状態。after_stepを終えた状態で外し、Noneなら組立完了の状態で外す。"""
+
+    after_step: str | None = None
+
+
+@dataclass(frozen=True)
 class Fastener:
-    """ネジ固定。clampの部品をbaseの部品へ締める。組立完了の状態で評価する。
+    """ネジ固定。clampの部品をbaseの部品へ締める。寸法は組立完了の状態で評価する。
 
     directionは締め込む向き (頭から先端へ)、centerは軸に垂直な面上の座標で
     Cylinderと同じ順に並ぶ。seat_mmは頭が当たる面、joint_mmはclampとbaseの境目の
     軸方向の座標である。clampが空の場合、締める対象は部品として記述されていない。
     through_mmはclampに開ける貫通穴の径で、頭の座面の内径になる。
+
+    releaseはネジを外す状態で、省略するとネジは外さない。clamp_keepoutsはネジで
+    締めているkeepout (基板など) のid。ネジを外すまで、baseとこれらは一体として扱う。
     """
 
     id: str
@@ -208,6 +218,8 @@ class Fastener:
     anchor: SelfTapping | Insert
     min_engagement_mm: float
     min_boss_wall_mm: float
+    release: Release | None = None
+    clamp_keepouts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,6 +264,7 @@ class Policy:
         "access_clearance", "part_interference",
         "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
         "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
+        "fastener_release",
     )
 
 
@@ -285,7 +298,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 7
+    schema_version: int = 8
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)

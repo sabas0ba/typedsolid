@@ -173,6 +173,8 @@ lid = Part("lid", (Feature("panel", Box((0, 0, 10), (40, 30, 12))),) + corner.cl
 model = Model(parts=(tray, lid), sweeps=(corner.sweep,), fasteners=(corner.fastener,))
 ```
 
+ネジを外す手順がある場合は`release=Release("open_lid")`のように外す状態を与える。蓋を外すstepより前に外すなら`Release()` (組立完了の状態) とする。省くとネジは外さないものとして扱い、ネジで留めた部品を引き離す分解stepがあると`fastener_release`が落ちる。基板をネジで締める場合は`clamp_keepouts=("pcb",)`で基板のkeepoutを示す。
+
 熱圧入インサートを使う場合は`insert=InsertSpec(name, source, hole_mm, length_mm)`を与える。インサートは境目と面一に埋め、下穴はネジの先端と`tip_clearance_mm`の分まで延ばす。検査項目は [設計](design.md#ネジ固定の検査) を参照する。
 
 材料と印刷機の値は`Profile`にまとめ、`Policy`と`Assembly`を作る。材料はIRの`Material`として`Model.materials`に渡し、部品の`material`で参照する。印刷機と設計値はIRに現れない。値はすべて必須で、既定値はない。
