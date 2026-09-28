@@ -95,7 +95,28 @@ board("raspberry_pi_5").height(20.0)      # 20.0
 
 取付穴の径が`None`の基板 (Zero 2 W、MKR WAN 1310) でも、`bosses`と`pilot_holes`は使える。どちらも径を呼び出し側が与え、catalogからは中心座標だけを使うためである。
 
-コネクタ開口は現時点でどのentryも持たない。登録した資料はいずれも開口の縦横を寸法線で与えていない。USB・HDMI等の規格書は、利用許諾の範囲や入手条件の点で公開catalogへの転記に使えないため、開口寸法を組み込まない方針とする。
+## コネクタ位置
+
+資料がコネクタ中心の辺上の位置を寸法線で与え、寸法とコネクタの対応が一意に読める場合だけ、`Board.connectors`に登録する。`edge`はコネクタのある辺の外向き法線、`offset_mm`はその辺に沿った中心の基板座標 (`edge`がy方向ならx、x方向ならy) である。
+
+| id | コネクタ | edge | offset_mm |
+| --- | --- | --- | --- |
+| `raspberry_pi_4_model_b` | `usb_c_power`, `micro_hdmi_0`, `micro_hdmi_1` | `minus_y` | 11.2, 26.0, 39.5 |
+| `raspberry_pi_4_model_b` | `usb_a_0`, `usb_a_1`, `ethernet` | `plus_x` | 9.0, 27.0, 45.75 |
+| `raspberry_pi_3_model_b_plus` | `micro_usb_power`, `hdmi`, `audio` | `minus_y` | 10.6, 32.0, 53.5 |
+| `raspberry_pi_3_model_b_plus` | `usb_a_0`, `usb_a_1` | `plus_x` | 29.0, 47.0 |
+| `raspberry_pi_zero_2_w` | `mini_hdmi`, `micro_usb_data`, `micro_usb_power` | `minus_y` | 12.4, 41.4, 54.0 |
+
+登録していないコネクタと理由は次のとおり。
+
+- **Pi 4の音声端子**: 下辺の7.5と11.5の寸法がどの部品を指すか一意に読めない。
+- **Pi 3B+のEthernet**: 右辺の10.25と11.5の2つの寸法が近接しており、どちらが中心かを読めない。
+- **Pi 5**: 図を再確認していないため、今回は登録していない。
+- **Arduinoの基板**: Nano 33 IoTとMKR WAN 1310の資料にコネクタ位置の図があるが、今回は読み取っていない。
+
+資料は高さ方向の中心を寸法化しないため、`connector_center`は高さを呼び出し側に求める。同じ種類のコネクタが並ぶ場合は、座標の小さい順に`_0`、`_1`と番号を付ける。
+
+開口の寸法 (プラグ外形) はcatalogに持たない。USB・HDMI等の規格書は、利用許諾の範囲や入手条件の点で公開catalogへの転記に使えないためである。開口は`connector_opening`に、利用者が出典とともにプラグ寸法を与えて作る。詳細は [設計](design.md#コネクタ開口の検査) を参照する。
 
 ## 使い方
 

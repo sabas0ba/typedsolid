@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from .model import Box, Clearance, Direction, Feature, Keepout, Vec2, Vec3, boss, hole
 
-__all__ = ["BOARDS", "Board", "MountingHole", "Source", "board", "board_ids"]
+__all__ = ["BOARDS", "Board", "BoardConnector", "MountingHole", "Source", "board", "board_ids"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,20 @@ class MountingHole:
 
 
 @dataclass(frozen=True)
+class BoardConnector:
+    """基板の辺にあるコネクタの位置。
+
+    edgeはコネクタのある辺の外向き法線、offset_mmはその辺に沿ったコネクタ中心の
+    基板座標 (edgeがy方向ならx、x方向ならy)。資料は高さ方向の中心を寸法化しない
+    ため持たない。
+    """
+
+    id: str
+    edge: Direction
+    offset_mm: float
+
+
+@dataclass(frozen=True)
 class Board:
     """1枚の基板。
 
@@ -55,6 +69,8 @@ class Board:
     source: Source
     pcb_thickness_mm: float | None = None
     overall_height_mm: float | None = None
+    # 資料が辺上の位置を寸法化したコネクタだけを持つ。
+    connectors: tuple[BoardConnector, ...] = ()
 
     def __post_init__(self) -> None:
         if self.length_mm <= 0.0 or self.width_mm <= 0.0:
@@ -74,6 +90,46 @@ class Board:
             if not (radius <= x <= self.length_mm - radius
                     and radius <= y <= self.width_mm - radius):
                 raise ValueError(f"{self.id}: 取付穴{index}が外形からはみ出している")
+        seen = set()
+        for item in self.connectors:
+            if item.id in seen:
+                raise ValueError(f"{self.id}: コネクタid {item.id} が重複している")
+            seen.add(item.id)
+            if item.edge.endswith("_z"):
+                raise ValueError(f"{self.id}: コネクタ {item.id} のedgeはx又はy方向である必要がある")
+            along = self.length_mm if item.edge.endswith("_y") else self.width_mm
+            if not 0.0 <= item.offset_mm <= along:
+                raise ValueError(f"{self.id}: コネクタ {item.id} が辺の範囲外にある")
+
+    def connector(self, id: str) -> BoardConnector:
+        """idでコネクタを引く。未登録の場合は候補を添えて送出する。"""
+        for item in self.connectors:
+            if item.id == id:
+                return item
+        known = ", ".join(item.id for item in self.connectors) or "なし"
+        raise KeyError(f"{self.id}: 未登録のコネクタid {id!r}。登録済み: {known}")
+
+    def connector_center(self, id: str, origin: Vec3, z_mm: float) -> Vec2:
+        """コネクタ中心のmodel座標を、edgeの軸に垂直な平面の2座標で返す。
+
+        並びはCylinderのcenterと同じで、connector_openingのcenterにそのまま渡せる。
+        z_mmはプラグ中心の高さのmodel座標で、資料が与えないため呼び出し側が決める。
+        """
+        item = self.connector(id)
+        x, y, _ = origin
+        along = (x if item.edge.endswith("_y") else y) + item.offset_mm
+        return (along, z_mm)
+
+    def edge_position(self, edge: Direction, origin: Vec3 = (0.0, 0.0, 0.0)) -> float:
+        """基板の辺のmodel座標。開口のplug_spanやwall_spanを決める基準に使う。"""
+        x, y, _ = origin
+        positions = {
+            "minus_x": x, "plus_x": x + self.length_mm,
+            "minus_y": y, "plus_y": y + self.width_mm,
+        }
+        if edge not in positions:
+            raise ValueError(f"{self.id}: edgeはx又はy方向である必要がある")
+        return positions[edge]
 
     def height(self, override_mm: float | None = None) -> float:
         """基板が占める高さ。overrideを優先し、無ければ資料の全高を使う。"""
@@ -308,6 +364,16 @@ _PI_4B = Board(
     # 図は部品ごとにZ=の値を記すが、基準面を示さないため全高として採らない。
     pcb_thickness_mm=None,
     overall_height_mm=None,
+    # 下辺は左端から3.5+7.7、+14.8、+13.5の連鎖寸法、右辺は下端からの寸法による。
+    # USB-Aの2基はyの小さい順に0, 1とする。音声端子は寸法の対応が一意に読めないため持たない。
+    connectors=(
+        BoardConnector("usb_c_power", "minus_y", 11.2),
+        BoardConnector("micro_hdmi_0", "minus_y", 26.0),
+        BoardConnector("micro_hdmi_1", "minus_y", 39.5),
+        BoardConnector("usb_a_0", "plus_x", 9.0),
+        BoardConnector("usb_a_1", "plus_x", 27.0),
+        BoardConnector("ethernet", "plus_x", 45.75),
+    ),
     source=Source(
         title="Raspberry Pi 4 Model B mechanical drawing",
         url="https://datasheets.raspberrypi.com/rpi4/raspberry-pi-4-mechanical-drawing.pdf",
@@ -326,6 +392,15 @@ _PI_3BP = Board(
     # Z-Heightの基準面が示されないため全高として採らない。
     pcb_thickness_mm=None,
     overall_height_mm=None,
+    # 下辺は左端からの寸法、右辺は下端からの寸法による。USB-Aの2基はyの小さい順に0, 1とする。
+    # Ethernetは10.25と11.5の2つの寸法が近接し、どちらが中心かを一意に読めないため持たない。
+    connectors=(
+        BoardConnector("micro_usb_power", "minus_y", 10.6),
+        BoardConnector("hdmi", "minus_y", 32.0),
+        BoardConnector("audio", "minus_y", 53.5),
+        BoardConnector("usb_a_0", "plus_x", 29.0),
+        BoardConnector("usb_a_1", "plus_x", 47.0),
+    ),
     source=Source(
         title="Raspberry Pi 3 Model B+ mechanical drawing",
         url="https://datasheets.raspberrypi.com/rpi3/raspberry-pi-3-b-plus-mechanical-drawing.pdf",
@@ -343,6 +418,12 @@ _ZERO_2_W = Board(
     mounting_holes=_grid_holes((3.5, 61.5), (3.5, 26.5), None),
     pcb_thickness_mm=None,
     overall_height_mm=None,
+    # 下辺の左端からの寸法による。
+    connectors=(
+        BoardConnector("mini_hdmi", "minus_y", 12.4),
+        BoardConnector("micro_usb_data", "minus_y", 41.4),
+        BoardConnector("micro_usb_power", "minus_y", 54.0),
+    ),
     source=Source(
         title="Raspberry Pi Zero 2 W mechanical drawing",
         url="https://datasheets.raspberrypi.com/rpizero2/raspberry-pi-zero-2-w-mechanical-drawing.pdf",

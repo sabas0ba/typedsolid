@@ -17,8 +17,9 @@ Rule = Literal[
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
     "support_free", "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
-    "fastener_release", "strength", "thermal",
+    "fastener_release", "connector_fit", "strength", "thermal",
 ]
+SourceKind = Literal["datasheet", "measured", "other"]
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,33 @@ class SnapFit:
 
 
 @dataclass(frozen=True)
+class PlugSource:
+    """プラグ外形の値の出典。kindがdatasheetならreferenceに品番と資料名、measuredなら
+    測定対象と方法を記す。"""
+
+    kind: SourceKind
+    reference: str
+
+
+@dataclass(frozen=True)
+class Connector:
+    """筐体の壁に開けるコネクタ開口。
+
+    openingはpartのcut boxのfeature id、sweepはプラグを抜く掃引のid。plug_mmは抜く向きに
+    垂直なプラグ断面で、並びはcylinderのcenterと同じ軸順 (x方向に抜くなら(y, z))。
+    開口はプラグとの間に各辺でclearance_mm以上の隙間を持つ。
+    """
+
+    id: str
+    part: str
+    opening: str
+    sweep: str
+    plug_mm: Vec2
+    clearance_mm: float
+    source: PlugSource
+
+
+@dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
@@ -264,7 +292,7 @@ class Policy:
         "access_clearance", "part_interference",
         "final_wall_thickness", "neck_section", "closed_cavity", "support_free",
         "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
-        "fastener_release",
+        "fastener_release", "connector_fit",
     )
 
 
@@ -298,7 +326,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 8
+    schema_version: int = 9
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
@@ -306,6 +334,7 @@ class Model:
     fasteners: tuple[Fastener, ...] = ()
     materials: tuple[Material, ...] = ()
     snap_fits: tuple[SnapFit, ...] = ()
+    connectors: tuple[Connector, ...] = ()
 
     def to_json(self) -> str:
         data = _expand_access(_without_unset(asdict(self)))

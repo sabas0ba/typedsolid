@@ -37,10 +37,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v8
+## IR v9
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
-- `Model`は`schema_version=8`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`policy`を持つ。
+- `Model`は`schema_version=9`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
@@ -62,11 +62,12 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`とはめ合い隙間を作る入力に留める。
 - `SnapFit`は矩形断面の片持ち梁によるsnap fitを表す。`part`の2つのadd box feature を`beam`と`hook`として参照し、`length_direction` (梁の根元から先端への向き)、`deflection` (外すときにフックが動く向き)、`deflection_mm`、フックが掛かる`mate`、外す分解`step`を持つ。梁の寸法はboxから求め、IRに重ねて持たない。
 - Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かし、両者ともそれ以前のstepで取り外されていない。
-- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・100材料・1000 snap fit・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
+- `Connector`は筐体の壁に開けるコネクタ開口を表す。`part`のcut boxの`opening`、プラグを抜く`sweep` (box形状)、抜く向きに垂直なプラグ断面`plug_mm` (並びはcylinderの`center`と同じ軸順)、開口とプラグの間に各辺で要求する`clearance_mm`、値の出典`source`を持つ。`source`は`kind` (`datasheet`、`measured`、`other`) と`reference` (1〜500文字) からなる。プラグ寸法に既定値はなく、利用者が与える。
+- 座標±1,000,000 mm、primitive寸法0.001 mm以上、100部品・100keepout・1000掃引・1000ネジ固定・100材料・1000 snap fit・1000コネクタ開口・合計1000feature・100 step・1 stepあたり16区間・JSON 1 MB以内、1部品あたりvoxel 2億cell以内を実装上の上限とする。これらはプリンタ能力の保証値ではない。
 
 ### 旧版からの昇格
 
-`schema_version`が1〜7のJSONは、読み込み時に順に昇格してv8へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜8のJSONは、読み込み時に順に昇格してv9へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
@@ -75,14 +76,15 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - v5→v6: v5は材料とsnap fitを持たないため、空の`materials`と`snap_fits`を補う。部品の`material`は省略可能であり、v5の部品はそのまま読める。v5の入力にこれらが現れた場合は拒否する。
 - v6→v7: v6のkeepoutは取付先を持たないため、外部に固定されたものとしてそのまま受理する。v7からkeepoutは分解の障害物となるため、同じモデルでも`disassembly_path`の判定が厳しくなる場合がある。v6の入力に`attached_to`が現れた場合は拒否する。
 - v7→v8: v7のネジは外す状態と締めるkeepoutを持たないため、外さないネジとしてそのまま受理する。v8で必須になる`fastener_release`は、ネジで留めた部品を引き離す分解stepがあると落ちる。v7の入力に`release`か`clamp_keepouts`が現れた場合は拒否する。
+- v8→v9: v8はコネクタ開口を持たないため、空の`connectors`を補う。v8の入力に`connectors`が現れた場合は拒否する。
 
-出力は常にv8で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv9で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
 検査は`pass / fail / not_evaluated`の3状態とし、rule ID・target ID・理由を保持する。1件でもfailがある場合、またはrequiredルールが全件passでない場合、出力を拒否する。preflightだけでは標準policyの出力条件を満たさない。
 
-標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit/snap_fit/fastener_release`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定・snap fitの検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
+標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit/snap_fit/fastener_release/connector_fit`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定・snap fit・コネクタ開口の検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
 `strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
@@ -200,6 +202,22 @@ backend例外、無効形状、空形状をfailとして保持する。依存を
 分解stepに`fit_clearance_mm`を要求すると、たわんだフックと爪の横方向の隙間もその値を要求される。フックの張り出しと同じ`deflection_mm`では隙間が0となるため、張り出しにclearanceを加えた値を与えるか、そのstepの`fit_clearance_mm`を0とする。
 
 Python APIの`snap_fit`は、根元の面の中心、寸法、向きから梁とフックのfeatureと`SnapFit`を作る。
+
+## コネクタ開口の検査
+
+`connector_fit`は、コネクタ開口ごとに`<connector>`のtargetで次を見る。IRの寸法だけで決まるため、Rust coreが判定する。いずれかがあればfailとし、messageに出典を載せる。
+
+- 掃引の断面が`plug_mm`と一致しない。
+- 開口の断面が、掃引の断面を各辺`clearance_mm`だけ広げた範囲を内包しない。
+- プラグの後端が、開口の内側の面より奥から動き始めて外側の面の外まで抜けない。
+
+開口の縁と壁以外の部品との干渉は、同じ掃引を使う`access_clearance`が見る。`connector_fit`は、helperで作った開口や掃引を手で書き換えたときの寸法の不整合と、抜く向きの誤りを検出する。
+
+プラグ外形の寸法は組み込まない。USB・HDMI等の規格書は、利用許諾が実装の評価目的に限られる、機密扱いである、有償で転載に許可を要する、のいずれかに当たり、公開するcatalogへの転記と両立しないためである。利用者は、使うプラグやケーブルの部品datasheetの値か実測値を、`source`に根拠を記して与える。
+
+縦の壁に開けた開口の上縁はbridgeとなり、`support_free`が`bridge_max_mm`と照合する。開口の幅がこれを超える場合は、印刷の向きや開口の形を見直すか、slicerのbridge設定に合わせて`bridge_max_mm`を与える。
+
+Python APIの`connector_opening`は、抜く向き、プラグ断面の中心と寸法、嵌合状態のプラグの範囲、切り欠く壁の範囲、clearance、出典から、cut feature、`Sweep`、`Connector`を作る。catalogの`Board.connector_center`は、資料が寸法化したコネクタの辺上の位置から`center`を求める。高さ方向の中心は資料が与えないため、呼び出し側が指定する。
 
 ## 解析への拡張
 
