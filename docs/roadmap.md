@@ -42,7 +42,7 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 - 工具・ケーブル・コネクタ抜き差しの掃引領域 (対応済み)
 - lid取り外し等のassembly state、着脱順序、複数軸のアクセス、keepoutと部品の取付関係 (対応済み)
-- 任意ネジ固定 (セルフタップ、熱圧入インサート)、材料・積層方向を含む設計profile (対応済み)
+- 任意ネジ固定 (セルフタップ、熱圧入インサート)、ネジを外す順序、材料・積層方向を含む設計profile (対応済み)
 - snap fit (対応済み。矩形断面の片持ち梁)
 - backendをworker processへ隔離し、timeout・再開可能な生成を導入 (対応済み)
 

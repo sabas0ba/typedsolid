@@ -6,9 +6,10 @@ from pathlib import Path
 import unittest
 
 from typedsolid import (
-    Box, Feature, InsertSpec, Material, Model, Part, Policy, Printer, Profile, ScrewSpec, Step, Move,
-    hole, screw_fixing,
+    Assembly, Box, Feature, InsertSpec, Material, Model, Part, Policy, Printer, Profile, Release, ScrewSpec,
+    Step, Move, hole, screw_fixing,
 )
+from typedsolid import _native
 from typedsolid.cadquery import build
 
 # ネジ固定と掃引だけを見る。voxel評価は判定に関わらないため、格子を粗くして時間を抑える。
@@ -104,6 +105,41 @@ class HelperTests(unittest.TestCase):
         for name, fastener in cases.items():
             with self.subTest(name), self.assertRaises(ValueError):
                 model(fix, fasteners=(fastener,)).to_json()
+
+
+OPEN_LID = Step("open_lid", ("lid",), (Move("plus_z"),))
+
+
+def release_status(fix) -> tuple[str, str]:
+    """蓋を上へ外す手順を持つモデルで、fastener_releaseの判定と理由を返す。"""
+    data = replace(model(fix), assembly=Assembly((OPEN_LID,))).to_json()
+    (check,) = json.loads(_native.evaluate_fastener_releases(data))
+    return check["status"], check["message"]
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_release_and_clamp_keepouts_serialize(self):
+        fix = fixing(release=Release("open_lid"))
+        data = json.loads(replace(model(fix), assembly=Assembly((OPEN_LID,))).to_json())
+        self.assertEqual(data["fasteners"][0]["release"], {"after_step": "open_lid"})
+        self.assertNotIn("clamp_keepouts", data["fasteners"][0])
+        # ドライバはネジを外す状態で抜き差しする。
+        self.assertEqual(fix.sweep.after_step, "open_lid")
+        self.assertEqual(fixing(release=Release()).fastener.release, Release())
+
+    def test_screw_must_come_out_before_the_lid(self):
+        self.assertEqual(release_status(fixing(release=Release()))[0], "pass")
+        for release in (None, Release("open_lid")):
+            with self.subTest(release=release):
+                status, message = release_status(fixing(release=release))
+                self.assertEqual(status, "fail")
+                self.assertIn("step open_lid moves lid away from tray", message)
+
+    def test_release_rule_is_reported_by_build(self):
+        Path(".work").mkdir(exist_ok=True)
+        base = replace(model(fixing()), assembly=Assembly((OPEN_LID,)))
+        checks = [c for c in build(base).report["checks"] if c["rule"] == "fastener_release"]
+        self.assertEqual([(c["target"], c["status"]) for c in checks], [("corner/release", "fail")])
 
 
 class ProfileTests(unittest.TestCase):

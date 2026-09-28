@@ -44,7 +44,7 @@ EXIT_MARGIN_MM = 2.0
 DEFAULT_TIMEOUT_S = 600.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
-    "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
+    "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit", "fastener_release",
 )
 # ネジの頭の座面として、座面からclamp側へ材料を要求する深さ。単位はmm。clampが薄ければその厚みまでとする。
 BEARING_DEPTH_MM = 0.5
@@ -704,6 +704,8 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
         geometry += _fastener_checks(data, shapes, progress)
         # ひずみと積層方向は寸法だけで決まるため、判定をRust coreに置く。
         geometry += json.loads(_native.evaluate_snap_fits(model_json))
+        # ネジを外す順序も形状を使わないため、判定をRust coreに置く。
+        geometry += json.loads(_native.evaluate_fastener_releases(model_json))
         geometry += _snap_checks(data, shapes, snaps, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -562,6 +562,20 @@ pub struct Fastener {
     pub anchor: Anchor,
     pub min_engagement_mm: f64,
     pub min_boss_wall_mm: f64,
+    /// ネジを外す状態。省略するとネジは外さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
+    /// ネジで締めているkeepout (基板など部品として記述しない物)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clamp_keepouts: Vec<String>,
+}
+
+/// ネジを外す状態。`after_step`を終えた状態で外し、省略すると組立完了の状態で外す。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_step: Option<String>,
 }
 
 fn positive_length(value: f64, name: &str, owner: &str) -> Result<(), String> {
@@ -860,12 +874,13 @@ pub enum Rule {
     DisassemblySeparation,
     FastenerFit,
     SnapFit,
+    FastenerRelease,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -882,6 +897,7 @@ impl Rule {
         Self::DisassemblySeparation,
         Self::FastenerFit,
         Self::SnapFit,
+        Self::FastenerRelease,
         Self::Strength,
         Self::Thermal,
     ];
@@ -1112,6 +1128,21 @@ fn upgrade_v6(value: &mut Value) -> Result<(), String> {
     {
         return Err("schema_version 6 does not define keepout attached_to".into());
     }
+    root.insert("schema_version".into(), json!(7));
+    Ok(())
+}
+
+/// schema v7のJSONをv8へ変換する。v8はネジを外す状態と、ネジで締めるkeepoutを加える。
+/// v7のネジはどちらも持たないため、外さないネジとしてそのまま受理する。
+fn upgrade_v7(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if let Some(fasteners) = root.get("fasteners").and_then(Value::as_array)
+        && fasteners
+            .iter()
+            .any(|f| f.get("release").is_some() || f.get("clamp_keepouts").is_some())
+    {
+        return Err("schema_version 7 does not define fastener release or clamp_keepouts".into());
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
@@ -1147,7 +1178,7 @@ impl Model {
         let mut value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
         const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] = [
-            upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6,
+            upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6, upgrade_v7,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1288,6 +1319,7 @@ impl Model {
                 return Err(format!("invalid or duplicate fastener id: {}", fastener.id));
             }
             fastener.validate(&part_ids)?;
+            self.validate_release(fastener)?;
         }
         if self.materials.len() > MAX_MATERIALS {
             return Err(format!("at most {MAX_MATERIALS} materials are supported"));
@@ -1321,6 +1353,140 @@ impl Model {
             snap.validate(&parts, &materials, &self.assembly.steps)?;
         }
         Ok(())
+    }
+
+    /// ネジを外す状態のstepと、締めるkeepoutが存在することを確かめる。
+    fn validate_release(&self, fastener: &Fastener) -> Result<(), String> {
+        if let Some(step) = fastener
+            .release
+            .as_ref()
+            .and_then(|r| r.after_step.as_ref())
+            && !self.assembly.steps.iter().any(|s| &s.id == step)
+        {
+            return Err(format!(
+                "fastener {} is released after unknown step {step}",
+                fastener.id
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for keepout in &fastener.clamp_keepouts {
+            if !self.keepouts.iter().any(|k| &k.id == keepout) || !seen.insert(keepout) {
+                return Err(format!(
+                    "fastener {} has an invalid clamp keepout {keepout}",
+                    fastener.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 部品を外すstepの番号。どのstepにも現れない部品はNone。
+    fn removal_step(&self, part: &str) -> Option<usize> {
+        self.assembly
+            .steps
+            .iter()
+            .position(|s| s.parts.iter().any(|p| p == part))
+    }
+
+    /// ネジを外す順序の検査。形状を使わないためRust coreで判定する。
+    ///
+    /// ネジを外すより前に、base、clampの部品、締めているkeepoutのいずれかを他と別々に
+    /// 動かすstepがあればfailとする。keepoutは取付先の部品と一緒に動く。締めている
+    /// keepoutを、ネジを外す前の状態で取り出す掃引もfailとする。
+    pub fn evaluate_fastener_releases(&self) -> Result<Vec<Check>, String> {
+        self.validate()?;
+        let steps = &self.assembly.steps;
+        // 状態の番号。-1は組立完了、iはsteps[i]を終えた状態。
+        let state_of = |step: &Option<String>| -> isize {
+            step.as_ref()
+                .and_then(|id| steps.iter().position(|s| &s.id == id))
+                .map_or(-1, |i| i as isize)
+        };
+        let mut checks = Vec::new();
+        for fastener in &self.fasteners {
+            // ネジを外した状態。Noneは外さない。
+            let released = fastener.release.as_ref().map(|r| state_of(&r.after_step));
+            let mut members: Vec<(String, Option<usize>)> = std::iter::once(&fastener.base)
+                .chain(&fastener.clamp)
+                .map(|p| (p.clone(), self.removal_step(p)))
+                .collect();
+            for id in &fastener.clamp_keepouts {
+                let keepout = self
+                    .keepouts
+                    .iter()
+                    .find(|k| &k.id == id)
+                    .ok_or("validated clamp keepout lost")?;
+                let removal = keepout
+                    .attached_to
+                    .as_deref()
+                    .and_then(|p| self.removal_step(p));
+                members.push((format!("keepout:{id}"), removal));
+            }
+            let mut problems = Vec::new();
+            for (index, step) in steps.iter().enumerate() {
+                // steps[index]はstate index-1から始まる。ネジはその状態で外れていれば効かない。
+                if released.is_some_and(|r| r < index as isize) {
+                    break;
+                }
+                let present: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, removal)| removal.is_none_or(|r| r >= index))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let moving: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, removal)| *removal == Some(index))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if !moving.is_empty() && moving.len() != present.len() {
+                    let staying: Vec<&str> = present
+                        .iter()
+                        .copied()
+                        .filter(|name| !moving.contains(name))
+                        .collect();
+                    problems.push(format!(
+                        "step {} moves {} away from {} while the screw holds them",
+                        step.id,
+                        moving.join(", "),
+                        staying.join(", ")
+                    ));
+                }
+            }
+            for sweep in &self.sweeps {
+                let Some(keepout) = &sweep.keepout else {
+                    continue;
+                };
+                let state = state_of(&sweep.after_step);
+                if fastener.clamp_keepouts.contains(keepout) && released.is_none_or(|r| state < r) {
+                    problems.push(format!(
+                        "sweep {} takes keepout {keepout} out while the screw holds it",
+                        sweep.id
+                    ));
+                }
+            }
+            let released_text = match &fastener.release {
+                None => "is never removed".to_string(),
+                Some(Release { after_step: None }) => "is removed in the assembled state".into(),
+                Some(Release {
+                    after_step: Some(step),
+                }) => format!("is removed after step {step}"),
+            };
+            checks.push(Check {
+                rule: Rule::FastenerRelease,
+                status: if problems.is_empty() {
+                    Status::Pass
+                } else {
+                    Status::Fail
+                },
+                target: format!("{}/release", fastener.id),
+                message: if problems.is_empty() {
+                    format!("screw {released_text}; nothing it holds is separated before that")
+                } else {
+                    format!("screw {released_text}; {}", problems.join("; "))
+                },
+            });
+        }
+        Ok(checks)
     }
 
     /// 掃引するkeepoutが、評価する状態でまだ存在することを確かめる。
@@ -1933,7 +2099,7 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_rejected() {
-        for version in ["0", "8", "\"2\""] {
+        for version in ["0", "9", "\"2\""] {
             let json = format!(
                 r#"{{"schema_version":{version},"units":"mm","parts":[],"keepouts":[],
                      "policy":{{"min_feature_mm":1.2,"required":[]}}}}"#
@@ -2173,6 +2339,8 @@ mod tests {
             anchor: Anchor::SelfTapping { pilot_mm: 1.6 },
             min_engagement_mm: 3.0,
             min_boss_wall_mm: 1.2,
+            release: None,
+            clamp_keepouts: vec![],
         }
     }
 
@@ -2591,6 +2759,136 @@ mod tests {
         assert_eq!(model.schema_version, SCHEMA_VERSION);
         assert!(model.keepouts[0].attached_to.is_none());
         value["keepouts"][0]["attached_to"] = json!("base");
+        assert!(Model::from_json(&value.to_string()).is_err());
+    }
+
+    /// 蓋 (lid) を基板 (base) にネジで留め、蓋を上へ外してから基板を下へ抜く。
+    fn with_screwed_lid(release: Option<Release>) -> Model {
+        let mut m = two_parts();
+        m.keepouts = with_keepout().keepouts;
+        m.assembly.steps = vec![
+            step("open_lid", &["lid"], vec![segment(Direction::PlusZ, EXIT)]),
+            step(
+                "drop_base",
+                &["base"],
+                vec![segment(Direction::MinusZ, EXIT)],
+            ),
+        ];
+        m.fasteners = vec![Fastener {
+            release,
+            ..fastener("corner")
+        }];
+        m
+    }
+
+    fn release_after(step: Option<&str>) -> Option<Release> {
+        Some(Release {
+            after_step: step.map(String::from),
+        })
+    }
+
+    fn release_check(m: &Model) -> Check {
+        let mut checks = m.evaluate_fastener_releases().unwrap();
+        assert_eq!(checks.len(), 1);
+        checks.remove(0)
+    }
+
+    #[test]
+    fn screw_must_be_removed_before_its_parts_separate() {
+        // 組立完了の状態で外せば、蓋を外すstepは妨げない。
+        let passed = release_check(&with_screwed_lid(release_after(None)));
+        assert_eq!(passed.status, Status::Pass, "{}", passed.message);
+        // 外さないネジ、蓋を外した後で外すネジは、蓋を外すstepで効いている。
+        for release in [None, release_after(Some("open_lid"))] {
+            let failed = release_check(&with_screwed_lid(release));
+            assert_eq!(failed.status, Status::Fail);
+            assert!(
+                failed
+                    .message
+                    .contains("step open_lid moves lid away from base"),
+                "{}",
+                failed.message
+            );
+        }
+    }
+
+    #[test]
+    fn parts_removed_together_stay_held() {
+        let mut m = with_screwed_lid(None);
+        m.assembly.steps = vec![step(
+            "lift_all",
+            &["lid", "base"],
+            vec![segment(Direction::PlusZ, EXIT)],
+        )];
+        assert_eq!(release_check(&m).status, Status::Pass);
+    }
+
+    #[test]
+    fn clamped_keepout_needs_the_screw_removed_before_it_leaves() {
+        // 基板 (keepout pcb) を蓋ではなくbaseへ締め、蓋を外した後に上へ抜く。
+        let mut m = with_screwed_lid(release_after(None));
+        m.fasteners[0].clamp = vec![];
+        m.fasteners[0].seat_mm = 2.0;
+        m.fasteners[0].clamp_keepouts = vec!["pcb".into()];
+        m.sweeps = vec![Sweep {
+            after_step: Some("open_lid".into()),
+            ..sweep("pcb_out")
+        }];
+        m.fasteners[0].release = release_after(Some("open_lid"));
+        assert_eq!(release_check(&m).status, Status::Pass);
+        m.fasteners[0].release = None;
+        let failed = release_check(&m);
+        assert_eq!(failed.status, Status::Fail);
+        assert!(
+            failed.message.contains("sweep pcb_out"),
+            "{}",
+            failed.message
+        );
+        // keepoutが固定されたままbaseを下へ抜くstepも、ネジが効いていればfail。
+        m.sweeps.clear();
+        let failed = release_check(&m);
+        assert!(
+            failed
+                .message
+                .contains("step drop_base moves base away from keepout:pcb"),
+            "{}",
+            failed.message
+        );
+        // keepoutがbaseに取り付けられていれば、一緒に動くため引き離されない。
+        m.keepouts[0].attached_to = Some("base".into());
+        assert_eq!(release_check(&m).status, Status::Pass);
+    }
+
+    #[test]
+    fn release_references_are_validated() {
+        let mut m = with_screwed_lid(release_after(Some("ghost")));
+        assert!(m.validate().is_err());
+        m.fasteners[0].release = None;
+        m.fasteners[0].clamp_keepouts = vec!["ghost".into()];
+        assert!(m.validate().is_err());
+        m.fasteners[0].clamp_keepouts = vec!["pcb".into(), "pcb".into()];
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn release_serializes_after_step_only_when_given() {
+        let mut m = with_screwed_lid(release_after(None));
+        m.fasteners[0].clamp_keepouts = vec!["pcb".into()];
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""release":{}"#), "{json}");
+        assert!(json.contains(r#""clamp_keepouts":["pcb"]"#), "{json}");
+        let back = Model::from_json(&json).unwrap();
+        assert_eq!(back.fasteners[0].release, Some(Release::default()));
+    }
+
+    #[test]
+    fn schema_v7_is_upgraded_with_screws_that_stay() {
+        let mut value = serde_json::to_value(with_screwed_lid(None)).unwrap();
+        value["schema_version"] = json!(7);
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.fasteners[0].release.is_none());
+        value["fasteners"][0]["release"] = json!({});
         assert!(Model::from_json(&value.to_string()).is_err());
     }
 
