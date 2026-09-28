@@ -5,9 +5,33 @@ from typedsolid.catalog import BOARDS, Board
 
 # 出典が寸法線として与える外形。catalogへの転記誤りを検出する。
 OUTLINES_MM = {
+    "raspberry_pi_pico": (51.0, 21.0),
+    "raspberry_pi_pico_w": (51.0, 21.0),
     "raspberry_pi_pico_2": (51.0, 21.0),
+    "raspberry_pi_pico_2_w": (51.0, 21.0),
+    "raspberry_pi_zero_2_w": (65.0, 30.0),
+    "raspberry_pi_3_model_b_plus": (85.0, 56.0),
+    "raspberry_pi_4_model_b": (85.0, 56.0),
     "raspberry_pi_5": (85.0, 56.0),
     "arduino_uno_r4_minima": (68.58, 53.34),
+    "arduino_uno_r4_wifi": (68.58, 53.34),
+    "arduino_nano_every": (43.18, 17.78),
+    "arduino_nano_33_iot": (43.16, 17.77),
+    "arduino_mkr_wan_1310": (67.7, 25.0),
+}
+
+# 取付穴の中心と径。径がNoneの基板は、資料が径を寸法化していない。
+HOLES_MM = {
+    "raspberry_pi_pico": ([(2.0, 4.8), (2.0, 16.2), (49.0, 4.8), (49.0, 16.2)], 2.1),
+    "raspberry_pi_pico_w": ([(2.0, 4.8), (2.0, 16.2), (49.0, 4.8), (49.0, 16.2)], 2.1),
+    "raspberry_pi_pico_2_w": ([(2.0, 4.8), (2.0, 16.2), (49.0, 4.8), (49.0, 16.2)], 2.1),
+    "raspberry_pi_zero_2_w": ([(3.5, 3.5), (3.5, 26.5), (61.5, 3.5), (61.5, 26.5)], None),
+    "raspberry_pi_3_model_b_plus": ([(3.5, 3.5), (3.5, 52.5), (61.5, 3.5), (61.5, 52.5)], 2.75),
+    "raspberry_pi_4_model_b": ([(3.5, 3.5), (3.5, 52.5), (61.5, 3.5), (61.5, 52.5)], 2.7),
+    "arduino_uno_r4_wifi": ([(13.97, 2.54), (15.24, 50.8), (66.04, 7.62), (66.04, 35.56)], 3.2),
+    "arduino_nano_every": ([(1.27, 1.27), (1.27, 16.51), (41.91, 1.27), (41.91, 16.51)], 1.65),
+    "arduino_nano_33_iot": ([(1.26, 1.27), (1.26, 16.51), (41.9, 1.27), (41.9, 16.51)], 1.66),
+    "arduino_mkr_wan_1310": ([(2.25, 2.25), (2.25, 22.75), (59.25, 2.25), (59.25, 22.75)], None),
 }
 
 
@@ -51,11 +75,28 @@ class MountingHoleTests(unittest.TestCase):
             self.assertEqual(len(entry.mounting_holes), 4)
             for index, item in enumerate(entry.mounting_holes):
                 with self.subTest(board=board_id, hole=index):
-                    radius = item.diameter_mm / 2.0
+                    radius = 0.0 if item.diameter_mm is None else item.diameter_mm / 2.0
                     self.assertLessEqual(radius, item.center[0])
                     self.assertLessEqual(item.center[0], entry.length_mm - radius)
                     self.assertLessEqual(radius, item.center[1])
                     self.assertLessEqual(item.center[1], entry.width_mm - radius)
+
+    def test_holes_match_the_source_figures(self):
+        for board_id, (centers, diameter) in HOLES_MM.items():
+            with self.subTest(board=board_id):
+                entry = board(board_id)
+                actual = sorted(item.center for item in entry.mounting_holes)
+                self.assertEqual(len(actual), len(centers))
+                for got, expected in zip(actual, sorted(centers)):
+                    self.assertAlmostEqual(got[0], expected[0], places=9)
+                    self.assertAlmostEqual(got[1], expected[1], places=9)
+                self.assertEqual({item.diameter_mm for item in entry.mounting_holes}, {diameter})
+
+    def test_hole_without_a_diameter_still_checks_the_outline(self):
+        with self.assertRaisesRegex(ValueError, "はみ出して"):
+            Board("t", "t", 10.0, 10.0, (MountingHole((11.0, 5.0), None),), source())
+        with self.assertRaisesRegex(ValueError, "直径が正でない"):
+            Board("t", "t", 10.0, 10.0, (MountingHole((5.0, 5.0), 0.0),), source())
 
     def test_pico_2_pitch_matches_the_datasheet_figure(self):
         """図が与えるのは短辺方向11.4。長辺方向47は端からの2.0と外形51から定まる。"""
