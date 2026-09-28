@@ -19,6 +19,11 @@ pub struct Triangle {
 }
 
 impl Triangle {
+    /// 3頂点の座標。単位はmm。
+    pub fn vertices(&self) -> [[f64; 3]; 3] {
+        self.vertices
+    }
+
     fn area_mm2(&self) -> f64 {
         let [a, b, c] = self.vertices;
         let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -91,6 +96,73 @@ pub fn parse_binary_stl(bytes: &[u8]) -> Result<Vec<Triangle>, String> {
         triangles.push(Triangle { vertices, keys });
     }
     Ok(triangles)
+}
+
+/// binaryとASCIIのSTLを読む。長さが宣言した三角形数と一致すればbinaryとして読み、
+/// そうでなく`solid`で始まればASCIIとして読む。binaryのheaderも`solid`で始まり得るため、
+/// 長さを先に照合する。
+pub fn parse_stl(bytes: &[u8]) -> Result<Vec<Triangle>, String> {
+    match parse_binary_stl(bytes) {
+        Ok(triangles) => Ok(triangles),
+        Err(_) if bytes.trim_ascii_start().starts_with(b"solid") => parse_ascii_stl(bytes),
+        Err(error) => Err(format!("{error}; an ASCII STL must start with \"solid\"")),
+    }
+}
+
+/// ASCII STL。`vertex x y z`を3つずつ1つの三角形として読む。normalは再計算できるため読まない。
+fn parse_ascii_stl(bytes: &[u8]) -> Result<Vec<Triangle>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "ASCII STL is not valid UTF-8")?;
+    let mut tokens = text.split_ascii_whitespace();
+    let mut corners: Vec<([f64; 3], VertexKey)> = Vec::new();
+    while let Some(token) = tokens.next() {
+        if token != "vertex" {
+            continue;
+        }
+        let mut position = [0.0f64; 3];
+        let mut raw = [0.0f32; 3];
+        for axis in 0..3 {
+            let value: f32 = tokens
+                .next()
+                .and_then(|t| t.parse().ok())
+                .filter(|v: &f32| v.is_finite())
+                .ok_or_else(|| format!("vertex {} has an invalid coordinate", corners.len()))?;
+            raw[axis] = value;
+            position[axis] = f64::from(value);
+        }
+        corners.push((position, vertex_key(raw)));
+    }
+    if corners.is_empty() || !corners.len().is_multiple_of(3) {
+        return Err(format!(
+            "ASCII STL has {} vertices; a positive multiple of 3 is required",
+            corners.len()
+        ));
+    }
+    Ok(corners
+        .chunks_exact(3)
+        .map(|c| Triangle {
+            vertices: [c[0].0, c[1].0, c[2].0],
+            keys: [c[0].1, c[1].1, c[2].1],
+        })
+        .collect())
+}
+
+/// 奇数個の三角形に共有される辺の数。0でなければmeshは閉じていない。
+/// 向きは問わない。空洞の内面や複数のshellを含むmeshも閉じていれば0になる。
+/// 2頂点が一致する退化三角形の長さ0の辺は、面を区切らないため数えない。
+pub fn boundary_edges(triangles: &[Triangle]) -> usize {
+    let mut edges: HashMap<(VertexKey, VertexKey), usize> = HashMap::new();
+    for triangle in triangles {
+        for corner in 0..3 {
+            let (a, b) = (triangle.keys[corner], triangle.keys[(corner + 1) % 3]);
+            if a == b {
+                continue;
+            }
+            *edges
+                .entry(if a < b { (a, b) } else { (b, a) })
+                .or_default() += 1;
+        }
+    }
+    edges.values().filter(|count| *count % 2 == 1).count()
 }
 
 fn find(parent: &mut [usize], mut node: usize) -> usize {

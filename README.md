@@ -6,6 +6,7 @@
 
 - [設計と検査範囲](docs/design.md)
 - [部品catalog](docs/catalog.md)
+- [既存ケースとの比較](docs/comparison.md)
 - [セットアップ・作例・テスト](docs/development.md)
 - [開放筐体の作例とE2E test](docs/development.md#開放筐体の作例)
 - [ロードマップ](docs/roadmap.md)

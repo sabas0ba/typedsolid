@@ -249,6 +249,17 @@ power = connector_opening(
 
 印刷姿勢は`Policy.build_direction` (既定`plus_z`)、支持なしで許す傾斜は`overhang_angle_deg` (既定45)、渡せる未支持区間の長さは`bridge_max_mm` (既定5.0) で指定する。
 
+## 外部形状の検査
+
+既存の筐体など、IRで記述していないSTL (binary又はASCII) とSTEPにも、最終形状の4 rule (肉厚、断面、閉空洞、支持) を適用できる。単位はmmとみなす。閉じていないmeshは評価せず拒否する。
+
+```bash
+.venv/bin/python -m typedsolid.external path/to/case.stl
+.venv/bin/python -m typedsolid.external path/to/case.step --min-wall-mm 1.0 --build-direction plus_y --json
+```
+
+すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
+
 ## slicerとの突合
 
 `support_free`は幾何のみに基づく近似であり、ノズル径、層厚、冷却、材料を含まない。実機で用いる場合は、出力したSTLをslicerへ読み込み、同じ印刷姿勢でサポート生成の要否を比較する。

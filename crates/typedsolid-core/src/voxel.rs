@@ -3,7 +3,7 @@
 //! backendのface/edge topologyに依存せず、boxとcylinderの内外判定だけで最終形状を
 //! 得る。厚さ・接続部・空洞はいずれも同じoccupancyから導く。
 
-use crate::{Check, Direction, Model, Operation, Part, Rule, Status};
+use crate::{Check, Direction, Model, Operation, Part, Policy, Rule, Status, mesh};
 
 /// 1 partあたりのcell数の上限。超える入力はvalidateで拒否する。
 pub const MAX_GRID_CELLS: u64 = 200_000_000;
@@ -111,6 +111,133 @@ impl Grid {
                     }
                 }
             }
+        }
+        Ok(grid)
+    }
+
+    /// 閉じた三角形meshの内部をcell単位で求める。
+    ///
+    /// 各(x, y) cell中心から+z方向の直線とmeshの交点を求め、winding numberが正の区間に
+    /// あるcell中心を内部とする。外向きの法線が-z成分を持つ面を通ると+1 (入る)、
+    /// +z成分を持つ面を通ると-1 (出る) とする。偶奇則と異なり、重なった複数のsolidは
+    /// 和として、内向きの面で囲んだ空洞は空洞として扱える。xy平面へ投影した三角形の
+    /// 内外判定は、辺上の点を辺の向きで一方の三角形だけに割り当てるため、隣り合う
+    /// 三角形の共有辺で交点を二重に数えない。格子はmeshの外接boxから半cellずらし、
+    /// 軸平行な面がcell中心を通らないようにする。winding numberが負になるか0に戻らない
+    /// 列があれば、meshが閉じていないか向きが不整合であるとして拒否する。
+    pub fn from_triangles(triangles: &[[[f64; 3]; 3]], pitch: f64) -> Result<Self, String> {
+        if triangles.is_empty() {
+            return Err("mesh has no triangles".into());
+        }
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        for vertex in triangles.iter().flatten() {
+            for axis in 0..3 {
+                if !vertex[axis].is_finite() || vertex[axis].abs() > crate::COORDINATE_LIMIT_MM {
+                    return Err("mesh coordinates must be finite and within ±1000000 mm".into());
+                }
+                low[axis] = low[axis].min(vertex[axis]);
+                high[axis] = high[axis].max(vertex[axis]);
+            }
+        }
+        let mut size = [0usize; 3];
+        let mut origin = [0.0f64; 3];
+        let mut cells: u64 = 1;
+        for axis in 0..3 {
+            let count = ((high[axis] - low[axis]) / pitch).ceil() as u64 + 1 + 2 * PADDING_CELLS;
+            cells = cells
+                .checked_mul(count)
+                .filter(|c| *c <= MAX_GRID_CELLS)
+                .ok_or_else(|| {
+                    format!(
+                        "mesh exceeds the voxel grid limit of {MAX_GRID_CELLS} cells at voxel_mm={pitch}"
+                    )
+                })?;
+            size[axis] = count as usize;
+            origin[axis] = low[axis] - (PADDING_CELLS as f64 - 0.5) * pitch;
+        }
+        let mut grid = Self {
+            size,
+            origin,
+            pitch,
+            occupied: vec![false; cells as usize],
+        };
+        let [nx, ny, _] = size;
+        // 交点のzとwinding numberの増分。
+        let mut columns: Vec<Vec<(f64, i32)>> = vec![Vec::new(); nx * ny];
+        for triangle in triangles {
+            let [a, mut b, mut c] = *triangle;
+            let mut area = cross(a, b, [c[0], c[1]]);
+            if area == 0.0 {
+                // xy平面へ投影すると線分になる三角形は+z方向の直線と交わらない。
+                continue;
+            }
+            // 投影が反時計回りなら外向きの法線は+z成分を持ち、上へ抜けると外に出る。
+            let delta = if area > 0.0 { -1 } else { 1 };
+            if area < 0.0 {
+                std::mem::swap(&mut b, &mut c);
+                area = -area;
+            }
+            // 以降、頂点a, b, cはxy平面で反時計回りに並ぶ。
+            let (x0, x1) = grid.cell_range(0, a[0].min(b[0]).min(c[0]), a[0].max(b[0]).max(c[0]));
+            let (y0, y1) = grid.cell_range(1, a[1].min(b[1]).min(c[1]), a[1].max(b[1]).max(c[1]));
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let point = [grid.centre(0, x), grid.centre(1, y)];
+                    let weights = [
+                        edge_weight(b, c, point),
+                        edge_weight(c, a, point),
+                        edge_weight(a, b, point),
+                    ];
+                    let edges = [(b, c), (c, a), (a, b)];
+                    let inside = weights
+                        .iter()
+                        .zip(edges.iter())
+                        .all(|(w, (u, v))| *w > 0.0 || (*w == 0.0 && owns_edge(*u, *v)));
+                    if inside {
+                        let z = (weights[0] * a[2] + weights[1] * b[2] + weights[2] * c[2]) / area;
+                        columns[y * nx + x].push((z, delta));
+                    }
+                }
+            }
+        }
+        let mut broken_columns = 0usize;
+        for y in 0..ny {
+            for x in 0..nx {
+                let hits = &mut columns[y * nx + x];
+                // 同じzの交点は入る側を先に数え、接する2つのsolidの境で外に出ないようにする。
+                hits.sort_by(|p, q| p.0.total_cmp(&q.0).then(q.1.cmp(&p.1)));
+                let mut winding = 0i32;
+                let mut entered = 0.0f64;
+                let mut broken = false;
+                for &(z, delta) in hits.iter() {
+                    let before = winding;
+                    winding += delta;
+                    if winding < 0 {
+                        broken = true;
+                        break;
+                    }
+                    if before == 0 && winding > 0 {
+                        entered = z;
+                    } else if before > 0 && winding == 0 {
+                        // 中心がentered <= z < 出た位置にあるcellを内部とする。
+                        let first = ((entered - grid.origin[2]) / pitch).ceil().max(0.0) as usize;
+                        let last = ((z - grid.origin[2]) / pitch).ceil().max(0.0) as usize;
+                        for cell in first..last.min(grid.size[2]) {
+                            let index = grid.index(x, y, cell);
+                            grid.occupied[index] = true;
+                        }
+                    }
+                }
+                if broken || winding != 0 {
+                    broken_columns += 1;
+                }
+            }
+        }
+        if broken_columns > 0 {
+            return Err(format!(
+                "mesh is not closed or its orientation is inconsistent: winding number is negative or does not return to 0 in {broken_columns} column(s)"
+            ));
         }
         Ok(grid)
     }
@@ -447,6 +574,29 @@ const NEIGHBOURS: [(i32, i32, i32); 6] = [
     (0, 0, 1),
 ];
 
+/// xy平面での(v - u)×(p - u)。uからvへの辺の左にpがあれば正。
+fn cross(u: [f64; 3], v: [f64; 3], p: [f64; 2]) -> f64 {
+    (v[0] - u[0]) * (p[1] - u[1]) - (v[1] - u[1]) * (p[0] - u[0])
+}
+
+/// 辺uvに対する点pの符号付き面積。端点を座標の辞書順に並べてから計算し、向きは符号で
+/// 表す。共有辺を逆向きに持つ2つの三角形はビット単位で符号だけが異なる値を得るため、
+/// 丸め誤差で両方が内側と判定することはない。
+fn edge_weight(u: [f64; 3], v: [f64; 3], p: [f64; 2]) -> f64 {
+    if (u[0], u[1]) <= (v[0], v[1]) {
+        cross(u, v, p)
+    } else {
+        -cross(v, u, p)
+    }
+}
+
+/// 辺上の点をこの辺を持つ三角形へ割り当てるか。隣り合う2つの反時計回りの三角形は
+/// 共有辺を逆向きに持つため、ちょうど一方だけがtrueとなる。
+fn owns_edge(u: [f64; 3], v: [f64; 3]) -> bool {
+    let (dx, dy) = (v[0] - u[0], v[1] - u[1]);
+    dy > 0.0 || (dy == 0.0 && dx < 0.0)
+}
+
 fn checked_step(value: usize, delta: i32, limit: usize) -> Option<usize> {
     let moved = value as i64 + delta as i64;
     if moved < 0 || moved >= limit as i64 {
@@ -518,23 +668,48 @@ fn check(rule: Rule, target: &str, passed: bool, message: String) -> Check {
 /// 量子化の誤差は最大でgrid間隔1つ分である。要求値に間隔を加えた厚さを満たす場合のみ
 /// passとし、判定を失敗側へ倒す。
 pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
-    let policy = &model.policy;
-    let pitch = policy.voxel_mm;
     let mut checks = Vec::new();
     for part in &model.parts {
-        let grid = Grid::rasterize(part, pitch)?;
+        let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
+        checks.extend(evaluate_grid(&grid, &part.id, &model.policy));
+    }
+    Ok(checks)
+}
+
+/// 外部のSTL (binary又はASCII) を読み、IRを介さずに最終形状のruleを評価する。
+/// 座標の単位はmmとみなす。meshは閉じている必要があり、閉じていなければ拒否する。
+pub fn evaluate_stl(bytes: &[u8], target: &str, policy: &Policy) -> Result<Vec<Check>, String> {
+    policy.validate()?;
+    let parsed = mesh::parse_stl(bytes)?;
+    // z方向の偶奇判定だけでは、z方向から見て面積0の面に開いた穴を検出できない。
+    let boundary = mesh::boundary_edges(&parsed);
+    if boundary > 0 {
+        return Err(format!(
+            "mesh is not closed: {boundary} edge(s) are shared by an odd number of triangles"
+        ));
+    }
+    let triangles: Vec<[[f64; 3]; 3]> = parsed.iter().map(mesh::Triangle::vertices).collect();
+    let grid = Grid::from_triangles(&triangles, policy.voxel_mm)?;
+    Ok(evaluate_grid(&grid, target, policy))
+}
+
+/// 1つの占有格子に対する最終形状のrule。
+fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
+    let pitch = grid.pitch;
+    let mut checks = Vec::new();
+    {
         let solid_cells = grid.occupied_cells();
         if solid_cells == 0 {
             // 空形状はvalid_solidが扱う。ここでは判定材料が無いことを明示する。
             for rule in Rule::VOXEL {
                 checks.push(check(
                     rule,
-                    &part.id,
+                    target,
                     false,
                     "rasterized geometry is empty".into(),
                 ));
             }
-            continue;
+            return checks;
         }
 
         // 量子化の誤差を失敗側へ倒すため、要求値にgrid間隔を足した長さを求める。
@@ -557,7 +732,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
         let largest = regions.iter().copied().max().unwrap_or(0);
         checks.push(check(
             Rule::FinalWallThickness,
-            &part.id,
+            target,
             regions.is_empty(),
             format!(
                 "{} region(s) thinner than {} mm; largest {:.3} mm³ of {:.3} mm³; grid {} mm; regions below {} mm³ are treated as edges",
@@ -576,7 +751,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
         let components = grid.component_sizes(&core).len();
         checks.push(check(
             Rule::NeckSection,
-            &part.id,
+            target,
             components == 1,
             if core_cells == 0 {
                 format!(
@@ -594,7 +769,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
         let enclosed = grid.enclosed_void_cells();
         checks.push(check(
             Rule::ClosedCavity,
-            &part.id,
+            target,
             enclosed == 0,
             format!(
                 "{enclosed} enclosed void cell(s); grid {} mm; cavities reachable only through gaps below the grid size are not distinguished",
@@ -617,7 +792,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
         let spanned = support.bridged.iter().filter(|cell| **cell).count();
         checks.push(check(
             Rule::SupportFree,
-            &part.id,
+            target,
             unsupported == 0,
             format!(
                 "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
@@ -630,7 +805,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
             ),
         ));
     }
-    Ok(checks)
+    checks
 }
 
 #[cfg(test)]
@@ -892,6 +1067,180 @@ mod tests {
         let vertical = evaluate(&model_with(stepped, narrow)).unwrap();
         // 真下にしか支持を認めないと、同じ張り出しが未支持になる。
         assert_eq!(status(&vertical, Rule::SupportFree), Status::Fail);
+    }
+
+    /// boxの12三角形。inwardなら法線を内向きにする (空洞の内面)。
+    fn box_triangles(min: [f64; 3], max: [f64; 3], inward: bool) -> Vec<[[f64; 3]; 3]> {
+        let corner = |i: usize| {
+            [
+                if i & 1 == 0 { min[0] } else { max[0] },
+                if i & 2 == 0 { min[1] } else { max[1] },
+                if i & 4 == 0 { min[2] } else { max[2] },
+            ]
+        };
+        // 外向きの法線で反時計回りに見える4頂点の組。
+        let faces = [
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+        ];
+        let mut triangles = Vec::new();
+        for [a, b, c, d] in faces {
+            for tri in [[a, b, c], [a, c, d]] {
+                let mut t = tri.map(corner);
+                if inward {
+                    t.swap(1, 2);
+                }
+                triangles.push(t);
+            }
+        }
+        triangles
+    }
+
+    fn binary_stl(triangles: &[[[f64; 3]; 3]], header: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 80];
+        bytes[..header.len()].copy_from_slice(header);
+        bytes.extend((triangles.len() as u32).to_le_bytes());
+        for triangle in triangles {
+            bytes.extend([0u8; 12]);
+            for vertex in triangle {
+                for value in vertex {
+                    bytes.extend((*value as f32).to_le_bytes());
+                }
+            }
+            bytes.extend([0u8; 2]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn closed_box_mesh_fills_its_volume_exactly() {
+        let grid = Grid::from_triangles(&box_triangles([0.; 3], [10.; 3], false), 1.0).unwrap();
+        // 格子を半cellずらすため、面がcell中心を通らず1000 cellちょうどになる。
+        assert_eq!(grid.occupied_cells(), 1000);
+    }
+
+    #[test]
+    fn cell_centres_on_a_shared_diagonal_are_counted_once() {
+        // 上下面は対角線で2三角形に分かれ、cell中心 (-0.1 + 0.2i, 22.9 + 0.2i) が
+        // 対角線上に並ぶ。座標は2進で表せず、辺ごとの計算では丸めが一致しない。
+        let grid =
+            Grid::from_triangles(&box_triangles([0., 23., 0.], [3., 26., 3.], false), 0.2).unwrap();
+        assert_eq!(grid.occupied_cells(), 15 * 15 * 15);
+    }
+
+    #[test]
+    fn slanted_faces_follow_the_analytic_volume() {
+        // |x|+|y|+|z| <= 6 の八面体。体積は(4/3)·6³ = 288 mm³。
+        let r = 6.0;
+        let tips = [
+            [r, 0., 0.],
+            [-r, 0., 0.],
+            [0., r, 0.],
+            [0., -r, 0.],
+            [0., 0., r],
+            [0., 0., -r],
+        ];
+        let mut triangles = Vec::new();
+        for (x, y, z) in [
+            (0, 2, 4),
+            (2, 1, 4),
+            (1, 3, 4),
+            (3, 0, 4),
+            (2, 0, 5),
+            (1, 2, 5),
+            (3, 1, 5),
+            (0, 3, 5),
+        ] {
+            triangles.push([tips[x], tips[y], tips[z]]);
+        }
+        let pitch = 0.25;
+        let grid = Grid::from_triangles(&triangles, pitch).unwrap();
+        let volume = grid.occupied_cells() as f64 * pitch.powi(3);
+        assert!((volume - 288.0).abs() / 288.0 < 0.03, "{volume}");
+    }
+
+    #[test]
+    fn open_mesh_is_rejected() {
+        let rules = policy(1.2, 1.2, 1.0);
+        // 最後の2三角形は+x面。z方向から見て面積0のため、偶奇判定では検出できない。
+        let mut side = box_triangles([0.; 3], [10.; 3], false);
+        side.pop();
+        let error = evaluate_stl(&binary_stl(&side, b""), "a", &rules).unwrap_err();
+        assert!(error.contains("odd number of triangles"), "{error}");
+        // 上面の穴はwinding numberでも検出する。
+        let mut top = box_triangles([0.; 3], [10.; 3], false);
+        top.remove(2);
+        let error = Grid::from_triangles(&top, 1.0).err().unwrap();
+        assert!(error.contains("winding number"), "{error}");
+    }
+
+    #[test]
+    fn overlapping_solids_are_united_and_inverted_shells_are_rejected() {
+        // x=0..10とx=5..15の2つのboxが重なる。偶奇則では重なりが外側になる。
+        let mut pair = box_triangles([0.; 3], [10.; 3], false);
+        pair.extend(box_triangles([5., 0., 0.], [15., 10., 10.], false));
+        let grid = Grid::from_triangles(&pair, 1.0).unwrap();
+        assert_eq!(grid.occupied_cells(), 15 * 10 * 10);
+        // 内向きの面だけからなるshellは、上へ抜ける前にwinding numberが負になる。
+        let error = Grid::from_triangles(&box_triangles([0.; 3], [10.; 3], true), 1.0)
+            .err()
+            .unwrap();
+        assert!(error.contains("orientation"), "{error}");
+    }
+
+    #[test]
+    fn stl_rules_detect_a_sealed_cavity_and_a_thin_plate() {
+        let rules = policy(1.2, 1.2, 0.5);
+        let solid = binary_stl(&box_triangles([0.; 3], [20.; 3], false), b"");
+        let checks = evaluate_stl(&solid, "block", &rules).unwrap();
+        assert_eq!(status(&checks, Rule::ClosedCavity), Status::Pass);
+        assert_eq!(status(&checks, Rule::FinalWallThickness), Status::Pass);
+        assert!(checks.iter().all(|c| c.target == "block"));
+
+        let mut hollow = box_triangles([0.; 3], [20.; 3], false);
+        hollow.extend(box_triangles([5.; 3], [15.; 3], true));
+        let checks = evaluate_stl(&binary_stl(&hollow, b""), "hollow", &rules).unwrap();
+        assert_eq!(status(&checks, Rule::ClosedCavity), Status::Fail);
+
+        let plate = binary_stl(&box_triangles([0.; 3], [20., 20., 0.8], false), b"");
+        let checks = evaluate_stl(&plate, "plate", &rules).unwrap();
+        assert_eq!(status(&checks, Rule::FinalWallThickness), Status::Fail);
+    }
+
+    #[test]
+    fn ascii_and_binary_with_a_solid_header_are_both_read() {
+        let triangles = box_triangles([0.; 3], [10.; 3], false);
+        let mut text = String::from("solid cube\n");
+        for t in &triangles {
+            text.push_str("facet normal 0 0 0\nouter loop\n");
+            for v in t {
+                text.push_str(&format!("vertex {} {} {}\n", v[0], v[1], v[2]));
+            }
+            text.push_str("endloop\nendfacet\n");
+        }
+        text.push_str("endsolid cube\n");
+        let rules = policy(1.2, 1.2, 1.0);
+        let ascii = evaluate_stl(text.as_bytes(), "a", &rules).unwrap();
+        let binary = evaluate_stl(&binary_stl(&triangles, b"solid header"), "b", &rules).unwrap();
+        assert_eq!(ascii.len(), Rule::VOXEL.len());
+        for (x, y) in ascii.iter().zip(binary.iter()) {
+            assert_eq!(
+                (x.rule, x.status, &x.message),
+                (y.rule, y.status, &y.message)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_policy_is_rejected_for_stl() {
+        let mut rules = policy(1.2, 1.2, 1.0);
+        rules.voxel_mm = 0.0;
+        let solid = binary_stl(&box_triangles([0.; 3], [10.; 3], false), b"");
+        assert!(evaluate_stl(&solid, "block", &rules).is_err());
     }
 
     #[test]
