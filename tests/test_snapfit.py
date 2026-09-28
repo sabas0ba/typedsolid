@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 import unittest
 
-from typedsolid import Assembly, Box, Feature, Material, Model, Move, Part, Policy, Step, snap_fit
+from typedsolid import (
+    Assembly, Box, Clearance, Feature, Keepout, Material, Model, Move, Part, Policy, Step, snap_fit,
+)
 from typedsolid.cadquery import build
 
 # snap fitと分解だけを見る。梁を積層面に沿わせるため、印刷方向は梁の長さ (z) と直交させる。
@@ -120,6 +122,15 @@ class SnapFitTests(unittest.TestCase):
         result = build(model(base_extra=(post,)))
         self.assertEqual(failing(result), {"clip/deflection_space"})
         self.assertIn("hits base", snap_checks(result)["deflection_space"]["message"])
+
+    def test_keepout_beside_the_beam_blocks_the_deflection(self):
+        # 柱と同じ位置の基板領域。取付先がsnap fitを持つ蓋でも、相手の筐体でも、梁はたわめない。
+        for attached_to in ("base", "lid", None):
+            with self.subTest(attached_to=attached_to):
+                board = Keepout("pcb", Box((33, 5, 15), (34, 15, 20)), Clearance(default=0.5), attached_to=attached_to)
+                result = build(replace(model(), keepouts=(board,)))
+                self.assertIn("clip/deflection_space", failing(result))
+                self.assertIn("keepout:pcb", snap_checks(result)["deflection_space"]["message"])
 
     def test_too_little_deflection_leaves_the_hook_caught(self):
         result = build(model(clip(deflection_mm=0.5)))

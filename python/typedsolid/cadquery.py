@@ -8,7 +8,7 @@ exportは既定で子processにbackendを隔離し、timeoutで打ち切る。bu
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import copy
 from dataclasses import dataclass
 import hashlib
@@ -186,13 +186,16 @@ def _laterally_expanded(
     return shape
 
 
-def _add_bounds(parts: list[dict], offset: list[float]) -> tuple[list[float], list[float]] | None:
+def _add_bounds(
+    parts: Sequence[dict], offset: list[float], keepouts: Sequence[dict] = (),
+) -> tuple[list[float], list[float]] | None:
+    """部品の付加形状とkeepoutの箱を合わせたAABBをoffsetだけ動かしたもの。"""
     boxes = [
         _aabb(feature["shape"])
         for part in parts
         for feature in part["features"]
         if feature["operation"] == "add"
-    ]
+    ] + [_aabb(keepout["shape"]) for keepout in keepouts]
     if not boxes:
         return None
     return (
@@ -274,12 +277,17 @@ def _disassembly_checks(
 ) -> list[dict]:
     """分解stepを順に実行し、移動中の干渉と、経路の終端で外れることを検査する。
 
+    keepoutは箱そのもの (clearanceを含まない) を障害物とする。取付先の部品を動かす
+    stepではその部品と一緒に動き、以降の状態から除かれる。取付先のないkeepoutは
+    最後まで残る。targetではkeepoutを`keepout:<id>`と書き、部品のidと区別する。
+
     snap fitを外すstepでは、フックをたわませた部品で経路を掃引する。あわせて、
     たわませないフックがそのstepの経路を塞ぐこと (保持) を検査する。
     """
     parts = {part["id"]: part for part in data["parts"]}
     assembly = data["assembly"]
     present = dict(shapes)
+    present_keepouts = list(data["keepouts"])
     checks: list[dict] = []
     for step in assembly["steps"]:
         progress(f"step {step['id']}: disassembly")
@@ -292,9 +300,14 @@ def _disassembly_checks(
         moving_shape = present.pop(moving_ids[0])
         for part_id in moving_ids[1:]:
             moving_shape = moving_shape.fuse(present.pop(part_id))
+        carried = [k for k in present_keepouts if k.get("attached_to") in moving_ids]
+        present_keepouts = [k for k in present_keepouts if k not in carried]
+        for keepout in carried:
+            moving_shape = moving_shape.fuse(_solid(keepout["shape"]))
         features = [feature for part_id in moving_ids for feature in parts[part_id]["features"]]
-        remaining_ids = list(present)
-        remaining_bounds = _add_bounds([parts[part_id] for part_id in remaining_ids], [0.0, 0.0, 0.0])
+        obstacles = dict(present) | {f"keepout:{k['id']}": _solid(k["shape"]) for k in present_keepouts}
+        remaining_bounds = _add_bounds([parts[part_id] for part_id in present], [0.0, 0.0, 0.0], present_keepouts)
+        moving_parts = [parts[p] for p in moving_ids]
         offset = [0.0, 0.0, 0.0]
         segments: list[tuple[str, float]] = []
 
@@ -305,26 +318,26 @@ def _disassembly_checks(
             expanded = _laterally_expanded(start, axis, clearance, features, offset)
             region = _swept(expanded, axis, signed, _split_coordinates(features, axis, offset))
             offset[axis] += signed
-            return {part_id: _overlap(region, present[part_id]) for part_id in remaining_ids}
+            return {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
 
         for index, segment in enumerate(step["path"]):
             direction = segment["direction"]
             distance = segment["distance_mm"]
             if distance == "exit":
-                distance = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, direction)
+                distance = _exit_distance(_add_bounds(moving_parts, offset, carried), remaining_bounds, direction)
             segments.append((direction, distance))
             overlaps = sweep_overlaps(direction, distance)
             if not overlaps:
-                checks.append(_check("disassembly_path", f"{label}/{index}", True, f"{direction} {distance:.6g} mm; no remaining parts"))
-            for part_id, overlap in overlaps.items():
-                checks.append(_check("disassembly_path", f"{label}/{index}/{part_id}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm with fit clearance {clearance} mm: overlap {overlap:.9g} mm³"))
+                checks.append(_check("disassembly_path", f"{label}/{index}", True, f"{direction} {distance:.6g} mm; no remaining parts or keepouts"))
+            for name, overlap in overlaps.items():
+                checks.append(_check("disassembly_path", f"{label}/{index}/{name}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm with fit clearance {clearance} mm: overlap {overlap:.9g} mm³"))
 
         # 最後の区間の方向へ外まで動かし続けられれば、部品は外れている。
         last = step["path"][-1]
         if last["distance_mm"] == "exit":
             checks.append(_check("disassembly_separation", label, True, f"last segment exits along {last['direction']}"))
         else:
-            continuation = _exit_distance(_add_bounds([parts[p] for p in moving_ids], offset), remaining_bounds, last["direction"])
+            continuation = _exit_distance(_add_bounds(moving_parts, offset, carried), remaining_bounds, last["direction"])
             overlaps = sweep_overlaps(last["direction"], continuation)
             blocking = {part_id: overlap for part_id, overlap in overlaps.items() if overlap > VOLUME_TOLERANCE}
             message = (
@@ -390,6 +403,8 @@ def _present_before(data: dict, step_id: str) -> list[str]:
 def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], progress: Progress) -> list[dict]:
     """snap fitの梁とフックが実形状にあり、外すstepの直前の状態でたわむ空間が空いている。
 
+    たわむ空間は、残っている部品とkeepoutの箱 (clearanceを含まない) を障害物とする。
+
     たわむ空間は、梁とフックをdeflection_mmだけ平行に動かした掃引で表す。根元は実際には
     動かないため、根元付近では保守側の判定になる。
     """
@@ -411,9 +426,14 @@ def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], pr
         hook_region = _swept(snap.hook, axis, signed, _split_coordinates(features, axis, [0.0, 0.0, 0.0]))
         region = snap.envelope.fuse(hook_region)
         obstacles = {} if snap.rest is None else {part_id: snap.rest}
-        for other in _present_before(data, snap.data["step"]):
+        present = _present_before(data, snap.data["step"])
+        for other in present:
             if other != part_id:
                 obstacles[other] = shapes[other]
+        # keepoutは取付先がsnap fitを持つ部品でも、梁と一緒にはたわまない。
+        for keepout in data["keepouts"]:
+            if keepout.get("attached_to") in (None, *present):
+                obstacles[f"keepout:{keepout['id']}"] = _solid(keepout["shape"])
         blocking = {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
         blocking = {name: overlap for name, overlap in blocking.items() if overlap > VOLUME_TOLERANCE}
         message = (

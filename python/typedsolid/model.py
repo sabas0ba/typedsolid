@@ -100,12 +100,16 @@ class Keepout:
 
     to_jsonはaccessの各方向を、idが`<keepout>_<direction>`のSweepへ展開する。
     分解stepの後で抜く場合や距離を限る場合は、Sweepを直接書く。
+
+    keepoutは分解経路の障害物になる。attached_toを与えると、その部品と一緒に
+    分解stepで動き、以降の状態から除かれる。省くと外部に固定され、最後まで残る。
     """
 
     id: str
     shape: Shape
     clearance_mm: Clearance = field(default_factory=Clearance)
     access: tuple[Direction, ...] = ()
+    attached_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,7 +257,7 @@ class Policy:
 
 def _without_unset(value: Any) -> Any:
     """未指定の値をJSONから除く。対象は面別clearance、stepのfit_clearance_mm、Sweepの省略可能な値、
-    部品のmaterial、材料のallowable_strainである。
+    部品のmaterial、材料のallowable_strain、keepoutのattached_toである。
 
     asdictはtupleをtupleのまま返すため、listと同じに扱わないと入れ子を降りられない。
     """
@@ -281,7 +285,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 6
+    schema_version: int = 7
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
