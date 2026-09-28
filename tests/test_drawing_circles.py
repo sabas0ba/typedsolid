@@ -54,6 +54,27 @@ class CircleTests(unittest.TestCase):
         )
         self.assertEqual(drawing_circles.circles(path), [])
 
+    def test_rotation_keeps_the_diameter(self):
+        """回転しても直径は変わらない。端点の外接矩形で測ると√2倍小さくなる。"""
+        c = math.cos(math.radians(45.0))
+        path = svg(
+            f'<path transform="matrix({c}, {c}, {-c}, {c}, 5, 7)" d="{circle_path(0.0, 0.0, 1.0)}"/>'
+        )
+        found = drawing_circles.circles(path)
+        self.assertEqual(len(found), 1)
+        self.assertAlmostEqual(found[0].diameter, 2.0, places=3)
+        self.assertAlmostEqual(found[0].center[0], 5.0)
+        self.assertAlmostEqual(found[0].center[1], 7.0)
+
+    def test_curves_with_cardinal_endpoints_but_not_on_a_circle(self):
+        """端点は円と同じでも、制御点が四角へ張り出した曲線は円ではない。"""
+        k = 1.0
+        d = (
+            f"M 1 0 C 1 {k} {k} 1 0 1 C {-k} 1 -1 {k} -1 0 "
+            f"C -1 {-k} {-k} -1 0 -1 C {k} -1 1 {-k} 1 0 Z"
+        )
+        self.assertEqual(drawing_circles.circles(svg(f'<path d="{d}"/>')), [])
+
     def test_glyph_definitions_are_ignored(self):
         path = svg(f'<defs><path d="{circle_path(0.0, 0.0, 1.0)}"/></defs>')
         self.assertEqual(drawing_circles.circles(path), [])

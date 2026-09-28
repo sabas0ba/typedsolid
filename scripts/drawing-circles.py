@@ -99,23 +99,48 @@ def subpaths(d: str) -> list[list[tuple[str, list[float]]]]:
     return result
 
 
+def bezier(points: list[Point], t: float) -> Point:
+    """3次Bézier曲線上の点。"""
+    s = 1.0 - t
+    weights = (s * s * s, 3.0 * s * s * t, 3.0 * s * t * t, t * t * t)
+    return (
+        sum(w * p[0] for w, p in zip(weights, points)),
+        sum(w * p[1] for w, p in zip(weights, points)),
+    )
+
+
+# 各曲線で中心からの距離を確かめる媒介変数。端点と内部の点を含める。
+SAMPLES = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
 def as_circle(segments: list[tuple[str, list[float]]], matrix: Matrix, tolerance: float) -> Circle | None:
-    """M、4本のC、任意のZからなり、4つの端点が正方形の外接を持つ場合に円とみなす。"""
+    """M、4本のC、任意のZからなり、曲線上の点がすべて1つの円周上にある場合に円とみなす。
+
+    中心は4本の曲線の端点の平均、半径は端点までの距離の平均とする。曲線ごとに端点と
+    内部の点を標本とし、中心からの距離と半径の相対差がtolerance以下であることを要求する。affine変換は制御点に
+    適用してから曲線を評価するため、回転しても直径は変わらず、非一様な拡大は楕円として
+    除かれる。
+    """
     body = [item for item in segments if item[0] != "Z"]
     if len(body) != 5 or body[0][0] != "M" or any(command != "C" for command, _ in body[1:]):
         return None
     start = apply(matrix, (body[0][1][0], body[0][1][1]))
-    ends = [apply(matrix, (values[4], values[5])) for _, values in body[1:]]
-    if math.dist(start, ends[-1]) > tolerance * max(1e-9, math.dist(start, ends[1])):
+    curves = []
+    current = start
+    for _, values in body[1:]:
+        controls = [apply(matrix, (values[i], values[i + 1])) for i in (0, 2, 4)]
+        curves.append([current] + controls)
+        current = controls[-1]
+    ends = [curve[3] for curve in curves]
+    center = (sum(p[0] for p in ends) / 4.0, sum(p[1] for p in ends) / 4.0)
+    # 半径は円周上に乗る端点から求める。内部の点は近似誤差だけ外へふくらむ。
+    radius = sum(math.dist(center, point) for point in ends) / 4.0
+    distances = [math.dist(center, bezier(curve, t)) for curve in curves for t in SAMPLES]
+    if radius <= 0.0 or math.dist(start, ends[-1]) > tolerance * radius:
         return None
-    xs = [point[0] for point in ends]
-    ys = [point[1] for point in ends]
-    width = max(xs) - min(xs)
-    height = max(ys) - min(ys)
-    if width <= 0.0 or abs(width - height) > tolerance * max(width, height):
+    if max(abs(d - radius) for d in distances) > tolerance * radius:
         return None
-    center = ((max(xs) + min(xs)) / 2.0, (max(ys) + min(ys)) / 2.0)
-    return Circle(center, (width + height) / 2.0)
+    return Circle(center, 2.0 * radius)
 
 
 def circles(svg: Path, tolerance: float = 0.02) -> list[Circle]:
