@@ -30,10 +30,13 @@ class Source:
 
 @dataclass(frozen=True)
 class MountingHole:
-    """PCBを貫通する取付穴。centerは基板座標系のx, y。"""
+    """PCBを貫通する取付穴。centerは基板座標系のx, y。
+
+    資料が位置だけを寸法化し、径を与えない場合はdiameter_mmをNoneとする。
+    """
 
     center: Vec2
-    diameter_mm: float
+    diameter_mm: float | None
 
 
 @dataclass(frozen=True)
@@ -64,9 +67,9 @@ class Board:
                 and self.overall_height_mm < self.pcb_thickness_mm):
             raise ValueError(f"{self.id}: 全高がPCB板厚を下回っている")
         for index, item in enumerate(self.mounting_holes):
-            if item.diameter_mm <= 0.0:
+            if item.diameter_mm is not None and item.diameter_mm <= 0.0:
                 raise ValueError(f"{self.id}: 取付穴{index}の直径が正でない")
-            radius = item.diameter_mm / 2.0
+            radius = 0.0 if item.diameter_mm is None else item.diameter_mm / 2.0
             x, y = item.center
             if not (radius <= x <= self.length_mm - radius
                     and radius <= y <= self.width_mm - radius):
@@ -157,6 +160,15 @@ def _centered_holes(
     )
 
 
+def _grid_holes(
+    xs: tuple[float, float],
+    ys: tuple[float, float],
+    diameter_mm: float | None,
+) -> tuple[MountingHole, ...]:
+    """x座標2つとy座標2つの組み合わせで決まる4穴を返す。"""
+    return tuple(MountingHole((x, y), diameter_mm) for x in xs for y in ys)
+
+
 _PICO_2 = Board(
     id="raspberry_pi_pico_2",
     name="Raspberry Pi Pico 2",
@@ -225,8 +237,209 @@ _UNO_R4_MINIMA = Board(
     ),
 )
 
+_PICO = Board(
+    id="raspberry_pi_pico",
+    name="Raspberry Pi Pico",
+    length_mm=51.0,
+    width_mm=21.0,
+    # 図が与えるのは短辺方向の穴間11.4、長辺の端から穴中心までの2、直径2.1。
+    # 長辺方向の穴間47は外形の中心に対する対称から定まり、PDFのベクタ座標で
+    # 47.0 (短辺方向11.4を基準) を確認した。
+    mounting_holes=_centered_holes(
+        51.0, 21.0, length_pitch_mm=47.0, width_pitch_mm=11.4, diameter_mm=2.1
+    ),
+    # 本文の「51×21 mm 1 mm thick PCB」による。
+    pcb_thickness_mm=1.0,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi Pico Datasheet",
+        url="https://datasheets.raspberrypi.com/pico/pico-datasheet.pdf",
+        revision="Release 21 (build date 03/07/2026)",
+        section="2. Mechanical specification / Figure 3",
+    ),
+)
+
+_PICO_W = Board(
+    id="raspberry_pi_pico_w",
+    name="Raspberry Pi Pico W",
+    length_mm=51.0,
+    width_mm=21.0,
+    # Picoと同じ寸法線 (穴間11.4、端から2、直径2.1)。ベクタ座標で長辺方向の
+    # 穴間47.03、短辺方向11.40を確認した。
+    mounting_holes=_centered_holes(
+        51.0, 21.0, length_pitch_mm=47.0, width_pitch_mm=11.4, diameter_mm=2.1
+    ),
+    pcb_thickness_mm=1.0,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi Pico W Datasheet",
+        url="https://datasheets.raspberrypi.com/picow/pico-w-datasheet.pdf",
+        revision="Release 7 (build date 03/07/2026)",
+        section="2. Mechanical specification / Figure 3",
+    ),
+)
+
+_PICO_2_W = Board(
+    id="raspberry_pi_pico_2_w",
+    name="Raspberry Pi Pico 2 W",
+    length_mm=51.0,
+    width_mm=21.0,
+    # 図はPico Wと同一で、ベクタ座標も一致する。
+    mounting_holes=_centered_holes(
+        51.0, 21.0, length_pitch_mm=47.0, width_pitch_mm=11.4, diameter_mm=2.1
+    ),
+    pcb_thickness_mm=1.0,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi Pico 2 W Datasheet",
+        url="https://datasheets.raspberrypi.com/picow/pico-2-w-datasheet.pdf",
+        revision="Release 2 (build date 03/07/2026)",
+        section="2. Mechanical specification / Figure 3",
+    ),
+)
+
+_PI_4B = Board(
+    id="raspberry_pi_4_model_b",
+    name="Raspberry Pi 4 Model B",
+    length_mm=85.0,
+    width_mm=56.0,
+    # Pi 5と同じ配置。左端から3.5と3.5+58、下端から3.5と3.5+49。
+    mounting_holes=_grid_holes((3.5, 61.5), (3.5, 52.5), 2.7),
+    # 図は部品ごとにZ=の値を記すが、基準面を示さないため全高として採らない。
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi 4 Model B mechanical drawing",
+        url="https://datasheets.raspberrypi.com/rpi4/raspberry-pi-4-mechanical-drawing.pdf",
+        revision="RP-008343-DS-1 (2026-09-28取得)",
+        section="平面図",
+    ),
+)
+
+_PI_3BP = Board(
+    id="raspberry_pi_3_model_b_plus",
+    name="Raspberry Pi 3 Model B+",
+    length_mm=85.0,
+    width_mm=56.0,
+    # 配置はPi 4と同じで、穴径だけが2.75と記される。
+    mounting_holes=_grid_holes((3.5, 61.5), (3.5, 52.5), 2.75),
+    # Z-Heightの基準面が示されないため全高として採らない。
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi 3 Model B+ mechanical drawing",
+        url="https://datasheets.raspberrypi.com/rpi3/raspberry-pi-3-b-plus-mechanical-drawing.pdf",
+        revision="RP-008337-DS-2 (2026-09-28取得)",
+        section="平面図",
+    ),
+)
+
+_ZERO_2_W = Board(
+    id="raspberry_pi_zero_2_w",
+    name="Raspberry Pi Zero 2 W",
+    length_mm=65.0,
+    width_mm=30.0,
+    # 左右とも端から3.5、下端から3.5と3.5+23。図は穴径を寸法化していない。
+    mounting_holes=_grid_holes((3.5, 61.5), (3.5, 26.5), None),
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Raspberry Pi Zero 2 W mechanical drawing",
+        url="https://datasheets.raspberrypi.com/rpizero2/raspberry-pi-zero-2-w-mechanical-drawing.pdf",
+        revision="RP-008358-DS-1 (2026-09-28取得)",
+        section="平面図",
+    ),
+)
+
+_UNO_R4_WIFI = Board(
+    id="arduino_uno_r4_wifi",
+    name="Arduino UNO R4 WiFi",
+    length_mm=68.58,
+    width_mm=53.34,
+    # 資料の図はUNO R4 Minimaの図と同一の画像であり、値もMinimaと同じになる。
+    mounting_holes=_UNO_R4_MINIMA.mounting_holes,
+    pcb_thickness_mm=1.0,
+    overall_height_mm=8.5,
+    source=Source(
+        title="Arduino UNO R4 WiFi Datasheet (SKU: ABX00087)",
+        url="https://docs.arduino.cc/resources/datasheets/ABX00087-datasheet.pdf",
+        revision="Modified 22/09/2026",
+        section="13 Mounting Holes And Board Outline",
+    ),
+)
+
+_NANO_EVERY = Board(
+    id="arduino_nano_every",
+    name="Arduino Nano Every",
+    length_mm=43.18,
+    width_mm=17.78,
+    # 右上の穴が右端と上端から1.27。穴間は長辺方向40.64、短辺方向15.24。
+    mounting_holes=_grid_holes((1.27, 41.91), (1.27, 16.51), 1.65),
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Arduino Nano Every Datasheet (SKU: ABX00028)",
+        url="https://docs.arduino.cc/resources/datasheets/ABX00028-datasheet.pdf",
+        revision="Modified 22/09/2026",
+        section="7.1 Board Outline and Mounting Holes",
+    ),
+)
+
+_NANO_33_IOT = Board(
+    id="arduino_nano_33_iot",
+    name="Arduino Nano 33 IoT",
+    length_mm=43.16,
+    width_mm=17.77,
+    # 右上の穴が右端と上端から1.26。穴間は長辺方向40.64、短辺方向15.24。
+    # 穴径はR0.83による。同じ資料の6.2節の図は4x Ø1.65と記し、一致しない。
+    mounting_holes=_grid_holes((1.26, 41.9), (1.27, 16.51), 1.66),
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Arduino Nano 33 IoT Datasheet (SKU: ABX00027)",
+        url="https://docs.arduino.cc/resources/datasheets/ABX00027-datasheet.pdf",
+        revision="Modified 22/09/2026",
+        section="6.1 Board Outline and Mounting Holes",
+    ),
+)
+
+_MKR_WAN_1310 = Board(
+    id="arduino_mkr_wan_1310",
+    name="Arduino MKR WAN 1310",
+    length_mm=67.7,
+    width_mm=25.0,
+    # 左上の穴が左端と上端から2.25。穴間は長辺方向57.00、短辺方向20.50。
+    # 図は穴径を寸法化していない。
+    mounting_holes=_grid_holes((2.25, 59.25), (2.25, 22.75), None),
+    pcb_thickness_mm=None,
+    overall_height_mm=None,
+    source=Source(
+        title="Arduino MKR WAN 1310 Datasheet (SKU: ABX00029)",
+        url="https://docs.arduino.cc/resources/datasheets/ABX00029-datasheet.pdf",
+        revision="Modified 22/09/2026",
+        section="4.1 Board Outline / 4.2 Mounting Holes",
+    ),
+)
+
 BOARDS: Mapping[str, Board] = MappingProxyType(
-    {entry.id: entry for entry in (_PICO_2, _PI_5, _UNO_R4_MINIMA)}
+    {
+        entry.id: entry
+        for entry in (
+            _PICO,
+            _PICO_W,
+            _PICO_2,
+            _PICO_2_W,
+            _ZERO_2_W,
+            _PI_3BP,
+            _PI_4B,
+            _PI_5,
+            _UNO_R4_MINIMA,
+            _UNO_R4_WIFI,
+            _NANO_EVERY,
+            _NANO_33_IOT,
+            _MKR_WAN_1310,
+        )
+    }
 )
 
 
