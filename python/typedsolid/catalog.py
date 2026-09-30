@@ -39,6 +39,10 @@ class MountingHole:
     diameter_mm: float | None
 
 
+# 基板の辺の外向き法線として取り得る値。
+_PLANAR_EDGES = ("minus_x", "plus_x", "minus_y", "plus_y")
+
+
 @dataclass(frozen=True)
 class BoardConnector:
     """基板の辺にあるコネクタの位置。
@@ -95,7 +99,7 @@ class Board:
             if item.id in seen:
                 raise ValueError(f"{self.id}: コネクタid {item.id} が重複している")
             seen.add(item.id)
-            if item.edge.endswith("_z"):
+            if item.edge not in _PLANAR_EDGES:
                 raise ValueError(f"{self.id}: コネクタ {item.id} のedgeはx又はy方向である必要がある")
             along = self.length_mm if item.edge.endswith("_y") else self.width_mm
             if not 0.0 <= item.offset_mm <= along:

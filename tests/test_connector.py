@@ -119,6 +119,8 @@ class CatalogTests(unittest.TestCase):
         for connectors in [
             (BoardConnector("a", "minus_y", 11.0),),
             (BoardConnector("a", "plus_z", 1.0),),
+            (BoardConnector("a", "foo_y", 1.0),),
+            (BoardConnector("a", "x", 1.0),),
             (BoardConnector("a", "minus_x", 1.0), BoardConnector("a", "plus_x", 2.0)),
         ]:
             with self.subTest(connectors=connectors), self.assertRaises(ValueError):
