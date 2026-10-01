@@ -681,11 +681,11 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
 pub fn evaluate_stl(bytes: &[u8], target: &str, policy: &Policy) -> Result<Vec<Check>, String> {
     policy.validate()?;
     let parsed = mesh::parse_stl(bytes)?;
-    // z方向の偶奇判定だけでは、z方向から見て面積0の面に開いた穴を検出できない。
-    let boundary = mesh::boundary_edges(&parsed);
-    if boundary > 0 {
+    // +z方向のwinding numberは、z方向から見て面積0の面の穴や裏返りを検出できない。
+    let unpaired = mesh::unpaired_edges(&parsed);
+    if unpaired > 0 {
         return Err(format!(
-            "mesh is not closed: {boundary} edge(s) are shared by an odd number of triangles"
+            "mesh is not closed or not consistently oriented: {unpaired} edge(s) are not paired with an opposite-direction edge"
         ));
     }
     let triangles: Vec<[[f64; 3]; 3]> = parsed.iter().map(mesh::Triangle::vertices).collect();
@@ -1170,12 +1170,24 @@ mod tests {
         let mut side = box_triangles([0.; 3], [10.; 3], false);
         side.pop();
         let error = evaluate_stl(&binary_stl(&side, b""), "a", &rules).unwrap_err();
-        assert!(error.contains("odd number of triangles"), "{error}");
+        assert!(error.contains("not paired"), "{error}");
         // 上面の穴はwinding numberでも検出する。
         let mut top = box_triangles([0.; 3], [10.; 3], false);
         top.remove(2);
         let error = Grid::from_triangles(&top, 1.0).err().unwrap();
         assert!(error.contains("winding number"), "{error}");
+    }
+
+    #[test]
+    fn a_reversed_triangle_on_a_vertical_face_is_rejected() {
+        // +x面の三角形を1枚だけ裏返す。z方向から見て面積0のため、交点の数にも
+        // 向きを問わない辺の偶奇にも現れない。
+        let mut flipped = box_triangles([0.; 3], [10.; 3], false);
+        let last = flipped.len() - 1;
+        flipped[last].swap(1, 2);
+        let error =
+            evaluate_stl(&binary_stl(&flipped, b""), "a", &policy(1.2, 1.2, 1.0)).unwrap_err();
+        assert!(error.contains("not consistently oriented"), "{error}");
     }
 
     #[test]

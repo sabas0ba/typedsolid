@@ -44,7 +44,7 @@ sha256sum .work/external/parts_holder.stl       # 上表の値と照合する
 | Framework Expansion Card筐体 | fail (7領域、最大132.2 mm³) | pass | pass | fail (2.816 mm³、bridge 0.576 mm³) |
 
 - **Tang Nano 9K 部品holder**: 体積126,124 mm³ (格子上)。4 ruleとも通る。
-- **MiSTeryNano筐体**: 奇数個の三角形に共有される辺が8本あり、閉じていないmeshとして評価を拒否した。T字接続か実際の隙間かは区別していない。
+- **MiSTeryNano筐体**: 向き付きで対にならない辺が8本あり、閉じていないか向きが不整合なmeshとして評価を拒否した。T字接続か実際の隙間かは区別していない。
 - **MiSTeryNano蓋**: 0.128 mm³ (0.2 mm格子で16 cell) の未支持を検出した。0.1 mm格子では0.076 mm³となる。局所的な小さい張り出しである。`support_free`はslicer条件を含まない保守的な近似であり、実際の印刷で支持が要るかは別途slicerで確かめる。
 - **Framework Expansion Card筐体**: 1.2 mm未満の領域が7つある。`min_wall_mm`を1.0とすると9領域 (最大34.4 mm³)、0.8としても12領域 (最大19.6 mm³) が残る。値を下げると縁とみなす領域の下限 (`min_wall_mm`³) も下がるため、領域数は減るとは限らない。標準policyの1.2 mmより薄い造作を持つ設計である。
 

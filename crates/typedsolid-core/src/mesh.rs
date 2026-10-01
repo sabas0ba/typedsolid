@@ -146,23 +146,27 @@ fn parse_ascii_stl(bytes: &[u8]) -> Result<Vec<Triangle>, String> {
         .collect())
 }
 
-/// 奇数個の三角形に共有される辺の数。0でなければmeshは閉じていない。
-/// 向きは問わない。空洞の内面や複数のshellを含むmeshも閉じていれば0になる。
-/// 2頂点が一致する退化三角形の長さ0の辺は、面を区切らないため数えない。
-pub fn boundary_edges(triangles: &[Triangle]) -> usize {
-    let mut edges: HashMap<(VertexKey, VertexKey), usize> = HashMap::new();
+/// 向き付きで対にならない辺の数。0でなければ、meshは閉じていないか向きが不整合である。
+///
+/// 閉じて向きの揃ったmeshでは、各辺をa→bの向きに使う三角形とb→aの向きに使う
+/// 三角形が同数ある。向きを問わない出現回数の偶奇だけでは、z軸に平行な面の三角形が
+/// 1枚だけ裏返っている場合を検出できない。空洞の内面や複数のshellを含むmeshも、
+/// 閉じて向きが揃っていれば0になる。2頂点が一致する退化三角形の長さ0の辺は、面を
+/// 区切らないため数えない。
+pub fn unpaired_edges(triangles: &[Triangle]) -> usize {
+    // 頂点を昇順に並べた辺ごとに、昇順の向きの出現を+1、逆向きを-1として数える。
+    let mut balance: HashMap<(VertexKey, VertexKey), i64> = HashMap::new();
     for triangle in triangles {
         for corner in 0..3 {
             let (a, b) = (triangle.keys[corner], triangle.keys[(corner + 1) % 3]);
             if a == b {
                 continue;
             }
-            *edges
-                .entry(if a < b { (a, b) } else { (b, a) })
-                .or_default() += 1;
+            let (key, step) = if a < b { ((a, b), 1) } else { ((b, a), -1) };
+            *balance.entry(key).or_default() += step;
         }
     }
-    edges.values().filter(|count| *count % 2 == 1).count()
+    balance.values().filter(|count| **count != 0).count()
 }
 
 fn find(parent: &mut [usize], mut node: usize) -> usize {
