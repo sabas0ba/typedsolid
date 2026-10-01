@@ -3,7 +3,11 @@
 //! backendのface/edge topologyに依存せず、boxとcylinderの内外判定だけで最終形状を
 //! 得る。厚さ・接続部・空洞はいずれも同じoccupancyから導く。
 
-use crate::{Check, Direction, Model, Operation, Part, Policy, Rule, Status, mesh};
+use crate::{
+    Axis, Check, Direction, Location, MAX_LOCATIONS, Model, Operation, Part, Policy, Rule, Status,
+    mesh,
+};
+use serde::{Deserialize, Serialize};
 
 /// 1 partあたりのcell数の上限。超える入力はvalidateで拒否する。
 pub const MAX_GRID_CELLS: u64 = 200_000_000;
@@ -349,46 +353,8 @@ impl Grid {
         runs
     }
 
-    /// 6-連結の連結成分ごとのcell数。対角のみで接する部分は分かれていると扱う。
-    fn component_sizes(&self, mask: &[bool]) -> Vec<usize> {
-        let mut seen = vec![false; mask.len()];
-        let mut stack = Vec::new();
-        let mut sizes = Vec::new();
-        let [nx, ny, nz] = self.size;
-        for start in 0..mask.len() {
-            if !mask[start] || seen[start] {
-                continue;
-            }
-            let mut size = 0usize;
-            seen[start] = true;
-            stack.push(start);
-            while let Some(index) = stack.pop() {
-                size += 1;
-                let x = index % nx;
-                let y = (index / nx) % ny;
-                let z = index / (nx * ny);
-                for (dx, dy, dz) in NEIGHBOURS {
-                    let (Some(nx_), Some(ny_), Some(nz_)) = (
-                        checked_step(x, dx, nx),
-                        checked_step(y, dy, ny),
-                        checked_step(z, dz, nz),
-                    ) else {
-                        continue;
-                    };
-                    let neighbour = self.index(nx_, ny_, nz_);
-                    if mask[neighbour] && !seen[neighbour] {
-                        seen[neighbour] = true;
-                        stack.push(neighbour);
-                    }
-                }
-            }
-            sizes.push(size);
-        }
-        sizes
-    }
-
-    /// 外周から到達できない空cellの数。padding により外周は必ず空である。
-    fn enclosed_void_cells(&self) -> usize {
+    /// 外周から到達できない空cell。padding により外周は必ず空である。
+    fn enclosed_void_mask(&self) -> Vec<bool> {
         let mut reached = vec![false; self.occupied.len()];
         let mut stack = Vec::new();
         let [nx, ny, nz] = self.size;
@@ -427,8 +393,8 @@ impl Grid {
         self.occupied
             .iter()
             .zip(reached.iter())
-            .filter(|(solid, seen)| !**solid && !**seen)
-            .count()
+            .map(|(solid, seen)| !*solid && !*seen)
+            .collect()
     }
 }
 
@@ -656,6 +622,7 @@ fn transform(f: &[f64], d: &mut [f64], vertices: &mut [usize], breaks: &mut [f64
 
 fn check(rule: Rule, target: &str, passed: bool, message: String) -> Check {
     Check {
+        locations: Vec::new(),
         rule,
         status: if passed { Status::Pass } else { Status::Fail },
         target: target.into(),
@@ -679,6 +646,12 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
 /// 外部のSTL (binary又はASCII) を読み、IRを介さずに最終形状のruleを評価する。
 /// 座標の単位はmmとみなす。meshは閉じている必要があり、閉じていなければ拒否する。
 pub fn evaluate_stl(bytes: &[u8], target: &str, policy: &Policy) -> Result<Vec<Check>, String> {
+    let grid = stl_grid(bytes, policy)?;
+    Ok(evaluate_grid(&grid, target, policy))
+}
+
+/// STLを読み、閉じていることを確かめてから格子にする。
+fn stl_grid(bytes: &[u8], policy: &Policy) -> Result<Grid, String> {
     policy.validate()?;
     let parsed = mesh::parse_stl(bytes)?;
     // +z方向のwinding numberは、z方向から見て面積0の面の穴や裏返りを検出できない。
@@ -689,33 +662,156 @@ pub fn evaluate_stl(bytes: &[u8], target: &str, policy: &Policy) -> Result<Vec<C
         ));
     }
     let triangles: Vec<[[f64; 3]; 3]> = parsed.iter().map(mesh::Triangle::vertices).collect();
-    let grid = Grid::from_triangles(&triangles, policy.voxel_mm)?;
-    Ok(evaluate_grid(&grid, target, policy))
+    Grid::from_triangles(&triangles, policy.voxel_mm)
 }
 
-/// 1つの占有格子に対する最終形状のrule。
-fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
-    let pitch = grid.pitch;
-    let mut checks = Vec::new();
-    {
-        let solid_cells = grid.occupied_cells();
-        if solid_cells == 0 {
-            // 空形状はvalid_solidが扱う。ここでは判定材料が無いことを明示する。
-            for rule in Rule::VOXEL {
-                checks.push(check(
-                    rule,
-                    target,
-                    false,
-                    "rasterized geometry is empty".into(),
-                ));
-            }
-            return checks;
-        }
+/// 断面を描く平面。`axis`に垂直で、座標`coordinate`を通る。単位はmm。
+/// `coordinate`を省くと格子の中央を通る。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Plane {
+    pub axis: Axis,
+    #[serde(default)]
+    pub coordinate: Option<f64>,
+}
 
+/// 断面1枚のcell。
+///
+/// `rows[j][i]`は、平面内の2軸 (`Axis::plane`の順) でi番目とj番目のcellを表す。
+/// 各文字はbitの和を32進 ("0"〜"9"、"a"〜"v") で書いたもので、bitは1が材料、
+/// 2が薄肉、4が接続部、8が未支持、16が閉空洞である。`origin`はcell (0, 0) の中心、
+/// `plane_coordinate`は実際に切ったcell中心の座標である。
+#[derive(Debug, Clone, Serialize)]
+pub struct Section {
+    pub axis: Axis,
+    pub plane_coordinate: f64,
+    pub origin: [f64; 2],
+    pub pitch: f64,
+    pub rows: Vec<String>,
+}
+
+pub const SECTION_SOLID: u8 = 1;
+pub const SECTION_THIN: u8 = 2;
+pub const SECTION_NECK: u8 = 4;
+pub const SECTION_UNSUPPORTED: u8 = 8;
+pub const SECTION_VOID: u8 = 16;
+/// 1回の呼び出しで求める断面の上限。
+const MAX_SECTIONS: usize = 256;
+
+impl Grid {
+    /// 解析結果を断面ごとに切り出す。平面の座標は最も近いcell中心へ丸める。
+    pub fn sections(&self, analysis: &Analysis, planes: &[Plane]) -> Result<Vec<Section>, String> {
+        if planes.len() > MAX_SECTIONS {
+            return Err(format!("at most {MAX_SECTIONS} sections are supported"));
+        }
+        const DIGITS: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+        planes
+            .iter()
+            .map(|plane| {
+                let normal = plane.axis.index();
+                let [first, second] = plane.axis.plane();
+                let layer = match plane.coordinate {
+                    None => self.size[normal] / 2,
+                    Some(value) if value.is_finite() => {
+                        let limit = self.size[normal] as f64 - 1.0;
+                        ((value - self.origin[normal]) / self.pitch)
+                            .round()
+                            .clamp(0.0, limit) as usize
+                    }
+                    Some(_) => return Err("section coordinate must be finite".into()),
+                };
+                let rows = (0..self.size[second])
+                    .map(|j| {
+                        let bytes: Vec<u8> = (0..self.size[first])
+                            .map(|i| {
+                                let mut cell = [0usize; 3];
+                                cell[normal] = layer;
+                                cell[first] = i;
+                                cell[second] = j;
+                                let index = self.index(cell[0], cell[1], cell[2]);
+                                let bits = [
+                                    (self.occupied[index], SECTION_SOLID),
+                                    (analysis.thin[index], SECTION_THIN),
+                                    (analysis.neck[index], SECTION_NECK),
+                                    (analysis.unsupported[index], SECTION_UNSUPPORTED),
+                                    (analysis.void[index], SECTION_VOID),
+                                ]
+                                .into_iter()
+                                .filter(|(set, _)| *set)
+                                .fold(0u8, |acc, (_, bit)| acc | bit);
+                                DIGITS[bits as usize]
+                            })
+                            .collect();
+                        String::from_utf8(bytes).expect("digits are ASCII")
+                    })
+                    .collect();
+                Ok(Section {
+                    axis: plane.axis,
+                    plane_coordinate: self.centre(normal, layer),
+                    origin: [self.origin[first], self.origin[second]],
+                    pitch: self.pitch,
+                    rows,
+                })
+            })
+            .collect()
+    }
+}
+
+/// IRの1部品を格子にし、指定した平面の断面を返す。
+pub fn sections_of_part(
+    model: &Model,
+    part_id: &str,
+    planes: &[Plane],
+) -> Result<Vec<Section>, String> {
+    model.validate()?;
+    let part = model
+        .parts
+        .iter()
+        .find(|p| p.id == part_id)
+        .ok_or_else(|| format!("unknown part {part_id}"))?;
+    let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
+    grid.sections(&grid.analyse(&model.policy), planes)
+}
+
+/// 外部のSTLを格子にし、指定した平面の断面を返す。
+pub fn sections_of_stl(
+    bytes: &[u8],
+    policy: &Policy,
+    planes: &[Plane],
+) -> Result<Vec<Section>, String> {
+    let grid = stl_grid(bytes, policy)?;
+    grid.sections(&grid.analyse(policy), planes)
+}
+
+/// 最終形状のruleが検出したcellのmaskと、messageに書く集計値。
+///
+/// 判定と図示が同じmaskを使い、図に描いた箇所と判定の根拠を一致させる。
+pub struct Analysis {
+    /// 一辺`min_wall_mm`の立方体以上の大きさを持つ薄肉領域。
+    pub thin: Vec<bool>,
+    /// erosionで分かれた成分どうしを繋ぐ細い接続部。
+    pub neck: Vec<bool>,
+    /// 外部に通じない空cell。
+    pub void: Vec<bool>,
+    /// bridgeでも支持されないcell。
+    pub unsupported: Vec<bool>,
+    thin_regions: usize,
+    largest_thin: usize,
+    core_cells: usize,
+    core_components: usize,
+    enclosed: usize,
+    unsupported_cells: usize,
+    spanned_cells: usize,
+}
+
+impl Grid {
+    /// 4つの最終形状ruleの判定材料を求める。
+    pub fn analyse(&self, policy: &Policy) -> Analysis {
+        let pitch = self.pitch;
         // 量子化の誤差を失敗側へ倒すため、要求値にgrid間隔を足した長さを求める。
         let required_run = ((policy.min_wall_mm + pitch) / pitch).ceil() as usize;
-        let runs = grid.axial_runs();
-        let thin: Vec<bool> = grid
+        let runs = self.axial_runs();
+        let thin_cells: Vec<bool> = self
             .occupied
             .iter()
             .zip(runs.iter())
@@ -724,88 +820,267 @@ fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
         // 面の縁や稜線は必ず薄くなる。一辺min_wall_mmの立方体に満たない領域は
         // 形状の縁であり、壁の薄さを示さないため数えない。
         let minimum_cells = (policy.min_wall_mm.powi(3) / pitch.powi(3)).ceil() as usize;
-        let regions: Vec<usize> = grid
-            .component_sizes(&thin)
-            .into_iter()
+        let (labels, sizes) = self.labels(&thin_cells);
+        let thin: Vec<bool> = labels
+            .iter()
+            .map(|label| *label > 0 && sizes[*label as usize - 1] >= minimum_cells)
+            .collect();
+        let kept: Vec<usize> = sizes
+            .iter()
+            .copied()
             .filter(|size| *size >= minimum_cells)
             .collect();
-        let largest = regions.iter().copied().max().unwrap_or(0);
-        checks.push(check(
+
+        let neck_radius = (policy.min_neck_mm + pitch) / 2.0 / pitch;
+        let core = self.eroded(neck_radius);
+        let core_cells = core.iter().filter(|cell| **cell).count();
+        let (core_labels, core_sizes) = self.labels(&core);
+        let neck = if core_cells == 0 {
+            // 断面を保つ材料が残らない。部品全体を接続部不足として示す。
+            self.occupied.clone()
+        } else if core_sizes.len() > 1 {
+            let meeting = self.meeting_cells(&core_labels);
+            if meeting.iter().any(|cell| *cell) {
+                meeting
+            } else {
+                // 材料で繋がっていない成分どうしは前線が出会わない。最大の成分以外を
+                // 切り離された部分として示す。
+                let largest = (0..core_sizes.len())
+                    .max_by_key(|slot| core_sizes[*slot])
+                    .map_or(0, |slot| slot as u32 + 1);
+                core_labels
+                    .iter()
+                    .map(|label| *label > 0 && *label != largest)
+                    .collect()
+            }
+        } else {
+            vec![false; self.occupied.len()]
+        };
+
+        let void = self.enclosed_void_mask();
+        let enclosed = void.iter().filter(|cell| **cell).count();
+
+        let support = self.support(
+            policy.build_direction,
+            policy.overhang_angle_deg,
+            policy.bridge_max_mm,
+        );
+        let unsupported: Vec<bool> = self
+            .occupied
+            .iter()
+            .zip(support.supported.iter())
+            .zip(support.bridged.iter())
+            .map(|((solid, held), spanned)| *solid && !*held && !*spanned)
+            .collect();
+        let unsupported_cells = unsupported.iter().filter(|cell| **cell).count();
+        let spanned_cells = support.bridged.iter().filter(|cell| **cell).count();
+        Analysis {
+            thin,
+            neck,
+            void,
+            unsupported,
+            thin_regions: kept.len(),
+            largest_thin: kept.iter().copied().max().unwrap_or(0),
+            core_cells,
+            core_components: core_sizes.len(),
+            enclosed,
+            unsupported_cells,
+            spanned_cells,
+        }
+    }
+
+    /// 6-連結の連結成分のlabel (0は対象外、kは1始まり) と、各成分のcell数。
+    fn labels(&self, mask: &[bool]) -> (Vec<u32>, Vec<usize>) {
+        let mut labels = vec![0u32; mask.len()];
+        let mut stack = Vec::new();
+        let mut sizes = Vec::new();
+        let [nx, ny, nz] = self.size;
+        for start in 0..mask.len() {
+            if !mask[start] || labels[start] != 0 {
+                continue;
+            }
+            let label = sizes.len() as u32 + 1;
+            let mut size = 0usize;
+            labels[start] = label;
+            stack.push(start);
+            while let Some(index) = stack.pop() {
+                size += 1;
+                let x = index % nx;
+                let y = (index / nx) % ny;
+                let z = index / (nx * ny);
+                for (dx, dy, dz) in NEIGHBOURS {
+                    let (Some(nx_), Some(ny_), Some(nz_)) = (
+                        checked_step(x, dx, nx),
+                        checked_step(y, dy, ny),
+                        checked_step(z, dz, nz),
+                    ) else {
+                        continue;
+                    };
+                    let neighbour = self.index(nx_, ny_, nz_);
+                    if mask[neighbour] && labels[neighbour] == 0 {
+                        labels[neighbour] = label;
+                        stack.push(neighbour);
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+        (labels, sizes)
+    }
+
+    /// erosionで残った成分から材料の内部を幅優先で同時に広げ、異なる成分から来た
+    /// 前線が接するcellを返す。前線は細い接続部で出会うため、この集合が接続部となる。
+    fn meeting_cells(&self, core_labels: &[u32]) -> Vec<bool> {
+        let mut owner = core_labels.to_vec();
+        let mut queue: std::collections::VecDeque<usize> = owner
+            .iter()
+            .enumerate()
+            .filter(|(_, label)| **label > 0)
+            .map(|(index, _)| index)
+            .collect();
+        let [nx, ny, nz] = self.size;
+        let neighbours = |index: usize| {
+            let x = index % nx;
+            let y = (index / nx) % ny;
+            let z = index / (nx * ny);
+            NEIGHBOURS.into_iter().filter_map(move |(dx, dy, dz)| {
+                Some(
+                    (checked_step(z, dz, nz)? * ny + checked_step(y, dy, ny)?) * nx
+                        + checked_step(x, dx, nx)?,
+                )
+            })
+        };
+        while let Some(index) = queue.pop_front() {
+            for neighbour in neighbours(index) {
+                if self.occupied[neighbour] && owner[neighbour] == 0 {
+                    owner[neighbour] = owner[index];
+                    queue.push_back(neighbour);
+                }
+            }
+        }
+        (0..owner.len())
+            .map(|index| {
+                owner[index] > 0
+                    && neighbours(index).any(|n| owner[n] > 0 && owner[n] != owner[index])
+            })
+            .collect()
+    }
+
+    /// maskの連結成分ごとの外接box。大きい成分から`MAX_LOCATIONS`件までと、成分の総数。
+    /// `margin_mm`だけ各方向へ広げる。cellは中心から半pitchの範囲を占める。
+    pub fn locations(&self, mask: &[bool], margin_mm: f64) -> (Vec<Location>, usize) {
+        let (labels, sizes) = self.labels(mask);
+        let mut low = vec![[usize::MAX; 3]; sizes.len()];
+        let mut high = vec![[0usize; 3]; sizes.len()];
+        let [nx, ny, _] = self.size;
+        for (index, label) in labels.iter().enumerate() {
+            if *label == 0 {
+                continue;
+            }
+            let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
+            let slot = *label as usize - 1;
+            for axis in 0..3 {
+                low[slot][axis] = low[slot][axis].min(cell[axis]);
+                high[slot][axis] = high[slot][axis].max(cell[axis]);
+            }
+        }
+        let mut order: Vec<usize> = (0..sizes.len()).collect();
+        order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]).then(a.cmp(b)));
+        let half = self.pitch / 2.0 + margin_mm;
+        let boxes = order
+            .into_iter()
+            .take(MAX_LOCATIONS)
+            .map(|slot| Location {
+                min: std::array::from_fn(|axis| self.centre(axis, low[slot][axis]) - half),
+                max: std::array::from_fn(|axis| self.centre(axis, high[slot][axis]) + half),
+            })
+            .collect();
+        (boxes, sizes.len())
+    }
+}
+
+/// 1つの占有格子に対する最終形状のrule。
+fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
+    let pitch = grid.pitch;
+    let solid_cells = grid.occupied_cells();
+    if solid_cells == 0 {
+        // 空形状はvalid_solidが扱う。ここでは判定材料が無いことを明示する。
+        return Rule::VOXEL
+            .into_iter()
+            .map(|rule| check(rule, target, false, "rasterized geometry is empty".into()))
+            .collect();
+    }
+    let analysis = grid.analyse(policy);
+    let cell_mm3 = pitch.powi(3);
+    let located = |rule: Rule, passed: bool, message: String, mask: &[bool], margin: f64| {
+        let mut result = check(rule, target, passed, message);
+        if !passed {
+            let (locations, total) = grid.locations(mask, margin);
+            result.message.push_str(&format!("; {total} location(s)"));
+            result.locations = locations;
+        }
+        result
+    };
+    vec![
+        located(
             Rule::FinalWallThickness,
-            target,
-            regions.is_empty(),
+            analysis.thin_regions == 0,
             format!(
                 "{} region(s) thinner than {} mm; largest {:.3} mm³ of {:.3} mm³; grid {} mm; regions below {} mm³ are treated as edges",
-                regions.len(),
+                analysis.thin_regions,
                 policy.min_wall_mm,
-                largest as f64 * pitch.powi(3),
-                solid_cells as f64 * pitch.powi(3),
+                analysis.largest_thin as f64 * cell_mm3,
+                solid_cells as f64 * cell_mm3,
                 pitch,
                 policy.min_wall_mm.powi(3)
             ),
-        ));
-
-        let neck_radius = (policy.min_neck_mm + pitch) / 2.0 / pitch;
-        let core = grid.eroded(neck_radius);
-        let core_cells = core.iter().filter(|cell| **cell).count();
-        let components = grid.component_sizes(&core).len();
-        checks.push(check(
+            &analysis.thin,
+            0.0,
+        ),
+        located(
             Rule::NeckSection,
-            target,
-            components == 1,
-            if core_cells == 0 {
+            analysis.core_components == 1,
+            if analysis.core_cells == 0 {
                 format!(
                     "no material survives a {} mm section; grid {} mm",
                     policy.min_neck_mm, pitch
                 )
             } else {
                 format!(
-                    "{components} component(s) remain after eroding to a {} mm section; grid {} mm",
-                    policy.min_neck_mm, pitch
+                    "{} component(s) remain after eroding to a {} mm section; grid {} mm",
+                    analysis.core_components, policy.min_neck_mm, pitch
                 )
             },
-        ));
-
-        let enclosed = grid.enclosed_void_cells();
-        checks.push(check(
+            &analysis.neck,
+            // 前線が出会う面は薄いため、断面の幅だけ広げて接続部を囲む。
+            policy.min_neck_mm / 2.0,
+        ),
+        located(
             Rule::ClosedCavity,
-            target,
-            enclosed == 0,
+            analysis.enclosed == 0,
             format!(
-                "{enclosed} enclosed void cell(s); grid {} mm; cavities reachable only through gaps below the grid size are not distinguished",
-                pitch
+                "{} enclosed void cell(s); grid {} mm; cavities reachable only through gaps below the grid size are not distinguished",
+                analysis.enclosed, pitch
             ),
-        ));
-
-        let support = grid.support(
-            policy.build_direction,
-            policy.overhang_angle_deg,
-            policy.bridge_max_mm,
-        );
-        let unsupported = grid
-            .occupied
-            .iter()
-            .zip(support.supported.iter())
-            .zip(support.bridged.iter())
-            .filter(|((solid, held), spanned)| **solid && !**held && !**spanned)
-            .count();
-        let spanned = support.bridged.iter().filter(|cell| **cell).count();
-        checks.push(check(
+            &analysis.void,
+            0.0,
+        ),
+        located(
             Rule::SupportFree,
-            target,
-            unsupported == 0,
+            analysis.unsupported_cells == 0,
             format!(
                 "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
-                unsupported as f64 * pitch.powi(3),
+                analysis.unsupported_cells as f64 * cell_mm3,
                 policy.overhang_angle_deg,
                 policy.build_direction,
-                spanned as f64 * pitch.powi(3),
+                analysis.spanned_cells as f64 * cell_mm3,
                 policy.bridge_max_mm,
                 pitch
             ),
-        ));
-    }
-    checks
+            &analysis.unsupported,
+            0.0,
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -1253,6 +1528,192 @@ mod tests {
         rules.voxel_mm = 0.0;
         let solid = binary_stl(&box_triangles([0.; 3], [10.; 3], false), b"");
         assert!(evaluate_stl(&solid, "block", &rules).is_err());
+    }
+
+    fn locations(checks: &[Check], rule: Rule) -> Vec<Location> {
+        checks
+            .iter()
+            .find(|c| c.rule == rule)
+            .map(|c| c.locations.clone())
+            .unwrap_or_default()
+    }
+
+    /// boxがpointを含むか。量子化の分だけ許す。
+    fn encloses(location: &Location, point: [f64; 3]) -> bool {
+        (0..3).all(|i| location.min[i] <= point[i] && point[i] <= location.max[i])
+    }
+
+    #[test]
+    fn passing_checks_carry_no_locations() {
+        let block = part(vec![add("body", box_shape([0.; 3], [10.; 3]))]);
+        let checks = evaluate(&model_with(block, policy(1.0, 1.0, 0.5))).unwrap();
+        assert!(checks.iter().all(|c| c.locations.is_empty()));
+        let json = serde_json::to_string(&checks[0]).unwrap();
+        assert!(!json.contains("locations"), "{json}");
+    }
+
+    #[test]
+    fn thin_plate_location_covers_the_plate() {
+        let plate = part(vec![add("body", box_shape([0.; 3], [10., 10., 0.8]))]);
+        let checks = evaluate(&model_with(plate, policy(1.2, 0.1, 0.2))).unwrap();
+        let found = locations(&checks, Rule::FinalWallThickness);
+        assert_eq!(found.len(), 1);
+        assert!(encloses(&found[0], [5., 5., 0.4]));
+        assert!(
+            found[0].max[2] <= 1.0 && found[0].min[2] >= -0.2,
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn neck_location_sits_on_the_neck() {
+        let dumbbell = part(vec![
+            add("left", box_shape([0., 0., 0.], [5., 5., 5.])),
+            add("neck", box_shape([5., 2., 2.], [7., 3., 3.])),
+            add("right", box_shape([7., 0., 0.], [12., 5., 5.])),
+        ]);
+        let checks = evaluate(&model_with(dumbbell, policy(0.5, 2.0, 0.25))).unwrap();
+        let found = locations(&checks, Rule::NeckSection);
+        assert_eq!(found.len(), 1, "{found:?}");
+        // 首の中央を含み、両側の塊の中心は含まない。
+        assert!(encloses(&found[0], [6., 2.5, 2.5]), "{found:?}");
+        assert!(!encloses(&found[0], [2.5, 2.5, 2.5]));
+        assert!(!encloses(&found[0], [9.5, 2.5, 2.5]));
+    }
+
+    #[test]
+    fn separated_blocks_report_the_smaller_one() {
+        // 2つの塊が1 mm離れている。材料で繋がらないため、小さい方を位置として示す。
+        let pair = part(vec![
+            add("big", box_shape([0., 0., 0.], [6., 6., 6.])),
+            add("small", box_shape([7., 0., 0.], [10., 3., 3.])),
+        ]);
+        let checks = evaluate(&model_with(pair, policy(0.5, 1.0, 0.25))).unwrap();
+        let found = locations(&checks, Rule::NeckSection);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(encloses(&found[0], [8.5, 1.5, 1.5]), "{found:?}");
+        assert!(!encloses(&found[0], [3., 3., 3.]));
+    }
+
+    #[test]
+    fn cavity_location_matches_the_pocket() {
+        let sealed = part(vec![
+            add("body", box_shape([0.; 3], [10., 10., 10.])),
+            cut("void", box_shape([3., 3., 3.], [7., 7., 7.])),
+        ]);
+        let checks = evaluate(&model_with(sealed, policy(0.5, 0.5, 0.5))).unwrap();
+        let found = locations(&checks, Rule::ClosedCavity);
+        assert_eq!(found.len(), 1);
+        for axis in 0..3 {
+            assert!((found[0].min[axis] - 3.0).abs() <= 0.5, "{found:?}");
+            assert!((found[0].max[axis] - 7.0).abs() <= 0.5, "{found:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_location_is_under_the_overhang() {
+        let checks = evaluate(&model_with(table(8.0), policy(1.0, 1.0, 0.5))).unwrap();
+        let found = locations(&checks, Rule::SupportFree);
+        assert!(!found.is_empty());
+        // 張り出しの下面 (x>4、z=6付近) にあり、脚の上には無い。
+        assert!(
+            found.iter().all(|l| l.max[0] > 4.0 && l.min[2] >= 5.5),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn locations_are_capped_and_the_total_is_reported() {
+        // 1 mm角の閉空洞を5×5で25個並べる。
+        let mut features = vec![add("body", box_shape([0.; 3], [26., 26., 4.]))];
+        for i in 0..5 {
+            for j in 0..5 {
+                let (x, y) = (2.0 + 5.0 * i as f64, 2.0 + 5.0 * j as f64);
+                features.push(cut(
+                    &format!("v{i}{j}"),
+                    box_shape([x, y, 1.5], [x + 1., y + 1., 2.5]),
+                ));
+            }
+        }
+        let checks = evaluate(&model_with(part(features), policy(0.5, 0.5, 0.25))).unwrap();
+        let cavity = checks
+            .iter()
+            .find(|c| c.rule == Rule::ClosedCavity)
+            .unwrap();
+        assert_eq!(cavity.locations.len(), MAX_LOCATIONS);
+        assert!(
+            cavity.message.ends_with("; 25 location(s)"),
+            "{}",
+            cavity.message
+        );
+    }
+
+    fn count_bits(section: &Section, bit: u8) -> usize {
+        section
+            .rows
+            .iter()
+            .flat_map(|row| row.bytes())
+            .map(|c| u8::from_str_radix(std::str::from_utf8(&[c]).unwrap(), 32).unwrap())
+            .filter(|value| value & bit != 0)
+            .count()
+    }
+
+    #[test]
+    fn section_through_a_pocket_shows_the_void_and_the_wall() {
+        let sealed = part(vec![
+            add("body", box_shape([0.; 3], [10., 10., 10.])),
+            cut("void", box_shape([3., 3., 3.], [7., 7., 7.])),
+        ]);
+        let model = model_with(sealed, policy(0.5, 0.5, 0.5));
+        let planes = [
+            Plane {
+                axis: Axis::Z,
+                coordinate: Some(5.0),
+            },
+            Plane {
+                axis: Axis::Z,
+                coordinate: Some(1.0),
+            },
+        ];
+        let sections = sections_of_part(&model, "block", &planes).unwrap();
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].plane_coordinate, 5.0);
+        // 中央の断面では空洞 (4 mm角、0.5 mm格子で9×9 cell) が現れ、床下の断面には無い。
+        assert_eq!(count_bits(&sections[0], SECTION_VOID), 81);
+        assert_eq!(count_bits(&sections[1], SECTION_VOID), 0);
+        assert!(count_bits(&sections[0], SECTION_SOLID) > 0);
+        let width = sections[0].rows[0].len();
+        assert!(sections[0].rows.iter().all(|row| row.len() == width));
+    }
+
+    #[test]
+    fn section_marks_the_neck() {
+        let dumbbell = part(vec![
+            add("left", box_shape([0., 0., 0.], [5., 5., 5.])),
+            add("neck", box_shape([5., 2., 2.], [7., 3., 3.])),
+            add("right", box_shape([7., 0., 0.], [12., 5., 5.])),
+        ]);
+        let model = model_with(dumbbell, policy(0.5, 2.0, 0.25));
+        let planes = [Plane {
+            axis: Axis::Y,
+            coordinate: Some(2.5),
+        }];
+        let section = &sections_of_part(&model, "block", &planes).unwrap()[0];
+        assert!(count_bits(section, SECTION_NECK) > 0);
+        assert!(sections_of_part(&model, "ghost", &planes).is_err());
+    }
+
+    #[test]
+    fn stl_sections_use_the_same_encoding() {
+        let mut hollow = box_triangles([0.; 3], [20.; 3], false);
+        hollow.extend(box_triangles([5.; 3], [15.; 3], true));
+        let planes = [Plane {
+            axis: Axis::X,
+            coordinate: None,
+        }];
+        let sections =
+            sections_of_stl(&binary_stl(&hollow, b""), &policy(1.2, 1.2, 1.0), &planes).unwrap();
+        assert_eq!(count_bits(&sections[0], SECTION_VOID), 100);
     }
 
     #[test]

@@ -15,7 +15,7 @@ import cadquery as cq
 LENGTH_MM, WIDTH_MM, HEIGHT_MM = 80.0, 55.0, 24.0
 BOSS_CENTERS = ((10, 10), (70, 10), (10, 45), (70, 45))
 VENT_X_MM = (22, 30, 38, 46, 54)
-OUTPUTS = {"electronics_enclosure.stl", "electronics_enclosure.step", "model.json", "report.json"}
+OUTPUTS = {"electronics_enclosure.stl", "electronics_enclosure.step", "model.json", "report.json", "figures"}
 
 
 class EnclosureEndToEndTests(unittest.TestCase):
@@ -91,11 +91,11 @@ class EnclosureEndToEndTests(unittest.TestCase):
             self.assertAlmostEqual(max(p[axis] for p in vertices), maximum, places=5)
 
     def test_existing_output_is_not_overwritten(self):
-        before = {path.name: path.read_bytes() for path in self.output.iterdir()}
+        before = {path: path.read_bytes() for path in self.output.rglob("*") if path.is_file()}
         repeated = subprocess.run(self.command, capture_output=True, text=True, check=False)
         self.assertNotEqual(repeated.returncode, 0)
         self.assertIn("FileExistsError", repeated.stderr)
-        self.assertEqual({path.name: path.read_bytes() for path in self.output.iterdir()}, before)
+        self.assertEqual({path: path.read_bytes() for path in self.output.rglob("*") if path.is_file()}, before)
 
 
 if __name__ == "__main__":

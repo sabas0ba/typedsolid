@@ -58,6 +58,27 @@ fn evaluate_stl_voxels(stl: &[u8], target: &str, policy: &str) -> PyResult<Strin
     serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// IRの1部品の断面。planesは[{"axis": "x", "coordinate": 1.0}, ...]。
+#[pyfunction]
+fn voxel_sections(json: &str, part: &str, planes: &str) -> PyResult<String> {
+    let model = Model::from_json(json).map_err(PyValueError::new_err)?;
+    let planes: Vec<voxel::Plane> =
+        serde_json::from_str(planes).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let sections = voxel::sections_of_part(&model, part, &planes).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&sections).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// 外部のSTLの断面。
+#[pyfunction]
+fn stl_sections(stl: &[u8], policy: &str, planes: &str) -> PyResult<String> {
+    let policy: Policy =
+        serde_json::from_str(policy).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let planes: Vec<voxel::Plane> =
+        serde_json::from_str(planes).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let sections = voxel::sections_of_stl(stl, &policy, &planes).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&sections).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// 出力STLの構造検査。解析失敗は例外にせず、failのcheckとして返す。
 #[pyfunction]
 fn inspect_mesh(
@@ -86,6 +107,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_fastener_releases, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_connectors, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_stl_voxels, module)?)?;
+    module.add_function(wrap_pyfunction!(voxel_sections, module)?)?;
+    module.add_function(wrap_pyfunction!(stl_sections, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(export_allowed, module)?)?;
     Ok(())

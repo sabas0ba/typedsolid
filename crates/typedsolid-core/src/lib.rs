@@ -1573,7 +1573,23 @@ impl Model {
                 SourceKind::Measured => "measured",
                 SourceKind::Other => "other",
             };
+            // failでは開口とプラグの掃引前の位置を示す。
+            let locations = if problems.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    Location {
+                        min: hole_min,
+                        max: hole_max,
+                    },
+                    Location {
+                        min: plug_min,
+                        max: plug_max,
+                    },
+                ]
+            };
             checks.push(Check {
+                locations,
                 rule: Rule::ConnectorFit,
                 status: if problems.is_empty() {
                     Status::Pass
@@ -1718,6 +1734,7 @@ impl Model {
                 }) => format!("is removed after step {step}"),
             };
             checks.push(Check {
+                locations: Vec::new(),
                 rule: Rule::FastenerRelease,
                 status: if problems.is_empty() {
                     Status::Pass
@@ -1774,6 +1791,7 @@ impl Model {
                 if feature.operation == Operation::Add {
                     let measured = feature.shape.minimum_dimension();
                     report.checks.push(Check {
+                        locations: Vec::new(),
                         rule: Rule::FeatureThickness,
                         status: if measured >= self.policy.min_feature_mm { Status::Pass } else { Status::Fail },
                         target: format!("{}/{}", part.id, feature.id),
@@ -1787,6 +1805,7 @@ impl Model {
             .filter(|r| *r != Rule::FeatureThickness)
         {
             report.checks.push(Check {
+                locations: Vec::new(),
                 rule,
                 status: Status::NotEvaluated,
                 target: "model".into(),
@@ -1820,6 +1839,7 @@ impl Model {
                 .ok_or("validated snap fit lost its material")?;
             let strain = snap.strain(geometry);
             checks.push(Check {
+                locations: Vec::new(),
                 rule: Rule::SnapFit,
                 status: if strain <= allowable { Status::Pass } else { Status::Fail },
                 target: format!("{}/strain", snap.id),
@@ -1831,6 +1851,7 @@ impl Model {
             let build = self.policy.build_direction.axis();
             let along = snap.length_direction.axis();
             checks.push(Check {
+                locations: Vec::new(),
                 rule: Rule::SnapFit,
                 status: if along == build {
                     Status::Fail
@@ -1848,6 +1869,17 @@ impl Model {
     }
 }
 
+/// 検出箇所の軸平行box。単位はmm。図示と、利用者が修正箇所を特定するために使う。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Location {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+/// 1つのcheckが持つ検出箇所の上限。大きい順に残し、総数はmessageに書く。
+pub const MAX_LOCATIONS: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Check {
@@ -1855,6 +1887,9 @@ pub struct Check {
     pub status: Status,
     pub target: String,
     pub message: String,
+    /// 検出箇所。位置を持たないcheckと、passのcheckでは空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<Location>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3324,6 +3359,7 @@ mod tests {
         };
         assert!(!r.export_allowed());
         r.checks.push(Check {
+            locations: Vec::new(),
             rule: Rule::SingleSolid,
             status: Status::Pass,
             target: "x".into(),
@@ -3331,6 +3367,7 @@ mod tests {
         });
         assert!(r.export_allowed());
         r.checks.push(Check {
+            locations: Vec::new(),
             rule: Rule::Thermal,
             status: Status::Fail,
             target: "x".into(),

@@ -260,6 +260,29 @@ power = connector_opening(
 
 すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
+`--figures DIR`を与えると、概観と検出箇所の断面図をDIRへ書く。
+
+## 検出箇所の図
+
+`export`は出力先の`figures/`に、部品ごとの概観と、failしたcheckの検出箇所を通る3断面のSVGを書く。report.jsonの各checkの`locations`は、図と同じ検出箇所のboxである。
+
+```python
+from typedsolid.cadquery import export
+
+try:
+    export(model, ".work/case")              # 合格なら .work/case/figures/ に概観図
+except ValueError as error:
+    print(error.__notes__)                   # 拒否なら .work/case.rejected/ に report.json と図
+```
+
+拒否した場合、出力先は作らず、reportと図だけを`<出力先>.rejected/`に書く。図が不要なら`export(..., figures=False)`とする。欠陥fixtureの図は、CadQueryを使わずRust coreの検査だけから次で描ける。
+
+```bash
+.venv/bin/python scripts/render-figures.py --output .work/figures
+```
+
+図の読み方と各ruleの検出箇所の定義は [設計](design.md#検出箇所と図) を参照する。
+
 ## slicerとの突合
 
 `support_free`は幾何のみに基づく近似であり、ノズル径、層厚、冷却、材料を含まない。実機で用いる場合は、出力したSTLをslicerへ読み込み、同じ印刷姿勢でサポート生成の要否を比較する。
