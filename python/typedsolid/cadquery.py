@@ -45,6 +45,7 @@ DEFAULT_TIMEOUT_S = 600.0
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
     "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit", "fastener_release",
+    "connector_fit",
 )
 # ネジの頭の座面として、座面からclamp側へ材料を要求する深さ。単位はmm。clampが薄ければその厚みまでとする。
 BEARING_DEPTH_MM = 0.5
@@ -640,11 +641,13 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定、snap fitは他の部品やkeepoutを参照するため除く。
+        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定、snap fit、コネクタ開口は
+        # 他の部品や掃引を参照するため除く。
         single = json.dumps(
             {
                 **data, "parts": [part], "keepouts": [], "sweeps": [],
                 "assembly": {"fit_clearance_mm": 0.0, "steps": []}, "fasteners": [], "snap_fits": [],
+                "connectors": [],
             },
             allow_nan=False,
         )
@@ -706,6 +709,8 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
         geometry += json.loads(_native.evaluate_snap_fits(model_json))
         # ネジを外す順序も形状を使わないため、判定をRust coreに置く。
         geometry += json.loads(_native.evaluate_fastener_releases(model_json))
+        # コネクタ開口の寸法の整合もIRの寸法だけで決まる。
+        geometry += json.loads(_native.evaluate_connectors(model_json))
         geometry += _snap_checks(data, shapes, snaps, progress)
         for rule in GEOMETRY_RULES:
             if not any(c["rule"] == rule for c in geometry):

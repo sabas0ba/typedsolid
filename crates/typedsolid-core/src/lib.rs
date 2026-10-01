@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -28,6 +28,8 @@ const MAX_FASTENERS: usize = 1000;
 const MAX_MATERIALS: usize = 100;
 /// snap fitの上限。
 const MAX_SNAP_FITS: usize = 1000;
+/// コネクタ開口の上限。
+const MAX_CONNECTORS: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -841,6 +843,109 @@ impl SnapFit {
     }
 }
 
+/// プラグ外形の値の出典の種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    /// 部品メーカーのdatasheet。referenceに品番と資料名を記す。
+    Datasheet,
+    /// 実物の測定。referenceに測定対象と方法を記す。
+    Measured,
+    /// 上記以外。referenceに根拠を記す。
+    Other,
+}
+
+/// プラグ外形の値の出典。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlugSource {
+    pub kind: SourceKind,
+    pub reference: String,
+}
+
+/// 筐体の壁に開けるコネクタ開口。
+///
+/// `opening`は`part`のcut featureで、壁を貫くbox。`sweep`はプラグを抜く掃引で、
+/// 嵌合状態のプラグ外形のboxを抜く向きへ動かす。`plug_mm`は抜く向きに垂直な
+/// プラグ断面の寸法で、並びは`Axis::plane`の順 (x方向に抜くなら[y, z])。開口は
+/// プラグとの間に各辺で`clearance_mm`以上の隙間を持つ。値は利用者が与え、
+/// 根拠を`source`に記す。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Connector {
+    pub id: String,
+    pub part: String,
+    pub opening: String,
+    pub sweep: String,
+    pub plug_mm: [f64; 2],
+    pub clearance_mm: f64,
+    pub source: PlugSource,
+}
+
+/// 出典の記述の上限。単位は文字。
+const MAX_SOURCE_REFERENCE: usize = 500;
+/// 寸法の一致とみなす差。単位はmm。
+const CONNECTOR_TOLERANCE_MM: f64 = 1e-6;
+
+impl Connector {
+    /// 参照先の型と値域を確かめる。寸法の整合は`connector_fit`で判定する。
+    fn validate(&self, parts: &BTreeMap<&String, &Part>, sweeps: &[Sweep]) -> Result<(), String> {
+        let part = parts
+            .get(&self.part)
+            .ok_or_else(|| format!("connector {} refers to unknown part {}", self.id, self.part))?;
+        let opening = part
+            .features
+            .iter()
+            .find(|f| f.id == self.opening)
+            .ok_or_else(|| {
+                format!(
+                    "connector {} refers to unknown feature {}/{}",
+                    self.id, self.part, self.opening
+                )
+            })?;
+        if opening.operation != Operation::Cut || !opening.shape.is_box() {
+            return Err(format!(
+                "connector {}: opening {} must be a cut box",
+                self.id, self.opening
+            ));
+        }
+        let sweep = sweeps.iter().find(|s| s.id == self.sweep).ok_or_else(|| {
+            format!(
+                "connector {} refers to unknown sweep {}",
+                self.id, self.sweep
+            )
+        })?;
+        if !sweep.shape.as_ref().is_some_and(Shape::is_box) {
+            return Err(format!(
+                "connector {}: sweep {} must have a box shape",
+                self.id, self.sweep
+            ));
+        }
+        for value in self.plug_mm {
+            if !value.is_finite() || !(MINIMUM_EXTENT_MM..=COORDINATE_LIMIT_MM).contains(&value) {
+                return Err(format!(
+                    "connector {}: plug_mm must be finite and at least {MINIMUM_EXTENT_MM} mm",
+                    self.id
+                ));
+            }
+        }
+        if !self.clearance_mm.is_finite() || !(0.0..=1000.0).contains(&self.clearance_mm) {
+            return Err(format!(
+                "connector {}: clearance_mm must be finite and in [0, 1000]",
+                self.id
+            ));
+        }
+        let reference = self.source.reference.trim();
+        if reference.is_empty() || reference.chars().count() > MAX_SOURCE_REFERENCE {
+            return Err(format!(
+                "connector {}: source reference must have 1..{MAX_SOURCE_REFERENCE} characters",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Units {
     #[serde(rename = "mm")]
@@ -875,12 +980,13 @@ pub enum Rule {
     FastenerFit,
     SnapFit,
     FastenerRelease,
+    ConnectorFit,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -898,6 +1004,7 @@ impl Rule {
         Self::FastenerFit,
         Self::SnapFit,
         Self::FastenerRelease,
+        Self::ConnectorFit,
         Self::Strength,
         Self::Thermal,
     ];
@@ -985,6 +1092,8 @@ pub struct Model {
     pub materials: Vec<Material>,
     #[serde(default)]
     pub snap_fits: Vec<SnapFit>,
+    #[serde(default)]
+    pub connectors: Vec<Connector>,
     pub policy: Policy,
 }
 
@@ -1143,7 +1252,19 @@ fn upgrade_v7(value: &mut Value) -> Result<(), String> {
     {
         return Err("schema_version 7 does not define fastener release or clamp_keepouts".into());
     }
+    root.insert("schema_version".into(), json!(8));
+    Ok(())
+}
+
+/// schema v8のJSONをv9へ変換する。v9はコネクタ開口を加える。v8はこれを持たないため、
+/// 空のconnectorsを補う。
+fn upgrade_v8(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if root.contains_key("connectors") {
+        return Err("schema_version 8 does not define connectors".into());
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("connectors".into(), json!([]));
     Ok(())
 }
 
@@ -1179,6 +1300,7 @@ impl Model {
         // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
         const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] = [
             upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6, upgrade_v7,
+            upgrade_v8,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1352,7 +1474,122 @@ impl Model {
             }
             snap.validate(&parts, &materials, &self.assembly.steps)?;
         }
+        if self.connectors.len() > MAX_CONNECTORS {
+            return Err(format!("at most {MAX_CONNECTORS} connectors are supported"));
+        }
+        let mut connector_ids = BTreeSet::new();
+        for connector in &self.connectors {
+            if !identifier(&connector.id) || !connector_ids.insert(&connector.id) {
+                return Err(format!(
+                    "invalid or duplicate connector id: {}",
+                    connector.id
+                ));
+            }
+            connector.validate(&parts, &self.sweeps)?;
+        }
         Ok(())
+    }
+
+    /// コネクタ開口の寸法の整合。IRの寸法だけから決まるためRust coreで判定する。
+    ///
+    /// 次のいずれかがあればfailとする。
+    /// - 掃引の断面がプラグ断面と一致しない。
+    /// - 開口の断面が、掃引の断面を各辺`clearance_mm`だけ広げた範囲を内包しない。
+    /// - プラグの後端が、開口の内側の面より奥から動き始めて外側の面の外まで抜けない。
+    pub fn evaluate_connectors(&self) -> Result<Vec<Check>, String> {
+        self.validate()?;
+        let mut checks = Vec::new();
+        for connector in &self.connectors {
+            let box_of = |shape: &Shape| shape.aabb();
+            let opening = self
+                .parts
+                .iter()
+                .find(|p| p.id == connector.part)
+                .and_then(|p| p.features.iter().find(|f| f.id == connector.opening))
+                .ok_or("validated connector opening lost")?;
+            let sweep = self
+                .sweeps
+                .iter()
+                .find(|s| s.id == connector.sweep)
+                .ok_or("validated connector sweep lost")?;
+            let (hole_min, hole_max) = box_of(&opening.shape);
+            let (plug_min, plug_max) =
+                box_of(sweep.shape.as_ref().ok_or("validated sweep shape lost")?);
+            let axis = sweep.direction.axis().index();
+            let plane = sweep.direction.axis().plane();
+            let clearance = connector.clearance_mm;
+            let mut problems = Vec::new();
+            let section = plane.map(|i| plug_max[i] - plug_min[i]);
+            if (0..2).any(|k| (section[k] - connector.plug_mm[k]).abs() > CONNECTOR_TOLERANCE_MM) {
+                problems.push(format!(
+                    "sweep {} section {:.3} x {:.3} mm differs from plug {:.3} x {:.3} mm",
+                    sweep.id, section[0], section[1], connector.plug_mm[0], connector.plug_mm[1]
+                ));
+            }
+            for i in plane {
+                let low = plug_min[i] - clearance;
+                let high = plug_max[i] + clearance;
+                if hole_min[i] > low + CONNECTOR_TOLERANCE_MM
+                    || hole_max[i] < high - CONNECTOR_TOLERANCE_MM
+                {
+                    problems.push(format!(
+                        "opening {} spans [{:.3}, {:.3}] on {}, plug with clearance needs [{low:.3}, {high:.3}]",
+                        opening.id,
+                        hole_min[i],
+                        hole_max[i],
+                        ["x", "y", "z"][i]
+                    ));
+                }
+            }
+            let travel = match sweep.distance_mm {
+                Distance::Millimetres(value) => value,
+                Distance::Keyword(DistanceKeyword::Exit) => f64::INFINITY,
+            };
+            // プラグの後端が開口の内側の面より奥から動き始め、外側の面の外まで抜けること。
+            let passes = if sweep.direction.is_positive() {
+                plug_min[axis] <= hole_min[axis] + CONNECTOR_TOLERANCE_MM
+                    && plug_min[axis] + travel >= hole_max[axis] - CONNECTOR_TOLERANCE_MM
+            } else {
+                plug_max[axis] >= hole_max[axis] - CONNECTOR_TOLERANCE_MM
+                    && plug_max[axis] - travel <= hole_min[axis] + CONNECTOR_TOLERANCE_MM
+            };
+            if !passes {
+                problems.push(format!(
+                    "sweep {} does not travel through opening {} along {}",
+                    sweep.id, opening.id, sweep.direction
+                ));
+            }
+            let kind = match connector.source.kind {
+                SourceKind::Datasheet => "datasheet",
+                SourceKind::Measured => "measured",
+                SourceKind::Other => "other",
+            };
+            checks.push(Check {
+                rule: Rule::ConnectorFit,
+                status: if problems.is_empty() {
+                    Status::Pass
+                } else {
+                    Status::Fail
+                },
+                target: connector.id.clone(),
+                message: if problems.is_empty() {
+                    format!(
+                        "plug {:.3} x {:.3} mm passes opening {} with clearance {clearance} mm (source: {kind}, {})",
+                        connector.plug_mm[0],
+                        connector.plug_mm[1],
+                        opening.id,
+                        connector.source.reference.trim()
+                    )
+                } else {
+                    format!(
+                        "{} (source: {kind}, {})",
+                        problems.join("; "),
+                        connector.source.reference.trim()
+                    )
+                },
+            });
+        }
+        Ok(checks)
     }
 
     /// ネジを外す状態のstepと、締めるkeepoutが存在することを確かめる。
@@ -1660,6 +1897,7 @@ mod tests {
             fasteners: vec![],
             materials: vec![],
             snap_fits: vec![],
+            connectors: vec![],
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
@@ -2509,7 +2747,7 @@ mod tests {
     fn schema_v4_is_upgraded_with_no_fasteners() {
         let mut value = serde_json::to_value(model()).unwrap();
         let root = value.as_object_mut().unwrap();
-        for key in ["fasteners", "materials", "snap_fits"] {
+        for key in ["fasteners", "materials", "snap_fits", "connectors"] {
             root.remove(key);
         }
         root.insert("schema_version".into(), json!(4));
@@ -2695,6 +2933,7 @@ mod tests {
         let root = value.as_object_mut().unwrap();
         root.remove("materials");
         root.remove("snap_fits");
+        root.remove("connectors");
         root.insert("schema_version".into(), json!(5));
         let model = Model::from_json(&value.to_string()).unwrap();
         assert_eq!(model.schema_version, SCHEMA_VERSION);
@@ -2754,6 +2993,7 @@ mod tests {
     #[test]
     fn schema_v6_is_upgraded_with_fixed_keepouts() {
         let mut value = serde_json::to_value(with_keepout()).unwrap();
+        value.as_object_mut().unwrap().remove("connectors");
         value["schema_version"] = json!(6);
         let model = Model::from_json(&value.to_string()).unwrap();
         assert_eq!(model.schema_version, SCHEMA_VERSION);
@@ -2884,12 +3124,187 @@ mod tests {
     #[test]
     fn schema_v7_is_upgraded_with_screws_that_stay() {
         let mut value = serde_json::to_value(with_screwed_lid(None)).unwrap();
+        value.as_object_mut().unwrap().remove("connectors");
         value["schema_version"] = json!(7);
         let model = Model::from_json(&value.to_string()).unwrap();
         assert_eq!(model.schema_version, SCHEMA_VERSION);
         assert!(model.fasteners[0].release.is_none());
         value["fasteners"][0]["release"] = json!({});
         assert!(Model::from_json(&value.to_string()).is_err());
+    }
+
+    /// x=0..2の壁にUSB程度の開口を持つ筐体。プラグは内側から-xへ抜く。
+    fn with_connector() -> Model {
+        let mut m = model();
+        m.parts[0].features = vec![
+            Feature {
+                id: "wall".into(),
+                role: Role::Wall,
+                operation: Operation::Add,
+                shape: Shape::Box {
+                    min: [0., 0., 0.],
+                    max: [2., 20., 10.],
+                },
+            },
+            Feature {
+                id: "port".into(),
+                role: Role::Generic,
+                operation: Operation::Cut,
+                shape: Shape::Box {
+                    min: [-1., 5., 3.],
+                    max: [3., 15., 7.],
+                },
+            },
+        ];
+        m.sweeps = vec![Sweep {
+            id: "plug".into(),
+            shape: Some(Shape::Box {
+                min: [1., 6., 4.],
+                max: [10., 14., 6.],
+            }),
+            keepout: None,
+            direction: Direction::MinusX,
+            distance_mm: Distance::Keyword(DistanceKeyword::Exit),
+            after_step: None,
+        }];
+        m.connectors = vec![Connector {
+            id: "usb".into(),
+            part: "base".into(),
+            opening: "port".into(),
+            sweep: "plug".into(),
+            plug_mm: [8., 2.],
+            clearance_mm: 0.5,
+            source: PlugSource {
+                kind: SourceKind::Measured,
+                reference: "cable A, caliper".into(),
+            },
+        }];
+        m
+    }
+
+    fn connector_check(m: &Model) -> Check {
+        let mut checks = m.evaluate_connectors().unwrap();
+        assert_eq!(checks.len(), 1);
+        checks.remove(0)
+    }
+
+    #[test]
+    fn connector_opening_with_clearance_passes() {
+        let check = connector_check(&with_connector());
+        assert_eq!(check.rule, Rule::ConnectorFit);
+        assert_eq!(check.target, "usb");
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("measured, cable A, caliper"),
+            "{}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn connector_fit_detects_each_inconsistency() {
+        type Edit = fn(&mut Model);
+        let cases: [(&str, Edit); 4] = [
+            ("differs from plug", |m| m.connectors[0].plug_mm = [8., 2.5]),
+            ("spans [3.000, 7.000] on z", |m| {
+                m.connectors[0].clearance_mm = 1.5
+            }),
+            ("does not travel through", |m| {
+                m.sweeps[0].direction = Direction::PlusX
+            }),
+            ("does not travel through", |m| {
+                m.sweeps[0].distance_mm = Distance::Millimetres(2.0)
+            }),
+        ];
+        for (expected, mutate) in cases {
+            let mut m = with_connector();
+            mutate(&mut m);
+            let check = connector_check(&m);
+            assert_eq!(check.status, Status::Fail, "{expected}");
+            assert!(check.message.contains(expected), "{}", check.message);
+        }
+    }
+
+    #[test]
+    fn exact_travel_through_the_opening_passes() {
+        let mut m = with_connector();
+        // プラグの後端x=10から開口の外端x=-1まで、ちょうど11 mm動かす。
+        m.sweeps[0].distance_mm = Distance::Millimetres(2.0 + 9.0);
+        assert_eq!(connector_check(&m).status, Status::Pass);
+    }
+
+    #[test]
+    fn invalid_connectors_are_rejected() {
+        type Edit = fn(&mut Model);
+        let cases: [(&str, Edit); 10] = [
+            ("unknown part", |m| m.connectors[0].part = "ghost".into()),
+            ("unknown feature", |m| {
+                m.connectors[0].opening = "ghost".into()
+            }),
+            ("opening is additive", |m| {
+                m.connectors[0].opening = "wall".into()
+            }),
+            ("opening is a cylinder", |m| {
+                m.parts[0].features[1].shape = Shape::Cylinder {
+                    axis: Axis::X,
+                    center: [10., 5.],
+                    radius: 2.,
+                    span: [-1., 3.],
+                }
+            }),
+            ("unknown sweep", |m| m.connectors[0].sweep = "ghost".into()),
+            ("sweep uses a keepout", |m| {
+                m.keepouts.push(Keepout {
+                    id: "pcb".into(),
+                    shape: Shape::Box {
+                        min: [3., 3., 3.],
+                        max: [9., 9., 5.],
+                    },
+                    clearance_mm: Clearance {
+                        default: 0.,
+                        faces: BTreeMap::new(),
+                    },
+                    attached_to: None,
+                });
+                m.sweeps[0].shape = None;
+                m.sweeps[0].keepout = Some("pcb".into());
+            }),
+            ("zero plug", |m| m.connectors[0].plug_mm = [0., 2.]),
+            ("negative clearance", |m| {
+                m.connectors[0].clearance_mm = -0.1
+            }),
+            ("blank source", |m| {
+                m.connectors[0].source.reference = "  ".into()
+            }),
+            ("duplicate id", |m| {
+                m.connectors.push(m.connectors[0].clone())
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut m = with_connector();
+            mutate(&mut m);
+            assert!(m.validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn connector_round_trips_through_json() {
+        let json = serde_json::to_string(&with_connector()).unwrap();
+        assert!(json.contains(r#""kind":"measured""#), "{json}");
+        let back = Model::from_json(&json).unwrap();
+        assert_eq!(back.connectors.len(), 1);
+        assert_eq!(back.connectors[0].plug_mm, [8., 2.]);
+    }
+
+    #[test]
+    fn schema_v8_is_upgraded_with_no_connectors() {
+        let mut value = serde_json::to_value(with_connector()).unwrap();
+        value["schema_version"] = json!(8);
+        assert!(Model::from_json(&value.to_string()).is_err());
+        value.as_object_mut().unwrap().remove("connectors");
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        assert!(model.connectors.is_empty());
     }
 
     #[test]

@@ -679,6 +679,7 @@ mod tests {
             fasteners: vec![],
             materials: vec![],
             snap_fits: vec![],
+            connectors: vec![],
             policy,
         }
     }

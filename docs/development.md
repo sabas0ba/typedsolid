@@ -223,6 +223,28 @@ pico = board("raspberry_pi_pico_2")
 pads = pico.bosses((0.0, 4.0), 5.0, origin=(4.5, 9.5, 4.0))
 ```
 
+コネクタ開口は`connector_opening`で作る。プラグ断面の寸法は組み込まれていないため、使うケーブルの部品datasheetの値か実測値を、出典とともに与える。コネクタの辺上の位置は、資料が寸法化した基板ならcatalogから取れる。
+
+```python
+from typedsolid import PlugSource, board, connector_opening
+
+pi = board("raspberry_pi_4_model_b")
+origin = (3.0, 4.0, 5.0)                                  # 基板左下角。PCB下面がz=5.0
+front = pi.edge_position("minus_y", origin)              # 基板の下辺のy座標
+power = connector_opening(
+    "power", part="case", direction="minus_y",            # プラグを-yへ抜く
+    center=pi.connector_center("usb_c_power", origin, z_mm=8.2),   # z_mmはプラグ中心の高さ (例示の値)
+    plug_mm=(12.4, 6.6),                                  # プラグ外形 (x, z)。例示の値で、実物を測って与える
+    plug_span=(front - 3.0, front + 6.0),                 # 嵌合状態でプラグが占めるy範囲
+    wall_span=(front - 4.5, front - 1.5),                 # 前壁のy範囲
+    clearance_mm=0.4,
+    source=PlugSource("measured", "USB-C cable in use, caliper, overmold max"),
+)
+# power.featureを前壁の部品へ、power.sweepとpower.connectorをModelへ加える。
+```
+
+`connector_fit`は開口と掃引とプラグ寸法の整合を、`access_clearance`は抜く経路上の干渉を見る。縦の壁の開口は上縁がbridgeになるため、幅が`bridge_max_mm`を超えると`support_free`が落ちる。詳細は [設計](design.md#コネクタ開口の検査) を参照する。
+
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
 印刷姿勢は`Policy.build_direction` (既定`plus_z`)、支持なしで許す傾斜は`overhang_angle_deg` (既定45)、渡せる未支持区間の長さは`bridge_max_mm` (既定5.0) で指定する。
