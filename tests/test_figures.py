@@ -99,6 +99,12 @@ class RenderTests(TemporaryDirectoryTest):
         highlight = {colour for _, colour, _ in HIGHLIGHT.values()}
         self.assertFalse(fills(self.root / names[0]) & highlight)
 
+    def test_summary_lists_each_failing_check_with_its_largest_location(self):
+        table = render_figures.summary(defects_only=True).splitlines()
+        rows = [line for line in table if line.startswith("| ") and not line.startswith("| fixture") and "---" not in line]
+        self.assertEqual(len(rows), len(DEFECTS))
+        self.assertTrue(any(row.startswith("| sealed_void | closed_cavity | enclosure | 1 |") for row in rows), rows)
+
     def test_render_script_writes_one_figure_per_defect(self):
         written = render_figures.render(self.root, defects_only=True)
         self.assertEqual(len(written), len(DEFECTS))

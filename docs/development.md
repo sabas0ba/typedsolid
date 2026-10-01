@@ -311,6 +311,8 @@ Rustのtransitive依存更新も`Cargo.lock`を差分レビューし、auditに�
 
 PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テストを含む検査を行う。CadQueryはVTK等の大きな依存を持つため、通常のPRごとに取得・統合buildを強制しない。初回PRはローカルの統合テスト結果を添付する。Windows/macOS jobと自動publishは追加しない。
 
+core検査は、欠陥fixtureの断面図をCadQueryを使わずに再生成し、`docs/assets/figures/`の図と一致することも確かめる。Python環境にはmaturinだけを`requirements-figures.lock`から入れる。検出箇所の表はjob summaryに書く。図を変える変更では`scripts/render-figures.py --output docs/assets/figures --defects-only`で再生成してcommitし、PR本文から参照する。artifactのupload用actionは依存を増やさないため使わない。
+
 ## 打ち切りと再開
 
 `export`は既定で子processにbackendを隔離し、`timeout_s` (既定600秒) を超えると`WorkerTimeout`を送出する。呼び出し元のscriptは子で読み込み直さないため、`if __name__ == "__main__"`による保護は不要で、notebookや標準入力からも呼べる。出力先は作られず、stagingも残らない。進行は`progress`に渡した関数へ、経過秒付きの段階名で届く。
