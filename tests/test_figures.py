@@ -12,6 +12,7 @@ from examples.defects import DEFECTS, baseline, sealed_void, thin_wall
 from typedsolid import _native
 from typedsolid.cadquery import export
 from typedsolid.external import inspect_file
+from typedsolid import figures as figures_module
 from typedsolid.figures import FIGURES_PER_CHECK, HIGHLIGHT, SOLID_COLOUR, plan, write_model_figures
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "render-figures.py"
@@ -20,6 +21,14 @@ render_figures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(render_figures)
 
 NS = "{http://www.w3.org/2000/svg}"
+
+
+def fake_sections(_part: str, planes: str) -> str:
+    """1 cellの材料だけを持つ断面。描画の経路だけを確かめるtestで使う。"""
+    return json.dumps([
+        {"axis": plane["axis"], "plane_coordinate": 0.0, "origin": [0.0, 0.0], "pitch": 1.0, "rows": ["1"]}
+        for plane in json.loads(planes)
+    ])
 
 
 def voxel_checks(model_json: str) -> list[dict]:
@@ -61,7 +70,19 @@ class PlanTests(unittest.TestCase):
         location = {"min": [0, 0, 0], "max": [1, 1, 1]}
         model = {"parts": [{"id": "case"}], "connectors": [{"id": "usb", "part": "case"}]}
         checks = [{"rule": "connector_fit", "status": "fail", "target": "usb", "message": "", "locations": [location]}]
-        self.assertEqual([f.name for f in plan(model, checks)][1], "case--connector_fit--1")
+        self.assertEqual([f.name for f in plan(model, checks)][1], "case--connector_fit--usb--1")
+
+    def test_two_connectors_on_one_part_get_distinct_names(self):
+        location = {"min": [0, 0, 0], "max": [1, 1, 1]}
+        model = {"parts": [{"id": "case"}], "connectors": [
+            {"id": "usb", "part": "case"}, {"id": "power", "part": "case"},
+        ]}
+        checks = [
+            {"rule": "connector_fit", "status": "fail", "target": target, "message": "", "locations": [location]}
+            for target in ("usb", "power")
+        ]
+        names = [f.name for f in plan(model, checks)]
+        self.assertEqual(names[1:], ["case--connector_fit--usb--1", "case--connector_fit--power--1"])
 
     def test_passing_and_unknown_rules_get_no_location_figures(self):
         checks = [
@@ -104,6 +125,42 @@ class RenderTests(TemporaryDirectoryTest):
         rows = [line for line in table if line.startswith("| ") and not line.startswith("| fixture") and "---" not in line]
         self.assertEqual(len(rows), len(DEFECTS))
         self.assertTrue(any(row.startswith("| sealed_void | closed_cavity | enclosure | 1 |") for row in rows), rows)
+
+    def test_unsafe_names_stay_inside_the_directory(self):
+        """外部形状のtargetは検証されない。`..`や`/`を含んでも出力先の外へ書かない。"""
+        location = {"min": [0, 0, 0], "max": [1, 1, 1]}
+        checks = [{"rule": "support_free", "status": "fail", "target": "../escape", "message": "",
+                   "locations": [location]}]
+        figures = plan({"parts": [{"id": "../escape"}, {"id": "/abs"}]}, checks)
+        target = self.root / "figures"
+        names = figures_module._write(figures, fake_sections, target)
+        self.assertEqual(len(names), 3)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), sorted(names))
+        self.assertFalse(any(path.exists() for path in self.root.glob("escape*")))
+        self.assertTrue(all("/" not in name and not name.startswith(".") for name in names))
+
+    def test_colliding_names_are_numbered(self):
+        figures = plan({"parts": [{"id": "a/b"}, {"id": "a_b"}]}, [])
+        names = figures_module._write(figures, fake_sections, self.root)
+        self.assertEqual(names, ["a_b--overview.svg", "a_b--overview--2.svg"])
+
+    def test_sections_are_requested_in_bounded_batches(self):
+        location = {"min": [0, 0, 0], "max": [1, 1, 1]}
+        model = {"parts": [{"id": "case"}], "connectors": [{"id": f"c{i}", "part": "case"} for i in range(100)]}
+        checks = [
+            {"rule": "connector_fit", "status": "fail", "target": f"c{i}", "message": "", "locations": [location]}
+            for i in range(100)
+        ]
+        calls = []
+
+        def counting(part, planes):
+            calls.append(len(json.loads(planes)))
+            return fake_sections(part, planes)
+
+        names = figures_module._write(plan(model, checks), counting, self.root)
+        self.assertEqual(len(names), 101)
+        self.assertEqual(sum(calls), 303)
+        self.assertTrue(all(count <= 256 for count in calls), calls)
 
     def test_render_script_writes_one_figure_per_defect(self):
         written = render_figures.render(self.root, defects_only=True)

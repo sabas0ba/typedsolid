@@ -28,6 +28,8 @@ HIGHLIGHT = {
 SOLID_COLOUR = "#c9ced6"
 # 1つのcheckについて描く検出箇所の数。locationsは大きい順に並ぶ。
 FIGURES_PER_CHECK = 3
+# 1回の呼び出しで求める断面の数。Rust coreの上限 (256) 以下で3の倍数とする。
+SECTIONS_PER_CALL = 255
 # 検出箇所の周囲に含める範囲の下限。単位はmm。
 MIN_WINDOW_MM = 10.0
 PANEL_PX = 380
@@ -90,9 +92,14 @@ def plan(model: dict, checks: list[dict]) -> list[Figure]:
         if owner is None:
             continue
         total = len(check["locations"])
+        # 同じ部品・ruleに複数のcheckがある場合 (connector_fit) に名前が衝突しないよう、
+        # targetが部品と異なればtargetも名前に含める。
+        stem = f"{owner}--{check['rule']}"
+        if check["target"] != owner:
+            stem += f"--{check['target']}"
         for index, location in enumerate(check["locations"][:FIGURES_PER_CHECK]):
             figures.append(Figure(
-                f"{owner}--{check['rule']}--{index + 1}", owner, check["rule"],
+                f"{stem}--{index + 1}", owner, check["rule"],
                 f"{owner}: {check['rule']} ({check['target']}), location {index + 1} of {total}",
                 location,
             ))
@@ -208,20 +215,36 @@ def render(figure: Figure, sections: list[dict]) -> str:
     ])
 
 
+def _file_name(name: str) -> str:
+    """図の名前をdirectory直下のfile名にする。英数字と`._-`以外は`_`に置き換え、
+    先頭の`.`も置き換える。外部形状のtargetは識別子として検証されないためである。"""
+    safe = "".join(c if c.isascii() and (c.isalnum() or c in "._-") else "_" for c in name)
+    return ("_" + safe[1:] if safe.startswith(".") else safe) + ".svg"
+
+
 def _write(figures: list[Figure], sections_of: Callable[[str, str], str], directory: Path) -> list[str]:
-    """部品ごとに断面をまとめて求め、図をdirectoryへ書く。"""
+    """部品ごとに断面を求め、図をdirectoryへ書く。断面はSECTIONS_PER_CALL枚ずつ求める。"""
     directory.mkdir(parents=True, exist_ok=True)
-    written = []
+    written: list[str] = []
     by_part: dict[str, list[Figure]] = {}
     for figure in figures:
         by_part.setdefault(figure.part, []).append(figure)
     for part, group in by_part.items():
-        planes = [plane for figure in group for plane in _planes(figure)]
-        sections = json.loads(sections_of(part, json.dumps(planes)))
-        for index, figure in enumerate(group):
-            path = directory / f"{figure.name}.svg"
-            path.write_text(render(figure, sections[3 * index:3 * index + 3]), encoding="utf-8")
-            written.append(path.name)
+        per_call = SECTIONS_PER_CALL // 3
+        for start in range(0, len(group), per_call):
+            batch = group[start:start + per_call]
+            planes = [plane for figure in batch for plane in _planes(figure)]
+            sections = json.loads(sections_of(part, json.dumps(planes)))
+            for index, figure in enumerate(batch):
+                name = _file_name(figure.name)
+                # 置き換えで名前が重なった場合は連番を付け、先の図を上書きしない。
+                suffix = 2
+                while name in written:
+                    name = _file_name(f"{figure.name}--{suffix}")
+                    suffix += 1
+                path = directory / name
+                path.write_text(render(figure, sections[3 * index:3 * index + 3]), encoding="utf-8")
+                written.append(name)
     return written
 
 
