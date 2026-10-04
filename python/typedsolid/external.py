@@ -16,6 +16,7 @@ import tempfile
 from typing import get_args
 
 from . import _native
+from .figures import write_stl_figures
 from .model import Direction, Policy
 
 __all__ = ["inspect_file", "main"]
@@ -39,12 +40,25 @@ def _stl_bytes(path: Path, pitch: float) -> bytes:
         return target.read_bytes()
 
 
-def inspect_file(path: str | Path, policy: Policy | None = None, target: str | None = None) -> list[dict]:
-    """ファイルを読み、4つの最終形状ruleの結果を返す。meshが閉じていなければ例外を送出する。"""
+def inspect_file(
+    path: str | Path,
+    policy: Policy | None = None,
+    target: str | None = None,
+    figures: str | Path | None = None,
+) -> list[dict]:
+    """ファイルを読み、4つの最終形状ruleの結果を返す。meshが閉じていなければ例外を送出する。
+
+    figuresを与えると、概観と検出箇所の断面図をそのdirectoryへ書く。
+    """
     path = Path(path)
     policy = policy or Policy()
+    target = target or path.stem
     stl = _stl_bytes(path, policy.voxel_mm)
-    return json.loads(_native.evaluate_stl_voxels(stl, target or path.stem, json.dumps(asdict(policy))))
+    policy_json = json.dumps(asdict(policy))
+    checks = json.loads(_native.evaluate_stl_voxels(stl, target, policy_json))
+    if figures is not None:
+        write_stl_figures(stl, policy_json, target, checks, figures)
+    return checks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,13 +72,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overhang-angle-deg", type=float, default=defaults.overhang_angle_deg)
     parser.add_argument("--bridge-max-mm", type=float, default=defaults.bridge_max_mm)
     parser.add_argument("--json", action="store_true", help="結果をJSONで出力する")
+    parser.add_argument("--figures", type=Path, help="概観と検出箇所の断面図を書くdirectory")
     args = parser.parse_args(argv)
     policy = replace(
         defaults, voxel_mm=args.voxel_mm, min_wall_mm=args.min_wall_mm, min_neck_mm=args.min_neck_mm,
         build_direction=args.build_direction, overhang_angle_deg=args.overhang_angle_deg,
         bridge_max_mm=args.bridge_max_mm,
     )
-    checks = inspect_file(args.path, policy)
+    checks = inspect_file(args.path, policy, figures=args.figures)
     if args.json:
         print(json.dumps(checks, ensure_ascii=False, indent=2))
     else:

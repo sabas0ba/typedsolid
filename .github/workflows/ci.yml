@@ -31,6 +31,19 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy -p typedsolid-core --all-targets --locked -- -D warnings
           cargo test -p typedsolid-core --locked
+      # 欠陥fixtureの断面図をCadQueryを使わずに再生成し、docsの図と一致することを確かめる。
+      # 検出箇所の表はjob summaryに書く。maturinだけを入れ、artifactのactionは使わない。
+      - name: Section figures
+        run: |
+          python3.12 -m venv .venv
+          .venv/bin/python -m pip install --require-hashes --only-binary :all: -r requirements-figures.lock
+          export PATH="$PWD/.work/toolchain/bin:$PWD/.venv/bin:$PATH"
+          export CARGO_HOME="$PWD/.work/cargo"
+          export PYO3_PYTHON="$PWD/.venv/bin/python"
+          export VIRTUAL_ENV="$PWD/.venv"
+          maturin develop --locked
+          python scripts/render-figures.py --output .work/figures-ci --defects-only --summary "$GITHUB_STEP_SUMMARY"
+          diff -r docs/assets/figures .work/figures-ci
 
   integration:
     if: github.event_name != 'pull_request'

@@ -260,6 +260,29 @@ power = connector_opening(
 
 すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
+`--figures DIR`を与えると、概観と検出箇所の断面図をDIRへ書く。
+
+## 検出箇所の図
+
+`export`は出力先の`figures/`に、部品ごとの概観と、failしたcheckの検出箇所を通る3断面のSVGを書く。report.jsonの各checkの`locations`は、図と同じ検出箇所のboxである。
+
+```python
+from typedsolid.cadquery import export
+
+try:
+    export(model, ".work/case")              # 合格なら .work/case/figures/ に概観図
+except ValueError as error:
+    print(error.__notes__)                   # 拒否なら .work/case.rejected/ に report.json と図
+```
+
+拒否した場合、出力先は作らず、reportと図だけを`<出力先>.rejected/`に書く。図が不要なら`export(..., figures=False)`とする。欠陥fixtureの図は、CadQueryを使わずRust coreの検査だけから次で描ける。
+
+```bash
+.venv/bin/python scripts/render-figures.py --output .work/figures
+```
+
+図の読み方と各ruleの検出箇所の定義は [設計](design.md#検出箇所と図) を参照する。
+
 ## slicerとの突合
 
 `support_free`は幾何のみに基づく近似であり、ノズル径、層厚、冷却、材料を含まない。実機で用いる場合は、出力したSTLをslicerへ読み込み、同じ印刷姿勢でサポート生成の要否を比較する。
@@ -287,6 +310,8 @@ Rustのtransitive依存更新も`Cargo.lock`を差分レビューし、auditに�
 ## CI方針
 
 PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テストを含む検査を行う。CadQueryはVTK等の大きな依存を持つため、通常のPRごとに取得・統合buildを強制しない。初回PRはローカルの統合テスト結果を添付する。Windows/macOS jobと自動publishは追加しない。
+
+core検査は、欠陥fixtureの断面図をCadQueryを使わずに再生成し、`docs/assets/figures/`の図と一致することも確かめる。Python環境にはmaturinだけを`requirements-figures.lock`から入れる。検出箇所の表はjob summaryに書く。図を変える変更では`scripts/render-figures.py --output docs/assets/figures --defects-only`で再生成してcommitし、PR本文から参照する。artifactのupload用actionは依存を増やさないため使わない。
 
 ## 打ち切りと再開
 

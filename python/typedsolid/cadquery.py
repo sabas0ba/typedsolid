@@ -28,6 +28,7 @@ from OCP.gp import gp_Vec
 
 from . import _native, worker
 from .cache import Cache
+from .figures import write_model_figures
 from .model import Model
 
 Progress = Callable[[str], None]
@@ -42,6 +43,9 @@ EMPTY_VOLUME_TOLERANCE = 1e-12
 EXIT_MARGIN_MM = 2.0
 # exportの既定の制限時間。単位は秒。作例はcacheなしで約12秒で終わる。
 DEFAULT_TIMEOUT_S = 600.0
+# 図を書くdirectoryと、出力を拒否した場合に残すfile。
+FIGURES_DIR = "figures"
+REJECTED_FILES = ("report.json", FIGURES_DIR)
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
     "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit", "fastener_release",
@@ -736,12 +740,27 @@ def _reject_unless_allowed(report: dict) -> None:
     raise ValueError("export blocked: " + json.dumps(failures, ensure_ascii=False))
 
 
-def _export_staged(progress: Progress, model_json: str, staging: str, cache_dir: str | None) -> dict:
+def _reject_with_figures(report: dict, root: Path, figure_names: list[str]) -> None:
+    """出力を拒否する場合、reportと図をstagingに残してから送出する。親がREJECTED_FILESだけを移す。"""
+    if _native.export_allowed(json.dumps(report)):
+        return
+    rejected = {"schema_version": 1, "units": "mm", "rejected": True, "report": report, "figures": figure_names}
+    (root / "report.json").write_text(json.dumps(rejected, indent=2) + "\n", encoding="utf-8")
+    _reject_unless_allowed(report)
+
+
+def _export_staged(
+    progress: Progress, model_json: str, staging: str, cache_dir: str | None, figures: bool = True,
+) -> dict:
     """検査し、stagingへ出力してmanifestを返す。子processでも同一processでも同じ処理を通る。"""
     result = _build(model_json, _open(cache_dir), progress)
-    _reject_unless_allowed(result.report)
-    tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     root = Path(staging)
+    figure_names: list[str] = []
+    if figures:
+        progress("writing figures")
+        figure_names = write_model_figures(result.model_json, result.report["checks"], root / FIGURES_DIR)
+    _reject_with_figures(result.report, root, figure_names)
+    tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     files = {}
     mesh_checks: list[dict] = []
     for part_id, shape in result.shapes.items():
@@ -759,7 +778,7 @@ def _export_staged(progress: Progress, model_json: str, staging: str, cache_dir:
     # meshは書き出し後にしか検査できない。failなら呼び出し側がstagingごと破棄する。
     report = copy.deepcopy(result.report)
     report["checks"] = [c for c in report["checks"] if c["rule"] not in MESH_RULES] + mesh_checks
-    _reject_unless_allowed(report)
+    _reject_with_figures(report, root, figure_names)
     # 保存bytesとdigestを同一の値から得る。model.jsonの再hashで照合できるようにする。
     model_bytes = (result.model_json + "\n").encode("utf-8")
     (root / "model.json").write_bytes(model_bytes)
@@ -768,11 +787,27 @@ def _export_staged(progress: Progress, model_json: str, staging: str, cache_dir:
         "schema_version": 1, "units": "mm", "cadquery": version("cadquery"),
         "cadquery_ocp": version("cadquery-ocp"),
         "model_sha256": hashlib.sha256(model_bytes).hexdigest(),
-        "files_sha256": files, "report": report,
+        "files_sha256": files, "report": report, "figures": figure_names,
         "notice": "Only listed checks were evaluated. This is not a printability or structural safety certification.",
     }
     (root / "report.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+
+def _keep_rejected(staging: Path, target: Path, error: Exception) -> None:
+    """検査で拒否したstagingから、reportと図だけを隣のdirectoryへ移す。"""
+    report = staging / "report.json"
+    if not report.exists() or not json.loads(report.read_text(encoding="utf-8")).get("rejected"):
+        return
+    rejected = target.with_name(target.name + ".rejected")
+    if rejected.exists():
+        error.add_note(f"report and figures were not kept: {rejected} already exists")
+        return
+    rejected.mkdir()
+    for name in REJECTED_FILES:
+        if (staging / name).exists():
+            (staging / name).rename(rejected / name)
+    error.add_note(f"report and figures: {rejected}")
 
 
 def export(
@@ -783,12 +818,17 @@ def export(
     cache_dir: str | Path | None = None,
     progress: Progress | None = None,
     isolated: bool = True,
+    figures: bool = True,
 ) -> dict:
     """モデルを検査し、新規ディレクトリへ出力する。既存成果物は上書きしない。
 
     既定では子processで実行し、timeout_sを超えるとWorkerTimeoutを送出する。
     isolated=Falseは同一processで実行し、timeout_sを使わない。backendを
     debuggerで追う場合に使う。いずれの経路でも、失敗時はdirectoryを作らない。
+
+    figuresが真なら、部品の概観と検出箇所の断面図を`figures/`に書く。検査で出力を
+    拒否した場合は、reportと図だけを`<directory>.rejected/`に残し、例外にその場所を
+    注記する。STL/STEPは残さない。
     """
     target = Path(directory)
     if target.exists():
@@ -798,13 +838,17 @@ def export(
     staging = Path(tempfile.mkdtemp(prefix=".typedsolid-", dir=target.parent))
     cache = None if cache_dir is None else str(cache_dir)
     try:
-        if isolated:
-            manifest = worker.run(
-                _export_staged, model.to_json(), str(staging), cache,
-                timeout_s=timeout_s, progress=progress,
-            )
-        else:
-            manifest = _export_staged(progress or _silent, model.to_json(), str(staging), cache)
+        try:
+            if isolated:
+                manifest = worker.run(
+                    _export_staged, model.to_json(), str(staging), cache, figures,
+                    timeout_s=timeout_s, progress=progress,
+                )
+            else:
+                manifest = _export_staged(progress or _silent, model.to_json(), str(staging), cache, figures)
+        except Exception as error:
+            _keep_rejected(staging, target, error)
+            raise
         # mkdirは存在判定と作成を一体で行う。競合時に他者の出力を置換しない。
         target.mkdir()
         for path in staging.iterdir():

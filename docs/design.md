@@ -92,6 +92,36 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 `valid_solid`の空判定には接触判定の許容差を流用せず、1e-12 mm³を下限とする。最小box寸法0.001 mmの立方体は1e-9 mm³であり、接触許容差を空判定に使うと正当な最小形状を無効と扱うためである。
 
+## 検出箇所と図
+
+failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で持つ。passのcheckと、位置を持たないruleのcheckでは省略する。1つのcheckにつき大きい順に20件までとし、総数はmessageの末尾 (`N location(s)`) に書く。
+
+| rule | 検出箇所 |
+| --- | --- |
+| `final_wall_thickness` | 薄肉と判定した領域の連結成分ごとの外接box |
+| `neck_section` | erosionで残った成分から材料の内部を幅優先で同時に広げ、異なる成分の前線が出会うcellの連結成分。断面の幅の半分だけ広げる。材料で繋がらない成分は前線が出会わないため、最大の成分以外を示す。材料が残らない場合は部品全体 |
+| `closed_cavity` | 外部に通じない空cellの連結成分ごとの外接box |
+| `support_free` | 支持もbridgeも得られないcellの連結成分ごとの外接box |
+| `connector_fit` | 開口と、掃引前のプラグのbox |
+
+干渉、掃引、分解、ネジ固定、snap fitの検出箇所は、OCCTのBooleanの結果から求めるため後続とする。
+
+**断面図**: `figures/`に、部品ごとの概観と、failしたcheckの検出箇所 (各checkの大きい順に3件) を通るx、y、zの3断面をSVGで書く。図は判定と同じvoxel格子とmaskから描くため、塗った箇所は判定の根拠そのものである。格子より細かい形状は図にも現れない。凡例の色は、赤が薄肉、紫が細い接続部、青が未支持、橙が閉空洞で、灰色が材料、破線が検出箇所のboxである。断面はRust coreが各cellのbit (材料、薄肉、接続部、未支持、閉空洞) を返し、PythonがSVGに描く。SVGの生成は標準libraryだけで行い、CadQueryに依存しない。
+
+| 欠陥 | 図 |
+| --- | --- |
+| 薄肉 (`thin_wall`) | ![thin wall](assets/figures/thin_wall/enclosure--final_wall_thickness--1.svg) |
+| 細い接続部 (`narrow_neck`) | ![narrow neck](assets/figures/narrow_neck/enclosure--neck_section--1.svg) |
+| 切り離された部分 (`severed_corner`) | ![severed corner](assets/figures/severed_corner/enclosure--neck_section--1.svg) |
+| 支持のない張り出し (`cantilever`) | ![cantilever](assets/figures/cantilever/enclosure--support_free--1.svg) |
+| 閉空洞 (`sealed_void`) | ![sealed void](assets/figures/sealed_void/enclosure--closed_cavity--1.svg) |
+
+図は`scripts/render-figures.py --output docs/assets/figures --defects-only`で再生成する。
+
+**出力の拒否と図**: `export`は検査で出力を拒否した場合も出力先を作らない。代わりに、reportと図だけを隣の`<出力先>.rejected/`に書き、例外にその場所を注記する。STL/STEPは書かない。`<出力先>.rejected/`が既にある場合は置き換えず、その旨を注記する。`export(..., figures=False)`で図を省ける。
+
+第三者の筐体の図は、形状の派生画像となるため文書に載せない。利用者が手元で`typedsolid.external`の`--figures`を使って確かめる。
+
 ## 着脱の検査
 
 分解stepごとに、動かす部品の最終形状を区間ごとに掃引し、残っている部品との共通体積を求める。判定はOCCTのBooleanで行う。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。

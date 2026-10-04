@@ -42,4 +42,4 @@ auditはinstall前の調査であり、通常のローカルtestとCI unit test�
 
 PR #2 の作業時に、既存のRust 21 package / Python 45 distributionを変更せず、`scripts/audit-dependencies.py`でOSVと公開日時を再照合した。全66件に該当advisoryはなく、全版が既存cutoff (2026-08-29) を満たした。あわせて[CadQuery 2.8.0](https://pypi.org/project/cadquery/2.8.0/)・[maturin 1.15.0](https://pypi.org/project/maturin/1.15.0/)の配布情報と、[CadQuery security](https://github.com/CadQuery/cadquery/security)・[maturin security](https://github.com/PyO3/maturin/security)を再確認した。確認した範囲で導入停止に該当する公開情報はなかった。依存数と保守集中の評価は上記の調査を引き継ぐ。全推移依存のmaintainer権限や未知の侵害を保証するものではない。
 
-照合の対象は2026-09-13時点のlockであり、以後`Cargo.lock`と`requirements-dev.lock`は変更していない。OSVのデータは時間経過で変わるため、この記録は現在の無該当を示さない。
+照合の対象は2026-09-13時点のlockであり、以後`Cargo.lock`と`requirements-dev.lock`は変更していない。`requirements-figures.lock`は、CIのcore検査で図を再生成するためにmaturinだけを持つlockである。`requirements-dev.lock`と同じ`uv pip compile`の条件 (`--exclude-newer 2026-08-29`) で生成し、maturin 1.15.0の配布hashは`requirements-dev.lock`と一致する。新たな依存は加えていない。OSVのデータは時間経過で変わるため、この記録は現在の無該当を示さない。
