@@ -792,9 +792,17 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
 
 
 def write_projection_figures(result: Build, directory: str | Path, *, overview: bool = True) -> list[str]:
-    """buildの結果について、組立状態の投影図をdirectoryへ書き、file名を返す。keepoutの箱を重ねる。"""
+    """buildの結果について、組立状態の投影図をdirectoryへ書き、file名を返す。keepoutの箱を重ねる。
+
+    cutで材料が残らない部品は外接boxを持たず、隠線処理できないため描かない。
+    描ける部品がなければ何も書かない。
+    """
+    shapes = {
+        part_id: shape for part_id, shape in result.shapes.items()
+        if any(abs(solid.Volume()) > EMPTY_VOLUME_TOLERANCE for solid in shape.Solids())
+    }
     keepouts = [_aabb(keepout["shape"]) for keepout in json.loads(result.model_json)["keepouts"]]
-    return write_projections(result.shapes, result.report["checks"], directory, keepouts, overview)
+    return write_projections(shapes, result.report["checks"], directory, keepouts, overview)
 
 
 def _reject_unless_allowed(report: dict) -> None:
@@ -824,10 +832,9 @@ def _export_staged(
         progress("writing figures")
         figure_names = write_model_figures(result.model_json, result.report["checks"], root / FIGURES_DIR)
         # backendが例外で止まった場合は形状がなく、投影図を描かない。
-        if result.shapes:
-            progress("writing projections")
-            projections = write_projection_figures(result, root / FIGURES_DIR / PROJECTION_DIR)
-            figure_names += [f"{PROJECTION_DIR}/{name}" for name in projections]
+        progress("writing projections")
+        projections = write_projection_figures(result, root / FIGURES_DIR / PROJECTION_DIR)
+        figure_names += [f"{PROJECTION_DIR}/{name}" for name in projections]
     _reject_with_figures(result.report, root, figure_names)
     tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     files = {}

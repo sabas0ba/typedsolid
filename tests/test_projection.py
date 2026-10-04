@@ -1,5 +1,6 @@
 """OCCTで判定するruleの検出箇所と投影図。部品間の欠陥fixtureで、判定、箇所、図を確かめる。"""
 
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
@@ -12,8 +13,8 @@ import cadquery as cq
 
 from examples.assembly_defects import ASSEMBLY_DEFECTS, lid_overlap, post_in_keepout
 from examples.defects import baseline
-from typedsolid import _native
-from typedsolid.cadquery import _check, build, export
+from typedsolid import Box, Feature, Model, Part, _native
+from typedsolid.cadquery import _check, build, export, write_projection_figures
 from typedsolid.projection import LOCATION_STYLE, VIEWS, Projection, write_projections
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "render-projections.py"
@@ -121,6 +122,28 @@ class ProjectionTests(TemporaryDirectoryTest):
 
 
 class ExportTests(TemporaryDirectoryTest):
+    def test_part_without_material_still_leaves_the_rejection_report(self):
+        """cutで材料が残らない部品は投影できない。投影図を省き、reportと断面図は残す。"""
+        removed = Model((Part("block", (
+            Feature("body", Box((0, 0, 0), (10, 10, 10))),
+            Feature("remove", Box((-1, -1, -1), (11, 11, 11)), operation="cut"),
+        )),))
+        with self.assertRaises(ValueError):
+            export(removed, self.root / "empty", isolated=False)
+        report = json.loads((self.root / "empty.rejected" / "report.json").read_text())
+        self.assertFalse([name for name in report["figures"] if name.startswith("projection/")])
+        self.assertIn("block--overview.svg", report["figures"])
+
+    def test_part_without_material_is_left_out_of_the_assembly_projection(self):
+        empty = Part("ghost", (
+            Feature("body", Box((20, 0, 0), (25, 5, 5))),
+            Feature("remove", Box((19, -1, -1), (26, 6, 6)), operation="cut"),
+        ))
+        model = replace(lid_overlap(), parts=(*lid_overlap().parts, empty))
+        names = write_projection_figures(build(model), self.root)
+        self.assertIn("overview.svg", names)
+
+
     def test_export_lists_the_projection_overview(self):
         manifest = export(baseline(), self.root / "ok", isolated=False)
         self.assertIn("projection/overview.svg", manifest["figures"])
