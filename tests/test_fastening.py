@@ -54,6 +54,14 @@ def fastener_checks(result) -> list[dict]:
     return [c for c in result.report["checks"] if c["rule"] == "fastener_fit"]
 
 
+def locations(result, aspect: str) -> list[dict]:
+    return next(c for c in fastener_checks(result) if c["target"] == f"corner/{aspect}")["locations"]
+
+
+def box(low, high) -> list[dict]:
+    return [{"min": list(low), "max": list(high)}]
+
+
 def failing_aspects(result) -> set[str]:
     return {c["target"].split("/")[1] for c in fastener_checks(result) if c["status"] != "pass"}
 
@@ -184,18 +192,24 @@ class FastenerFitTests(unittest.TestCase):
     def test_short_screw_lacks_engagement(self):
         result = build(model(fixing(replace(M2, length_mm=5.0))))
         self.assertEqual(failing_aspects(result), {"engagement"})
+        # 検出箇所は要求されるかかり長さ4 mmの範囲のネジ。
+        self.assertEqual(locations(result, "engagement"), box((14, 9, 6), (16, 11, 10)))
 
     def test_thin_boss_fails_the_wall(self):
         result = build(model(fixing(boss_mm=4.0)))
         self.assertEqual(failing_aspects(result), {"boss_wall"})
+        # 下穴1.6 mmに肉1.5 mmを足した輪帯のうち、径4 mmのbossの外側。
+        self.assertEqual(locations(result, "boss_wall"), box((12.7, 7.7, 4), (17.3, 12.3, 10)))
 
     def test_missing_through_hole_blocks_the_screw(self):
         result = build(model(fixing(), clamp_features=()))
         self.assertEqual(failing_aspects(result), {"through"})
+        self.assertEqual(locations(result, "through"), box((13.8, 8.8, 10), (16.2, 11.2, 12)))
 
     def test_through_hole_wider_than_the_head_has_no_bearing(self):
         result = build(model(fixing(), clamp_features=(hole("wide", "z", (15, 10), 4.0, (9.5, 12.5)),)))
         self.assertEqual(failing_aspects(result), {"bearing"})
+        self.assertEqual(locations(result, "bearing"), box((13.1, 8.1, 11.5), (16.9, 11.9, 12)))
 
     def test_shallow_bore_blocks_the_tip(self):
         fix = fixing()
@@ -203,6 +217,7 @@ class FastenerFitTests(unittest.TestCase):
         shallow = (boss, hole("corner_bore", "z", (15, 10), 1.6, (6.0, 10.5)))
         result = build(model(fix, base_features=shallow))
         self.assertEqual(failing_aspects(result), {"clear_tip"})
+        self.assertEqual(locations(result, "clear_tip"), box((14.2, 9.2, 4), (15.8, 10.8, 6)))
 
     def test_bore_as_wide_as_the_thread_engages_nothing(self):
         fix = fixing()

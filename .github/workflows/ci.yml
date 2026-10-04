@@ -72,3 +72,10 @@ jobs:
           maturin develop --locked
           python -m unittest discover -s tests -v
           python examples/board_tray.py --output .work/board-tray
+      # 部品間の欠陥fixtureの投影図を再生成し、docsの図と一致することを確かめる。
+      # 隠線処理にCadQueryを使うため、mainへのpushでだけ走るこのjobで照合する。
+      - name: Projection figures
+        run: |
+          export PATH="$PWD/.work/toolchain/bin:$PWD/.venv/bin:$PATH"
+          python scripts/render-projections.py --output .work/projections-ci
+          diff -r docs/assets/projections .work/projections-ci

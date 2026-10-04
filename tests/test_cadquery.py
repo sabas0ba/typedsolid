@@ -44,6 +44,10 @@ class CadQueryTests(unittest.TestCase):
         result = build(add_feature(block(), Feature("island", Box((20, 0, 0), (25, 5, 5)))))
         self.assertFalse(result.export_allowed)
         self.assertTrue(failures(result, "single_solid"))
+        # solidごとの外接boxを体積の大きい順に並べる。
+        self.assertEqual(failures(result, "single_solid")[0]["locations"], [
+            {"min": [0, 0, 0], "max": [10, 10, 10]}, {"min": [20, 0, 0], "max": [25, 5, 5]},
+        ])
 
     def test_cut_can_disconnect_final_geometry(self):
         result = build(add_feature(block(), Feature("slot", Box((4, -1, -1), (6, 11, 11)), operation="cut")))

@@ -30,8 +30,11 @@ from . import _native, worker
 from .cache import Cache
 from .figures import write_model_figures
 from .model import Model
+from .projection import write_projections
 
 Progress = Callable[[str], None]
+# 検出箇所と、並べ替えに使う体積の組。
+Located = Sequence[tuple[float, dict]]
 
 # OCCTの境界演算誤差を吸収する接触判定の絶対体積許容差。単位はmm³。
 VOLUME_TOLERANCE = 1e-7
@@ -45,6 +48,8 @@ EXIT_MARGIN_MM = 2.0
 DEFAULT_TIMEOUT_S = 600.0
 # 図を書くdirectoryと、出力を拒否した場合に残すfile。
 FIGURES_DIR = "figures"
+# 投影図を置くfigures/の下のdirectory。断面図のfile名はすべて`.svg`で終わり、この名前と重ならない。
+PROJECTION_DIR = "projection"
 REJECTED_FILES = ("report.json", FIGURES_DIR)
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
@@ -59,6 +64,8 @@ FILL_TOLERANCE = 1e-6
 LENGTH_TOLERANCE = 1e-6
 # face法線と移動方向の内積をこれ以下とみなす面は、移動方向と平行として扱う。
 PARALLEL_TOLERANCE = 1e-9
+# 検出箇所の座標を丸める小数点以下の桁数。単位はmm。
+LOCATION_DIGITS = 6
 # 出力表現の検査であり、STLを書き出すexportでのみ評価できる。
 MESH_RULES = ("mesh_manifold", "mesh_volume")
 # IRから直接rasterizeして判定する。backendのtopologyに依存しない。
@@ -316,15 +323,16 @@ def _disassembly_checks(
         offset = [0.0, 0.0, 0.0]
         segments: list[tuple[str, float]] = []
 
-        def sweep_overlaps(direction: str, distance: float) -> dict[str, float]:
+        def sweep_overlaps(direction: str, distance: float) -> dict[str, tuple[float, Located]]:
             axis = AXES.index(direction[-1])
             signed = distance if direction.startswith("plus") else -distance
             start = moving_shape.translate(cq.Vector(*offset))
             expanded = _laterally_expanded(start, axis, clearance, features, offset)
             region = _swept(expanded, axis, signed, _split_coordinates(features, axis, offset))
             offset[axis] += signed
-            return {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
+            return {name: _intersection(region, obstacle) for name, obstacle in obstacles.items()}
 
+        # 検出箇所は掃引領域と障害物の共通部分であり、障害物側の組立位置にある。
         for index, segment in enumerate(step["path"]):
             direction = segment["direction"]
             distance = segment["distance_mm"]
@@ -334,8 +342,8 @@ def _disassembly_checks(
             overlaps = sweep_overlaps(direction, distance)
             if not overlaps:
                 checks.append(_check("disassembly_path", f"{label}/{index}", True, f"{direction} {distance:.6g} mm; no remaining parts or keepouts"))
-            for name, overlap in overlaps.items():
-                checks.append(_check("disassembly_path", f"{label}/{index}/{name}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm with fit clearance {clearance} mm: overlap {overlap:.9g} mm³"))
+            for name, (overlap, located) in overlaps.items():
+                checks.append(_check("disassembly_path", f"{label}/{index}/{name}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm with fit clearance {clearance} mm: overlap {overlap:.9g} mm³", located))
 
         # 最後の区間の方向へ外まで動かし続けられれば、部品は外れている。
         last = step["path"][-1]
@@ -344,12 +352,13 @@ def _disassembly_checks(
         else:
             continuation = _exit_distance(_add_bounds(moving_parts, offset, carried), remaining_bounds, last["direction"])
             overlaps = sweep_overlaps(last["direction"], continuation)
-            blocking = {part_id: overlap for part_id, overlap in overlaps.items() if overlap > VOLUME_TOLERANCE}
+            blocking = {part_id: item for part_id, item in overlaps.items() if item[0] > VOLUME_TOLERANCE}
             message = (
                 f"continuing {continuation:.6g} mm along {last['direction']} "
-                + ("is clear" if not blocking else "is blocked by " + ", ".join(f"{p} ({v:.9g} mm³)" for p, v in blocking.items()))
+                + ("is clear" if not blocking else "is blocked by " + ", ".join(f"{p} ({v:.9g} mm³)" for p, (v, _) in blocking.items()))
             )
-            checks.append(_check("disassembly_separation", label, not blocking, message))
+            located = [item for _, boxes in blocking.values() for item in boxes]
+            checks.append(_check("disassembly_separation", label, not blocking, message, located))
 
         for snap in releasing:
             checks.append(_retention_check(snap, shapes, parts, moving_ids, segments))
@@ -363,7 +372,10 @@ def _retention_check(
     snap: _Snap, shapes: dict[str, cq.Shape], parts: dict[str, dict], moving_ids: list[str],
     segments: list[tuple[str, float]],
 ) -> dict:
-    """たわませないフックとmateの相対運動がstepの経路で干渉する。干渉しなければ保持していない。"""
+    """たわませないフックとmateの相対運動がstepの経路で干渉する。干渉しなければ保持していない。
+
+    保持しない場合の検出箇所は、組立位置にあるフックである。
+    """
     mate_id = snap.data["mate"]
     # Rust coreの検証により、stepはpartとmateの一方だけを動かす。
     if snap.data["part"] in moving_ids:
@@ -381,6 +393,7 @@ def _retention_check(
     return _check(
         "snap_fit", f"{snap.data['id']}/retention", total > VOLUME_TOLERANCE,
         f"undeflected hook against {mate_id} along step {snap.data['step']}: overlap {total:.9g} mm³",
+        _boxes(snap.hook),
     )
 
 
@@ -424,7 +437,10 @@ def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], pr
         expected = sum(abs(s.Volume()) for s in boxes.Solids())
         filled = _overlap(boxes, shapes[part_id])
         passed = expected - filled <= max(VOLUME_TOLERANCE, FILL_TOLERANCE * expected)
-        checks.append(_check("snap_fit", f"{snap_id}/beam", passed, f"{filled / expected:.6%} of the beam and hook boxes is material of {part_id}"))
+        checks.append(_check(
+            "snap_fit", f"{snap_id}/beam", passed, f"{filled / expected:.6%} of the beam and hook boxes is material of {part_id}",
+            () if passed else _missing(boxes, shapes[part_id]),
+        ))
 
         axis = AXES.index(snap.data["deflection"][-1])
         signed = snap.data["deflection_mm"] if snap.data["deflection"].startswith("plus") else -snap.data["deflection_mm"]
@@ -439,13 +455,14 @@ def _snap_checks(data: dict, shapes: dict[str, cq.Shape], snaps: list[_Snap], pr
         for keepout in data["keepouts"]:
             if keepout.get("attached_to") in (None, *present):
                 obstacles[f"keepout:{keepout['id']}"] = _solid(keepout["shape"])
-        blocking = {name: _overlap(region, obstacle) for name, obstacle in obstacles.items()}
-        blocking = {name: overlap for name, overlap in blocking.items() if overlap > VOLUME_TOLERANCE}
+        blocking = {name: _intersection(region, obstacle) for name, obstacle in obstacles.items()}
+        blocking = {name: item for name, item in blocking.items() if item[0] > VOLUME_TOLERANCE}
         message = (
             f"deflecting {snap.data['deflection_mm']} mm along {snap.data['deflection']} before {snap.data['step']} "
-            + ("is clear" if not blocking else "hits " + ", ".join(f"{name} ({overlap:.9g} mm³)" for name, overlap in blocking.items()))
+            + ("is clear" if not blocking else "hits " + ", ".join(f"{name} ({overlap:.9g} mm³)" for name, (overlap, _) in blocking.items()))
         )
-        checks.append(_check("snap_fit", f"{snap_id}/deflection_space", not blocking, message))
+        located = [item for _, boxes in blocking.values() for item in boxes]
+        checks.append(_check("snap_fit", f"{snap_id}/deflection_space", not blocking, message, located))
     return checks
 
 
@@ -480,8 +497,8 @@ def _sweep_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress) -
         if not present:
             checks.append(_check("access_clearance", sweep["id"], True, f"{direction} {distance:.6g} mm after {state}; no remaining parts"))
         for part_id in present:
-            overlap = _overlap(region, shapes[part_id])
-            checks.append(_check("access_clearance", f"{sweep['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm after {state}: overlap {overlap:.9g} mm³"))
+            overlap, located = _intersection(region, shapes[part_id])
+            checks.append(_check("access_clearance", f"{sweep['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"{direction} {distance:.6g} mm after {state}: overlap {overlap:.9g} mm³", located))
     return checks
 
 
@@ -513,15 +530,16 @@ def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress
             }
             return _solid(shape)
 
-        def filled(inner: float, outer: float, start: float, end: float, material: cq.Shape) -> tuple[bool, float]:
-            """輪帯のうち材料で埋まっている割合。"""
+        def filled(inner: float, outer: float, start: float, end: float, material: cq.Shape) -> tuple[bool, float, Located]:
+            """輪帯が材料で埋まっているか、埋まっている割合、埋まっていない部分の外接box。"""
             ring = cylinder(outer, start, end).cut(cylinder(inner, start, end))
             expected = math.pi * (outer**2 - inner**2) / 4.0 * abs(end - start)
             present = _overlap(ring, material)
-            return expected - present <= max(VOLUME_TOLERANCE, FILL_TOLERANCE * expected), present / expected
+            passed = expected - present <= max(VOLUME_TOLERANCE, FILL_TOLERANCE * expected)
+            return passed, present / expected, () if passed else _missing(ring, material)
 
-        def record(aspect: str, passed: bool, message: str) -> None:
-            checks.append(_check("fastener_fit", f"{fastener_id}/{aspect}", passed, message))
+        def record(aspect: str, passed: bool, message: str, located: Located = ()) -> None:
+            checks.append(_check("fastener_fit", f"{fastener_id}/{aspect}", passed, message, located))
 
         if not fastener["clamp"]:
             for aspect in ("through", "bearing"):
@@ -531,13 +549,14 @@ def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress
             for part_id in fastener["clamp"][1:]:
                 clamp = clamp.fuse(shapes[part_id])
             through = fastener["through_mm"]
-            overlap = _overlap(cylinder(through, seat, joint), clamp)
-            record("through", overlap <= VOLUME_TOLERANCE, f"clamp material inside the {through} mm through hole: {overlap:.9g} mm³")
+            overlap, located = _intersection(cylinder(through, seat, joint), clamp)
+            record("through", overlap <= VOLUME_TOLERANCE, f"clamp material inside the {through} mm through hole: {overlap:.9g} mm³", located)
             depth = min(BEARING_DEPTH_MM, sign * (joint - seat))
-            passed, fraction = filled(through, screw["head_mm"], seat, seat + sign * depth, clamp)
-            record("bearing", passed, f"{fraction:.6%} of the ring between {through} and {screw['head_mm']} mm, {depth:.6g} mm under the head, is clamp material")
+            passed, fraction, located = filled(through, screw["head_mm"], seat, seat + sign * depth, clamp)
+            record("bearing", passed, f"{fraction:.6%} of the ring between {through} and {screw['head_mm']} mm, {depth:.6g} mm under the head, is clamp material", located)
 
         reach = sign * (tip - joint)
+        obstructions: list[tuple[float, dict]] = []
         if anchor["kind"] == "self_tapping":
             bore = anchor["pilot_mm"]
             span = reach
@@ -545,7 +564,7 @@ def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress
                 area = math.pi * (major**2 - bore**2) / 4.0
                 ring = cylinder(major, joint, tip).cut(cylinder(bore, joint, tip))
                 engaged = _overlap(ring, base) / area
-                blocked = _overlap(cylinder(bore, joint, tip), base)
+                blocked, obstructions = _intersection(cylinder(bore, joint, tip), base)
             else:
                 engaged, blocked = 0.0, 0.0
             engagement = f"thread between {bore} and {major} mm engages {engaged:.6g} mm of base over a reach of {reach:.6g} mm"
@@ -554,17 +573,21 @@ def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress
             span = length
             engaged = min(max(reach, 0.0), length)
             bottom = joint + sign * length
-            blocked = _overlap(cylinder(bore, joint, bottom), base)
+            blocked, obstructions = _intersection(cylinder(bore, joint, bottom), base)
             if reach > length:
-                blocked += _overlap(cylinder(major, bottom, tip), base)
+                beyond, located = _intersection(cylinder(major, bottom, tip), base)
+                blocked += beyond
+                obstructions = [*obstructions, *located]
             engagement = f"screw reaches {reach:.6g} mm past the joint into a {length} mm insert; engages {engaged:.6g} mm"
         required = fastener["min_engagement_mm"]
-        record("engagement", engaged >= required - LENGTH_TOLERANCE, f"{engagement}; required {required} mm")
-        record("clear_tip", blocked <= VOLUME_TOLERANCE, f"base material in the bore and the screw path: {blocked:.9g} mm³")
+        # かかり長さの不足は、要求されるかかり長さの範囲のネジを検出箇所とする。
+        engaging = cylinder(major, joint, joint + sign * required)
+        record("engagement", engaged >= required - LENGTH_TOLERANCE, f"{engagement}; required {required} mm", _boxes(engaging))
+        record("clear_tip", blocked <= VOLUME_TOLERANCE, f"base material in the bore and the screw path: {blocked:.9g} mm³", obstructions)
         wall = fastener["min_boss_wall_mm"]
         if span > 0.0:
-            passed, fraction = filled(bore, bore + 2.0 * wall, joint, joint + sign * span, base)
-            record("boss_wall", passed, f"{fraction:.6%} of a {wall} mm wall around the {bore} mm bore over {span:.6g} mm is base material")
+            passed, fraction, located = filled(bore, bore + 2.0 * wall, joint, joint + sign * span, base)
+            record("boss_wall", passed, f"{fraction:.6%} of a {wall} mm wall around the {bore} mm bore over {span:.6g} mm is base material", located)
         else:
             checks.append({
                 "rule": "fastener_fit", "target": f"{fastener_id}/boss_wall", "status": "not_evaluated",
@@ -573,18 +596,52 @@ def _fastener_checks(data: dict, shapes: dict[str, cq.Shape], progress: Progress
     return checks
 
 
-def _check(rule: str, target: str, passed: bool, message: str) -> dict:
-    return {"rule": rule, "target": target, "status": "pass" if passed else "fail", "message": message}
+def _check(rule: str, target: str, passed: bool, message: str, located: Located = ()) -> dict:
+    """checkを作る。failなら検出箇所を体積の大きい順にMAX_LOCATIONS件まで持たせ、総数をmessageに書く。"""
+    check = {"rule": rule, "target": target, "status": "pass" if passed else "fail", "message": message}
+    if not passed and located:
+        ordered = sorted(located, key=lambda item: -item[0])
+        check["locations"] = [location for _, location in ordered[:_native.MAX_LOCATIONS]]
+        check["message"] += f"; {len(ordered)} location(s)"
+    return check
 
 
-def _overlap(a: cq.Shape, b: cq.Shape) -> float:
+def _boxes(shape: cq.Shape) -> Located:
+    """solidごとの体積と外接box。体積が無視できるsolidは除く。
+
+    座標はOCCTの許容差による端数を除くため、LOCATION_DIGITS桁に丸める。
+    """
+    located = []
+    for solid in shape.Solids():
+        volume = abs(solid.Volume())
+        if volume <= EMPTY_VOLUME_TOLERANCE:
+            continue
+        box = solid.BoundingBox()
+        located.append((volume, {
+            "min": [round(v, LOCATION_DIGITS) for v in (box.xmin, box.ymin, box.zmin)],
+            "max": [round(v, LOCATION_DIGITS) for v in (box.xmax, box.ymax, box.zmax)],
+        }))
+    return located
+
+
+def _intersection(a: cq.Shape, b: cq.Shape) -> tuple[float, Located]:
+    """共通部分の体積と、共通部分のsolidごとの外接box。"""
     common = a.intersect(b)
     if not common.isValid():
         raise ValueError("intersection returned invalid topology")
     volume = sum(abs(s.Volume()) for s in common.Solids())
     if not math.isfinite(volume):
         raise ValueError("intersection returned non-finite volume")
-    return volume
+    return volume, _boxes(common)
+
+
+def _overlap(a: cq.Shape, b: cq.Shape) -> float:
+    return _intersection(a, b)[0]
+
+
+def _missing(region: cq.Shape, material: cq.Shape) -> Located:
+    """regionのうちmaterialで埋まっていない部分の外接box。材料の不足を示すcheckのfail時にだけ求める。"""
+    return _boxes(region.cut(material))
 
 
 @dataclass(frozen=True)
@@ -689,7 +746,8 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
             volume = sum(abs(s.Volume()) for s in solids)
             valid = bool(solids) and shape.isValid() and math.isfinite(volume) and volume > EMPTY_VOLUME_TOLERANCE
             geometry.append(_check("valid_solid", part["id"], valid, f"valid={shape.isValid()}, volume={volume:.9g} mm³"))
-            geometry.append(_check("single_solid", part["id"], len(solids) == 1, f"final solid count: {len(solids)}"))
+            # 分かれた場合は各solidの外接boxを検出箇所とする。最大のsolidが本体である。
+            geometry.append(_check("single_solid", part["id"], len(solids) == 1, f"final solid count: {len(solids)}", _boxes(shape)))
             shapes[part["id"]] = shape
 
         progress("keepout and interference checks")
@@ -699,11 +757,11 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
             volume_shape = _box_solid(bounds)
             clearance_text = ", ".join(f"{face}={value}" for face, value in clearance.items())
             for part_id, shape in shapes.items():
-                overlap = _overlap(shape, volume_shape)
-                geometry.append(_check("keepout_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³; clearance: {clearance_text}"))
+                overlap, located = _intersection(shape, volume_shape)
+                geometry.append(_check("keepout_clearance", f"{keepout['id']}/{part_id}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³; clearance: {clearance_text}", located))
         for (left, a), (right, b) in combinations(shapes.items(), 2):
-            overlap = _overlap(a, b)
-            geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³"))
+            overlap, located = _intersection(a, b)
+            geometry.append(_check("part_interference", f"{left}/{right}", overlap <= VOLUME_TOLERANCE, f"overlap: {overlap:.9g} mm³", located))
         snaps = _snap_shapes(data, shapes)
         geometry += _disassembly_checks(data, shapes, snaps, progress)
         # 経路上に別部品がある場合も検査するため、残っている部品の外まで掃引する。
@@ -733,6 +791,12 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
     return Build(shapes, report, model_json)
 
 
+def write_projection_figures(result: Build, directory: str | Path, *, overview: bool = True) -> list[str]:
+    """buildの結果について、組立状態の投影図をdirectoryへ書き、file名を返す。keepoutの箱を重ねる。"""
+    keepouts = [_aabb(keepout["shape"]) for keepout in json.loads(result.model_json)["keepouts"]]
+    return write_projections(result.shapes, result.report["checks"], directory, keepouts, overview)
+
+
 def _reject_unless_allowed(report: dict) -> None:
     if _native.export_allowed(json.dumps(report)):
         return
@@ -759,6 +823,11 @@ def _export_staged(
     if figures:
         progress("writing figures")
         figure_names = write_model_figures(result.model_json, result.report["checks"], root / FIGURES_DIR)
+        # backendが例外で止まった場合は形状がなく、投影図を描かない。
+        if result.shapes:
+            progress("writing projections")
+            projections = write_projection_figures(result, root / FIGURES_DIR / PROJECTION_DIR)
+            figure_names += [f"{PROJECTION_DIR}/{name}" for name in projections]
     _reject_with_figures(result.report, root, figure_names)
     tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     files = {}
@@ -826,9 +895,9 @@ def export(
     isolated=Falseは同一processで実行し、timeout_sを使わない。backendを
     debuggerで追う場合に使う。いずれの経路でも、失敗時はdirectoryを作らない。
 
-    figuresが真なら、部品の概観と検出箇所の断面図を`figures/`に書く。検査で出力を
-    拒否した場合は、reportと図だけを`<directory>.rejected/`に残し、例外にその場所を
-    注記する。STL/STEPは残さない。
+    figuresが真なら、部品の概観と検出箇所の断面図を`figures/`に、組立状態の投影図を
+    `figures/projection/`に書く。検査で出力を拒否した場合は、reportと図だけを
+    `<directory>.rejected/`に残し、例外にその場所を注記する。STL/STEPは残さない。
     """
     target = Path(directory)
     if target.exists():
