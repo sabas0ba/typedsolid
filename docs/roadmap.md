@@ -36,7 +36,7 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 `min_neck_mm`は2.0とし、既定の`min_wall_mm` 1.2と分けている。両者が同じ値だと、断面が足りない箇所は必ず肉厚も足りず、2つのruleを区別できない。
 
-既存ケースへの適用は未実施である。第三者の筐体モデルを取り込むことになるため、出典と再配布条件を確認してから行う。
+既存ケースへは、外部のSTL/STEPへ最終形状のruleを適用する経路 (`typedsolid.external`) で適用した。第三者のファイルはリポジトリに含めず、取得元、commit、sha256と結果だけを [既存ケースとの比較](comparison.md) に記す。Tang Nano 9K用の部品holderは4 ruleとも通り、Tang Nano 20K用のMiSTeryNano筐体は閉じていないmeshのため評価できなかった。
 
 ## M2: 組立と保守アクセス
 

@@ -1047,6 +1047,47 @@ pub struct Policy {
     pub required: Vec<Rule>,
 }
 
+impl Policy {
+    /// 値域と必須ruleの重複を確かめる。IRの検証と外部形状の評価が共有する。
+    pub fn validate(&self) -> Result<(), String> {
+        let thickness = self.min_feature_mm;
+        if !thickness.is_finite() || !(0.001..=1000.0).contains(&thickness) {
+            return Err("min_feature_mm must be finite and in [0.001, 1000]".into());
+        }
+        let tolerance = self.mesh_volume_tolerance;
+        if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
+            return Err("mesh_volume_tolerance must be finite and in [0, 1]".into());
+        }
+        let pitch = self.voxel_mm;
+        if !pitch.is_finite() || !(0.01..=10.0).contains(&pitch) {
+            return Err("voxel_mm must be finite and in [0.01, 10]".into());
+        }
+        for (name, value) in [
+            ("min_wall_mm", self.min_wall_mm),
+            ("min_neck_mm", self.min_neck_mm),
+        ] {
+            if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
+                return Err(format!("{name} must be finite and in [0.01, 1000]"));
+            }
+        }
+        let overhang = self.overhang_angle_deg;
+        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
+            return Err("overhang_angle_deg must be finite and in [0, 89]".into());
+        }
+        let bridge = self.bridge_max_mm;
+        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
+            return Err("bridge_max_mm must be finite and in [0, 1000]".into());
+        }
+        let mut required = BTreeSet::new();
+        for rule in &self.required {
+            if !required.insert(rule) {
+                return Err("duplicate required rule".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 fn default_mesh_volume_tolerance() -> f64 {
     0.01
 }
@@ -1329,40 +1370,8 @@ impl Model {
         if self.keepouts.len() > 100 {
             return Err("at most 100 keepouts are supported".into());
         }
-        let thickness = self.policy.min_feature_mm;
-        if !thickness.is_finite() || !(0.001..=1000.0).contains(&thickness) {
-            return Err("min_feature_mm must be finite and in [0.001, 1000]".into());
-        }
-        let tolerance = self.policy.mesh_volume_tolerance;
-        if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
-            return Err("mesh_volume_tolerance must be finite and in [0, 1]".into());
-        }
+        self.policy.validate()?;
         let pitch = self.policy.voxel_mm;
-        if !pitch.is_finite() || !(0.01..=10.0).contains(&pitch) {
-            return Err("voxel_mm must be finite and in [0.01, 10]".into());
-        }
-        for (name, value) in [
-            ("min_wall_mm", self.policy.min_wall_mm),
-            ("min_neck_mm", self.policy.min_neck_mm),
-        ] {
-            if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
-                return Err(format!("{name} must be finite and in [0.01, 1000]"));
-            }
-        }
-        let overhang = self.policy.overhang_angle_deg;
-        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
-            return Err("overhang_angle_deg must be finite and in [0, 89]".into());
-        }
-        let bridge = self.policy.bridge_max_mm;
-        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
-            return Err("bridge_max_mm must be finite and in [0, 1000]".into());
-        }
-        let mut required = BTreeSet::new();
-        for rule in &self.policy.required {
-            if !required.insert(rule) {
-                return Err("duplicate required rule".into());
-            }
-        }
         let mut part_ids = BTreeSet::new();
         let mut total = 0;
         for part in &self.parts {
