@@ -31,6 +31,7 @@ from .cache import Cache
 from .figures import write_model_figures
 from .model import Model
 from .projection import write_projections
+from .viewer import write_viewer
 
 Progress = Callable[[str], None]
 # 検出箇所と、並べ替えに使う体積の組。
@@ -50,6 +51,8 @@ DEFAULT_TIMEOUT_S = 600.0
 FIGURES_DIR = "figures"
 # 投影図を置くfigures/の下のdirectory。断面図のfile名はすべて`.svg`で終わり、この名前と重ならない。
 PROJECTION_DIR = "projection"
+# 3D viewer。部品のmeshと検査結果を埋め込んだ1つのHTMLである。
+VIEWER_FILE = "viewer.html"
 REJECTED_FILES = ("report.json", FIGURES_DIR)
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
@@ -797,12 +800,27 @@ def write_projection_figures(result: Build, directory: str | Path, *, overview: 
     cutで材料が残らない部品は外接boxを持たず、隠線処理できないため描かない。
     描ける部品がなければ何も書かない。
     """
-    shapes = {
+    keepouts = [_aabb(keepout["shape"]) for keepout in json.loads(result.model_json)["keepouts"]]
+    return write_projections(_drawable(result), result.report["checks"], directory, keepouts, overview)
+
+
+def write_viewer_figure(result: Build, path: str | Path, *, title: str | None = None) -> Path:
+    """buildの結果について、部品、keepout、checkを埋め込んだ3D viewerのHTMLをpathへ書く。
+
+    描ける部品がない場合 (backendの例外、材料の残らない部品) も、checkの一覧は表示できるため書く。
+    """
+    data = json.loads(result.model_json)
+    keepouts = [(keepout["id"], _aabb(keepout["shape"])) for keepout in data["keepouts"]]
+    name = title or "TypedSolid: " + ", ".join(part["id"] for part in data["parts"])
+    return write_viewer(_drawable(result), result.report["checks"], path, keepouts, name)
+
+
+def _drawable(result: Build) -> dict[str, cq.Shape]:
+    """体積を持つsolidのある部品。cutで材料が残らない部品は外接boxを持たず、描けない。"""
+    return {
         part_id: shape for part_id, shape in result.shapes.items()
         if any(abs(solid.Volume()) > EMPTY_VOLUME_TOLERANCE for solid in shape.Solids())
     }
-    keepouts = [_aabb(keepout["shape"]) for keepout in json.loads(result.model_json)["keepouts"]]
-    return write_projections(shapes, result.report["checks"], directory, keepouts, overview)
 
 
 def _reject_unless_allowed(report: dict) -> None:
@@ -835,6 +853,9 @@ def _export_staged(
         progress("writing projections")
         projections = write_projection_figures(result, root / FIGURES_DIR / PROJECTION_DIR)
         figure_names += [f"{PROJECTION_DIR}/{name}" for name in projections]
+        progress("writing viewer")
+        write_viewer_figure(result, root / FIGURES_DIR / VIEWER_FILE)
+        figure_names.append(VIEWER_FILE)
     _reject_with_figures(result.report, root, figure_names)
     tolerance = json.loads(result.model_json)["policy"]["mesh_volume_tolerance"]
     files = {}
@@ -903,7 +924,7 @@ def export(
     debuggerで追う場合に使う。いずれの経路でも、失敗時はdirectoryを作らない。
 
     figuresが真なら、部品の概観と検出箇所の断面図を`figures/`に、組立状態の投影図を
-    `figures/projection/`に書く。検査で出力を拒否した場合は、reportと図だけを
+    `figures/projection/`に、3D viewerを`figures/viewer.html`に書く。検査で出力を拒否した場合は、reportと図だけを
     `<directory>.rejected/`に残し、例外にその場所を注記する。STL/STEPは残さない。
     """
     target = Path(directory)

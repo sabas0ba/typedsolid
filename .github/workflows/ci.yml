@@ -23,6 +23,11 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust locally
         run: bash scripts/bootstrap-rust.sh
+      # 3D viewerのJavaScriptをnode:testで検査する。Node.jsは公式tarballをsha256で照合して置く。
+      - name: Viewer JavaScript tests
+        run: |
+          bash scripts/bootstrap-node.sh
+          .work/node/bin/node --test tests/js/*.test.js
       - name: Core format, lint and tests
         env:
           CARGO_HOME: ${{ github.workspace }}/.work/cargo
@@ -48,7 +53,7 @@ jobs:
   integration:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -79,3 +84,10 @@ jobs:
           export PATH="$PWD/.work/toolchain/bin:$PWD/.venv/bin:$PATH"
           python scripts/render-projections.py --output .work/projections-ci
           diff -r docs/assets/projections .work/projections-ci
+      # 3D viewerを固定した版のChromiumで撮影し、表示状態ごとに画素を検査する。
+      # imageはdebianのdigestとsnapshot.debian.orgの時刻で固定し、撮影はnetwork無しで行う。
+      - name: Viewer screenshots
+        run: |
+          export PATH="$PWD/.work/toolchain/bin:$PWD/.venv/bin:$PATH"
+          docker build -t typedsolid-viewer docker/viewer
+          python scripts/check-viewer.py --output .work/viewer-check

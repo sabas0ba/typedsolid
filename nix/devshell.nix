@@ -33,6 +33,9 @@ pkgs.mkShellNoCC {
 
     # 部品catalogの一次情報となるPDFから寸法を読む。
     pkgs.poppler-utils
+
+    # 3D viewerのJavaScriptをnode:testで検査する。npmのpackageは使わない。
+    pkgs.nodejs_24
   ];
 
   env = {
