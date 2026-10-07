@@ -159,6 +159,11 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 | --- | --- |
 | checkの選択と部品の半透明 (`post_in_keepout`) | ![selected check](assets/viewer/post_in_keepout--selected.png) |
 | z方向の断面 (`lid_overlap`) | ![section](assets/viewer/lid_overlap--section.png) |
+| 複数の欠陥を持つ2部品の筐体の概観 (`pi4_enclosure_defects`) | ![pi4 enclosure defects](assets/viewer/pi4_enclosure_defects--overview.png) |
+
+**Raspberry Pi 4の筐体**: `examples/pi4_enclosure.py`は、部品catalogのRaspberry Pi 4 Model Bの外形、取付穴、コネクタ位置から作る底と蓋の2部品の筐体である。蓋を四隅の柱へ4本のネジで、基板を底の4本のbossへネジで締め、底の壁に6個のコネクタ開口と、プラグを抜く掃引を持つ。蓋には通気スリットを開ける。基板の高さ、PCBの厚み、コネクタの高さとプラグの断面、ネジの寸法、bridgeで渡せる長さ (15 mm) は作例が決めた説明用の値である。正常版 (`pi4_enclosure`) はすべてのruleを通り、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、2部品にまたがって6 ruleの7 checkが落ちる。`tests/test_pi4_enclosure.py`が落ちる集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+
+snap fitは持たない。IRは印刷方向をmodel全体で1つだけ持つため、蓋から垂らす梁は積層方向に沿い、正常な設計でも`snap_fit`の積層方向の検査に落ちる。部品ごとの印刷姿勢は後続の課題である。
 
 ## 着脱の検査
 

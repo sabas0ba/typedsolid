@@ -20,6 +20,7 @@ import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from examples.assembly_defects import ASSEMBLY_DEFECTS
+from examples.pi4_enclosure import pi4_enclosure_defects
 from typedsolid.cadquery import build, write_viewer_figure
 
 WIDTH, HEIGHT = 1200, 760
@@ -29,8 +30,12 @@ CHROMIUM_FLAGS = (
     "--headless", "--no-sandbox", "--use-angle=swiftshader", "--enable-unsafe-swiftshader",
     "--hide-scrollbars", "--disable-dev-shm-usage",
 )
+# 検出箇所の線が占める描画領域の割合の下限。白い画面では0になる。
+MIN_LINE_FRACTION = 0.0002
 # 撮影の後、docsに置く画像。fixture名と状態名の組。
-DOCS = (("post_in_keepout", "selected"), ("lid_overlap", "section"))
+DOCS = (("post_in_keepout", "selected"), ("lid_overlap", "section"), ("pi4_enclosure_defects", "overview"))
+# 撮影するfixture。部品間の欠陥を1つずつ持つものと、複数の欠陥を同時に持つ筐体である。
+FIXTURES = tuple(factory for factory, _ in ASSEMBLY_DEFECTS) + (pi4_enclosure_defects,)
 
 
 # ---- PNG ----
@@ -139,8 +144,9 @@ def scenes(model: dict, checks: list[dict]) -> list[Scene]:
     # 断面はz方向の中央。部品の内側の面が切り口から見える。
     top = max(f["shape"]["max"][2] for part in model["parts"] for f in part["features"] if f["shape"]["kind"] == "box")
     return [
-        Scene("overview", "", lambda f, _: _require(f, part=0.05, location=0.0005)),
-        Scene("selected", f"#check={failing}&ghost={parts}", lambda f, _: _require(f, part=0.02, location=0.0005)),
+        # 検出箇所の線が画面に現れること。小さい箇所の線は画素が少ないため、下限は0でない最小の目安とする。
+        Scene("overview", "", lambda f, _: _require(f, part=0.05, location=MIN_LINE_FRACTION)),
+        Scene("selected", f"#check={failing}&ghost={parts}", lambda f, _: _require(f, part=0.02, location=MIN_LINE_FRACTION)),
         # 注視では検出箇所を寄せて半透明の赤で塗る。線だけの状態より赤が十分に多い。
         Scene("focus", f"#check={failing}&loc=0", lambda f, seen: _require(f, location=3 * seen["selected"]["location"])),
         Scene("section", f"#clip=z:{top / 2:.3f}&view=35,60,1", lambda f, _: _require(f, part=0.05, cut=0.001)),
@@ -176,7 +182,7 @@ def run(args: argparse.Namespace) -> list[str]:
     output.mkdir(parents=True, exist_ok=True)
     command, inside = chromium_command(args, output)
     problems = []
-    for factory, _ in ASSEMBLY_DEFECTS:
+    for factory in FIXTURES:
         seen: dict[str, dict[str, float]] = {}
         model = factory()
         result = build(model)
