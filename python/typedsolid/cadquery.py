@@ -804,15 +804,20 @@ def write_projection_figures(result: Build, directory: str | Path, *, overview: 
     return write_projections(_drawable(result), result.report["checks"], directory, keepouts, overview)
 
 
-def write_viewer_figure(result: Build, path: str | Path, *, title: str | None = None) -> Path:
+def write_viewer_figure(
+    result: Build, path: str | Path, *, title: str | None = None, checks: list[dict] | None = None,
+) -> Path:
     """buildの結果について、部品、keepout、checkを埋め込んだ3D viewerのHTMLをpathへ書く。
 
-    描ける部品がない場合 (backendの例外、材料の残らない部品) も、checkの一覧は表示できるため書く。
+    checksを与えるとbuildのreportの代わりに埋め込む。exportがmeshの検査を加えたreportで
+    書き直すために使う。描ける部品がない場合 (backendの例外、材料の残らない部品) も、
+    checkの一覧は表示できるため書く。
     """
     data = json.loads(result.model_json)
     keepouts = [(keepout["id"], _aabb(keepout["shape"])) for keepout in data["keepouts"]]
     name = title or "TypedSolid: " + ", ".join(part["id"] for part in data["parts"])
-    return write_viewer(_drawable(result), result.report["checks"], path, keepouts, name)
+    embedded = result.report["checks"] if checks is None else checks
+    return write_viewer(_drawable(result), embedded, path, keepouts, name)
 
 
 def _drawable(result: Build) -> dict[str, cq.Shape]:
@@ -875,6 +880,10 @@ def _export_staged(
     # meshは書き出し後にしか検査できない。failなら呼び出し側がstagingごと破棄する。
     report = copy.deepcopy(result.report)
     report["checks"] = [c for c in report["checks"] if c["rule"] not in MESH_RULES] + mesh_checks
+    if figures:
+        # viewerはcheckの状態を一覧で示すため、meshの検査を加えたreportで書き直す。
+        # 断面図と投影図は検出箇所だけを描き、meshの検査は検出箇所を持たないため変わらない。
+        write_viewer_figure(result, root / FIGURES_DIR / VIEWER_FILE, checks=report["checks"])
     _reject_with_figures(report, root, figure_names)
     # 保存bytesとdigestを同一の値から得る。model.jsonの再hashで照合できるようにする。
     model_bytes = (result.model_json + "\n").encode("utf-8")

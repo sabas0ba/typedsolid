@@ -162,7 +162,9 @@
     const box = focus || modelBox;
     const target = core.boxCentre(box).map((value, i) => value + pan[i]);
     // 注視では検出箇所の周囲も入るよう、箇所の外接球の2倍の範囲を収める。
-    const distance = (focus ? 2 * core.fitDistance(box, FOVY, modelRadius * 0.15) : core.fitDistance(box, FOVY, 0)) * state.zoom;
+    // 縦長の画面では横の視野角で収める。
+    const fov = core.fittingFov(FOVY, width / height);
+    const distance = (focus ? 2 * core.fitDistance(box, fov, modelRadius * 0.15) : core.fitDistance(box, fov, 0)) * state.zoom;
     const eye = core.orbitEye(target, distance, state.yaw, state.pitch);
     const near = Math.max(distance - 2 * modelRadius, distance * 0.01);
     const far = distance + 2 * modelRadius;

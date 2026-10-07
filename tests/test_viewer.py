@@ -111,6 +111,14 @@ class ExportTests(TemporaryDirectoryTest):
         self.assertIn("viewer.html", manifest["figures"])
         self.assertTrue((self.root / "ok" / "figures" / "viewer.html").exists())
 
+    def test_viewer_shows_the_mesh_checks_of_the_final_report(self):
+        """meshの検査は書き出し後に決まる。viewerの状態はreport.jsonと一致する。"""
+        manifest = export(baseline(), self.root / "mesh", isolated=False)
+        data = embedded((self.root / "mesh" / "figures" / "viewer.html").read_text(encoding="utf-8"))
+        statuses = lambda checks: [(c["rule"], c["target"], c["status"]) for c in checks]
+        self.assertEqual(statuses(data["checks"]), statuses(manifest["report"]["checks"]))
+        self.assertIn(("mesh_manifold", "pass"), {(c["rule"], c["status"]) for c in data["checks"]})
+
     def test_rejected_export_keeps_the_viewer(self):
         with self.assertRaises(ValueError):
             export(lid_overlap(), self.root / "bad")

@@ -61,6 +61,16 @@ test("fit distance contains the bounding sphere and honours the minimum radius",
   assert.ok(Math.abs(core.fitDistance(box, fovy, 10) - 10 / Math.sin(fovy / 2)) < 1e-9);
 });
 
+test("fitting field of view is the narrower of the vertical and horizontal", () => {
+  const fovy = Math.PI / 3;
+  assert.equal(core.fittingFov(fovy, 1.5), fovy);
+  const narrow = core.fittingFov(fovy, 0.5);
+  assert.ok(Math.abs(Math.tan(narrow / 2) - 0.5 * Math.tan(fovy / 2)) < 1e-12);
+  // 縦長の画面では収める距離が長くなる。
+  const box = { min: [0, 0, 0], max: [10, 10, 10] };
+  assert.ok(core.fitDistance(box, narrow, 0) > core.fitDistance(box, fovy, 0));
+});
+
 test("box edges are the 12 axis-aligned edges", () => {
   const edges = core.boxEdges({ min: [0, 0, 0], max: [1, 2, 3] });
   assert.equal(edges.length, 12 * 2 * 3);
@@ -96,6 +106,13 @@ test("state round-trips through the URL fragment", () => {
   assert.equal(state.sort, "rule");
   assert.deepEqual([state.yaw, state.pitch, state.zoom], [10, -20, 2]);
   assert.equal(core.formatState(state), hash);
+});
+
+test("section coordinates keep sub-micrometre precision in the fragment", () => {
+  const state = { ...core.parseState(""), clip: { axis: "x", value: 0.0005, flip: false } };
+  const hash = core.formatState(state);
+  assert.equal(core.parseState(hash).clip.value, 0.0005);
+  assert.equal(core.parseState(core.formatState({ ...state, clip: { axis: "x", value: 12.3456789, flip: false } })).clip.value, 12.345679);
 });
 
 test("default state formats to an empty fragment", () => {

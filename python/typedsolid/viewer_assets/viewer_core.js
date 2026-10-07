@@ -193,7 +193,12 @@
     };
   }
 
-  // boxの外接球が縦の視野角に収まる距離。minRadiusは小さい検出箇所に寄りすぎないための下限。
+  // 縦と横のうち狭い方の視野角。縦長の画面では横の視野角が縦より狭い。
+  function fittingFov(fovy, aspect) {
+    return aspect < 1 ? 2 * Math.atan(Math.tan(fovy / 2) * aspect) : fovy;
+  }
+
+  // boxの外接球が視野角fovに収まる距離。minRadiusは小さい検出箇所に寄りすぎないための下限。
   function fitDistance(box, fovy, minRadius) {
     const radius = Math.max(boxRadius(box), minRadius || 0, 1e-6);
     return radius / Math.sin(fovy / 2);
@@ -289,8 +294,10 @@
     return state;
   }
 
-  function round(value) {
-    return Number(value.toFixed(3)).toString();
+  // 視点の角度と倍率は3桁で足りる。断面の位置は検出箇所と同じ6桁 (1 nm) で書き、
+  // 共有したURLで最小のfeatureを横切る位置へずれないようにする。
+  function round(value, digits = 3) {
+    return Number(value.toFixed(digits)).toString();
   }
 
   // 既定値と異なる項目だけを書く。同じ状態は同じ文字列になる。
@@ -303,7 +310,7 @@
       }
     }
     if (state.clip) {
-      params.set("clip", `${state.clip.axis}:${round(state.clip.value)}${state.clip.flip ? ":flip" : ""}`);
+      params.set("clip", `${state.clip.axis}:${round(state.clip.value, 6)}${state.clip.flip ? ":flip" : ""}`);
     }
     if (state.hidden.length) {
       params.set("hidden", state.hidden.join(","));
@@ -421,6 +428,7 @@
     decodeUint32,
     filterChecks,
     fitDistance,
+    fittingFov,
     flatTriangles,
     formatState,
     invert,
