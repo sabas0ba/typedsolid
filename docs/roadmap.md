@@ -65,4 +65,4 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 ## 後続判断
 
-Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図を実装した。干渉系の検出箇所、投影図、3D viewerを順に追加する。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。
+Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図、OCCTで判定するruleの検出箇所、組立状態の投影図を実装した。3D viewerを後続で追加する。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。

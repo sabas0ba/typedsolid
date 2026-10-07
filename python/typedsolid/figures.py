@@ -222,6 +222,16 @@ def _file_name(name: str) -> str:
     return ("_" + safe[1:] if safe.startswith(".") else safe) + ".svg"
 
 
+def unique_file_name(name: str, written: list[str]) -> str:
+    """writtenと重ならないfile名。置き換えで名前が重なった場合は連番を付け、先の図を上書きしない。"""
+    candidate = _file_name(name)
+    suffix = 2
+    while candidate in written:
+        candidate = _file_name(f"{name}--{suffix}")
+        suffix += 1
+    return candidate
+
+
 def _write(figures: list[Figure], sections_of: Callable[[str, str], str], directory: Path) -> list[str]:
     """部品ごとに断面を求め、図をdirectoryへ書く。断面はSECTIONS_PER_CALL枚ずつ求める。"""
     directory.mkdir(parents=True, exist_ok=True)
@@ -236,12 +246,7 @@ def _write(figures: list[Figure], sections_of: Callable[[str, str], str], direct
             planes = [plane for figure in batch for plane in _planes(figure)]
             sections = json.loads(sections_of(part, json.dumps(planes)))
             for index, figure in enumerate(batch):
-                name = _file_name(figure.name)
-                # 置き換えで名前が重なった場合は連番を付け、先の図を上書きしない。
-                suffix = 2
-                while name in written:
-                    name = _file_name(f"{figure.name}--{suffix}")
-                    suffix += 1
+                name = unique_file_name(figure.name, written)
                 path = directory / name
                 path.write_text(render(figure, sections[3 * index:3 * index + 3]), encoding="utf-8")
                 written.append(name)

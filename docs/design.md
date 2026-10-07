@@ -103,8 +103,16 @@ failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で
 | `closed_cavity` | 外部に通じない空cellの連結成分ごとの外接box |
 | `support_free` | 支持もbridgeも得られないcellの連結成分ごとの外接box |
 | `connector_fit` | 開口と、掃引前のプラグのbox |
+| `single_solid` | solidごとの外接box。最大のものが本体である |
+| `part_interference` | 2部品の共通部分のsolidごとの外接box |
+| `keepout_clearance` | 部品と、clearanceで広げたkeepoutの共通部分 |
+| `access_clearance` | 掃引領域と部品の共通部分 |
+| `disassembly_path` | 動かす部品の掃引領域と障害物の共通部分。障害物の組立位置にある |
+| `disassembly_separation` | 最後の区間の延長で塞ぐ障害物との共通部分 |
+| `fastener_fit` | `through`と`clear_tip`は穴やネジの経路にある材料、`bearing`と`boss_wall`は輪帯のうち材料のない部分、`engagement`は要求されるかかり長さの範囲のネジ |
+| `snap_fit` | `beam`は梁とフックのboxのうち材料のない部分、`deflection_space`はたわむ空間と障害物の共通部分、`retention`は保持しないフック |
 
-干渉、掃引、分解、ネジ固定、snap fitの検出箇所は、OCCTのBooleanの結果から求めるため後続とする。
+OCCTで判定するruleの検出箇所は、判定に使ったBooleanの結果 (共通部分、または要求領域から材料を引いた残り) のsolidごとの外接boxである。体積の大きい順に並べ、座標は小数点以下6桁に丸める。`valid_solid`は部品全体の妥当性であり、検出箇所を持たない。寸法だけで判定する`snap_fit`の`strain`と`layer`、`fastener_release`も同様である。
 
 **断面図**: `figures/`に、部品ごとの概観と、failしたcheckの検出箇所 (各checkの大きい順に3件) を通るx、y、zの3断面をSVGで書く。図は判定と同じvoxel格子とmaskから描くため、塗った箇所は判定の根拠そのものである。格子より細かい形状は図にも現れない。凡例の色は、赤が薄肉、紫が細い接続部、青が未支持、橙が閉空洞で、灰色が材料、破線が検出箇所のboxである。断面はRust coreが各cellのbit (材料、薄肉、接続部、未支持、閉空洞) を返し、PythonがSVGに描く。SVGの生成は標準libraryだけで行い、CadQueryに依存しない。
 
@@ -117,6 +125,17 @@ failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で
 | 閉空洞 (`sealed_void`) | ![sealed void](assets/figures/sealed_void/enclosure--closed_cavity--1.svg) |
 
 図は`scripts/render-figures.py --output docs/assets/figures --defects-only`で再生成する。
+
+**投影図**: `figures/projection/`に、組立状態の全部品の概観 (`overview.svg`) と、検出箇所を持つfailしたcheckごとの図を書く。図は平面図、等角図、正面図、右側面図を同じ縮尺で2×2に並べる。部品の線はOCCTの隠線処理 (HLR) で求め、見える線を実線、隠れる線を破線で描く。検出箇所 (赤) とkeepoutの箱 (緑、clearanceを含まない) は隠線処理をせずに同じ投影で描く。検出箇所は部品の内部にあることが多いためである。部品の隠線処理は方向ごとに1回だけ行い、図ごとに使い回す。断面図と異なりvoxel格子を経由しないため、格子より細かい形状も現れる。backendが例外で止まった場合は形状がなく、投影図を書かない。cutで材料が残らない部品は外接boxを持たないため描かず、そのような部品しかなければ投影図を書かない。この場合もreportと断面図は書く。`build`の結果からは`typedsolid.cadquery.write_projection_figures`で書ける。
+
+| 欠陥 | 図 |
+| --- | --- |
+| 蓋が壁に食い込む (`lid_overlap`) | ![lid overlap](assets/projections/lid_overlap/part_interference--tray_lid.svg) |
+| ケーブルの経路を壁が塞ぐ (`blocked_cable`) | ![blocked cable](assets/projections/blocked_cable/access_clearance--usb_cable_tray.svg) |
+| 柱が基板の確保領域に入る (`post_in_keepout`) | ![post in keepout](assets/projections/post_in_keepout/keepout_clearance--pcb_tray.svg) |
+| 引き抜く板を壁が塞ぐ (`sliding_lid`) | ![sliding lid](assets/projections/sliding_lid/disassembly_path--slide_out_inner_lid_0_tray.svg) |
+
+fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`が落ちるruleと検出箇所の座標を照合する。図は`scripts/render-projections.py --output docs/assets/projections`で再生成する。CIのintegration jobが再生成してdocsの図と比べる。
 
 **出力の拒否と図**: `export`は検査で出力を拒否した場合も出力先を作らない。代わりに、reportと図だけを隣の`<出力先>.rejected/`に書き、例外にその場所を注記する。STL/STEPは書かない。`<出力先>.rejected/`が既にある場合は置き換えず、その旨を注記する。`export(..., figures=False)`で図を省ける。
 

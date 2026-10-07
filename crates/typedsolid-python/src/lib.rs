@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use typedsolid_core::{Model, Policy, Report, mesh, voxel};
+use typedsolid_core::{MAX_LOCATIONS, Model, Policy, Report, mesh, voxel};
 
 #[pyfunction]
 fn normalize_model(json: &str) -> PyResult<String> {
@@ -111,5 +111,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stl_sections, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(export_allowed, module)?)?;
+    // backendが求める検出箇所も同じ上限で切る。
+    module.add("MAX_LOCATIONS", MAX_LOCATIONS)?;
     Ok(())
 }

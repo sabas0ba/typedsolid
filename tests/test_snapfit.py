@@ -49,6 +49,10 @@ def snap_checks(result) -> dict[str, dict]:
     return {c["target"].split("/")[1]: c for c in result.report["checks"] if c["rule"] == "snap_fit"}
 
 
+def box(low, high) -> list[dict]:
+    return [{"min": list(low), "max": list(high)}]
+
+
 def failing(result, rule: str = "snap_fit") -> set[str]:
     return {c["target"] for c in result.report["checks"] if c["rule"] == rule and c["status"] != "pass"}
 
@@ -116,12 +120,16 @@ class SnapFitTests(unittest.TestCase):
     def test_without_the_ledge_nothing_is_retained(self):
         result = build(model(ledge=False))
         self.assertEqual(failing(result), {"clip/retention"})
+        # 保持しないフックそのものを検出箇所とする。
+        self.assertEqual(snap_checks(result)["retention"]["locations"], box((36, 5, 10), (37, 15, 12)))
 
     def test_obstacle_beside_the_beam_blocks_the_deflection(self):
         post = Feature("post", Box((33, 5, 15), (34, 15, 20)))
         result = build(model(base_extra=(post,)))
         self.assertEqual(failing(result), {"clip/deflection_space"})
         self.assertIn("hits base", snap_checks(result)["deflection_space"]["message"])
+        # 梁の包絡 (x≥33.5) と柱の共通部分。
+        self.assertEqual(snap_checks(result)["deflection_space"]["locations"], box((33.5, 5, 15), (34, 15, 20)))
 
     def test_keepout_beside_the_beam_blocks_the_deflection(self):
         # 柱と同じ位置の基板領域。取付先がsnap fitを持つ蓋でも、相手の筐体でも、梁はたわめない。
@@ -173,6 +181,7 @@ class SnapFitTests(unittest.TestCase):
         slot = Feature("slot", Box((30, 0, 20), (40, 20, 21)), operation="cut")
         result = build(model(lid_extra=(slot,)))
         self.assertIn("clip/beam", failing(result))
+        self.assertEqual(snap_checks(result)["beam"]["locations"], box((34.5, 5, 20), (36, 15, 21)))
 
 
 if __name__ == "__main__":

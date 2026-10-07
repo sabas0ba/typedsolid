@@ -171,7 +171,7 @@ class RenderTests(TemporaryDirectoryTest):
 class ExportTests(TemporaryDirectoryTest):
     def test_export_writes_figures_and_lists_them(self):
         manifest = export(baseline(), self.root / "ok", isolated=False)
-        self.assertEqual(manifest["figures"], ["enclosure--overview.svg"])
+        self.assertEqual(manifest["figures"], ["enclosure--overview.svg", "projection/overview.svg"])
         self.assertTrue((self.root / "ok" / "figures" / "enclosure--overview.svg").exists())
 
     def test_export_can_skip_figures(self):

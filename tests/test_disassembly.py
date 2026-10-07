@@ -140,6 +140,7 @@ class DisassemblyTests(unittest.TestCase):
         result = build(model(tray(), lipped_lid(0.3), steps=(sideways,)))
         blocked = failing(result, "disassembly_path")
         self.assertEqual([c["target"] for c in blocked], ["open_lid/lid/0/tray"])
+        self.assertTrue(blocked[0]["locations"])
         self.assertFalse(result.export_allowed)
 
     def test_hooked_lid_needs_to_slide_before_lifting(self):
@@ -165,6 +166,10 @@ class DisassemblyTests(unittest.TestCase):
                     if c["status"] == "fail" and c["rule"].startswith("disassembly_")
                 }
                 self.assertEqual(failed, expected, result.report)
+                if name == "slide too little":
+                    # 爪の下に残る蓋の端と爪の共通部分。
+                    separation = failing(result, "disassembly_separation")[0]
+                    self.assertEqual(separation["locations"], [{"min": [22, 0, 6], "max": [24, 20, 8]}])
 
     def test_order_matters_for_a_part_under_the_lid(self):
         board = Part("board", (Feature("pcb", Box((5, 5, 2), (25, 15, 4))),))
