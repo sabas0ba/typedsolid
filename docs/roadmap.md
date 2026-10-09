@@ -65,4 +65,4 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 ## 後続判断
 
-Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図、OCCTで判定するruleの検出箇所、組立状態の投影図、3D viewerを実装した。外部形状のviewer、断面のcap、部品ごとの印刷姿勢 (蓋から垂らすsnap fitの梁を積層方向の検査に通すため) は後続とする。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。
+Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図、OCCTで判定するruleの検出箇所、組立状態の投影図、3D viewer (IRのモデルと外部のSTL/STEP、断面の切り口を含む) を実装した。部品ごとの印刷姿勢 (蓋から垂らすsnap fitの梁を積層方向の検査に通すため) は後続とする。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。

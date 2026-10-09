@@ -263,7 +263,7 @@ power = connector_opening(
 
 すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
-`--figures DIR`を与えると、概観と検出箇所の断面図をDIRへ書く。
+`--figures DIR`を与えると、概観と検出箇所の断面図と、3D viewer (`viewer.html`) をDIRへ書く。viewerは判定に使ったSTLの三角形をそのまま描く。三角形数とfileの大きさは標準エラーに出る。
 
 ## 検出箇所の図
 

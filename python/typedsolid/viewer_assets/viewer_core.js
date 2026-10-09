@@ -63,13 +63,14 @@
   }
 
   // 三角形ごとに頂点を複製し、面の法線を付ける。陰影で面の境界を見せるためである。
+  // indicesがnullなら、positionsは三角形ごとに3頂点を並べたもの (STLの三角形) とする。
   function flatTriangles(positions, indices) {
-    const count = indices.length;
+    const count = indices ? indices.length : positions.length / 3;
     const outPositions = new Float32Array(count * 3);
     const outNormals = new Float32Array(count * 3);
     for (let t = 0; t < count; t += 3) {
       const p = [0, 1, 2].map((k) => {
-        const i = indices[t + k] * 3;
+        const i = (indices ? indices[t + k] : t + k) * 3;
         return [positions[i], positions[i + 1], positions[i + 2]];
       });
       const n = normalize(cross(subtract(p[1], p[0]), subtract(p[2], p[0])));
@@ -242,6 +243,22 @@
     const plane = [0, 0, 0, -sign * clip.value];
     plane[AXES.indexOf(clip.axis)] = sign;
     return plane;
+  }
+
+  // 断面の平面上で、boxの範囲をmarginだけ広げた四角形。2つの三角形の頂点を並べる。
+  // 切り口 (cap) はこの四角形のうち、部品の内部にある画素だけを塗る。
+  function clipQuad(clip, box, margin) {
+    const axis = AXES.indexOf(clip.axis);
+    const [u, v] = [0, 1, 2].filter((i) => i !== axis);
+    const corner = (a, b) => {
+      const point = [0, 0, 0];
+      point[axis] = clip.value;
+      point[u] = a ? box.max[u] + margin : box.min[u] - margin;
+      point[v] = b ? box.max[v] + margin : box.min[v] - margin;
+      return point;
+    };
+    const [p00, p10, p11, p01] = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
+    return new Float32Array([...p00, ...p10, ...p11, ...p00, ...p11, ...p01]);
   }
 
   // ---- 表示状態とURL fragment ----
@@ -424,6 +441,7 @@
     boxCentre,
     boxEdges,
     clipPlane,
+    clipQuad,
     decodeFloat32,
     decodeUint32,
     filterChecks,

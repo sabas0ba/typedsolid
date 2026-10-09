@@ -14,6 +14,11 @@
   const KEEPOUT_COLOUR = [0.13, 0.56, 0.35];
   const CUT_COLOUR = [0.35, 0.37, 0.40];
   const GHOST_ALPHA = 0.25;
+  // 切り口は部品色を暗くした地に、画面上で一定間隔の45°の斜線を入れる。値は部品色に掛ける比で、
+  // 斜線の比は陰影の下限 (0.5) より小さく、表面の色と重ならない。scripts/check-viewer.pyが読む。
+  const CAP_FILL = 0.6;
+  const CAP_STRIPE = 0.35;
+  const CAP_PERIOD_PX = 8.0;
 
   const data = JSON.parse(document.getElementById("viewer-data").textContent);
   const checks = data.checks.map((check, index) => ({ ...check, index, locations: check.locations || [] }));
@@ -27,7 +32,9 @@
 
   const canvas = document.getElementById("view");
   // canvasを不透明にする。半透明の部品を描くと描画先のalphaが下がり、pageの背景と合成されて消えるためである。
-  const gl = canvas.getContext("webgl", { alpha: false, antialias: true, preserveDrawingBuffer: true });
+  // 切り口はstencilで部品の内部を判定して塗る。stencilを得られない環境では切り口を描かない。
+  const gl = canvas.getContext("webgl", { alpha: false, antialias: true, stencil: true, preserveDrawingBuffer: true });
+  const hasStencil = Boolean(gl && gl.getContextAttributes().stencil);
 
   const SURFACE_VERTEX = `
     attribute vec3 aPosition;
@@ -69,6 +76,14 @@
     uniform vec4 uColour;
     void main() {
       gl_FragColor = uColour;
+    }`;
+  const CAP_FRAGMENT = `
+    precision mediump float;
+    uniform vec4 uColour;
+    uniform vec3 uCut;
+    void main() {
+      float phase = mod(gl_FragCoord.x + gl_FragCoord.y, ${CAP_PERIOD_PX.toFixed(1)});
+      gl_FragColor = phase < ${(CAP_PERIOD_PX / 3).toFixed(1)} ? vec4(uCut, uColour.a) : uColour;
     }`;
 
   function compile(type, source) {
@@ -120,14 +135,17 @@
 
   let surface = null;
   let flat = null;
+  let cap = null;
   let parts = [];
   let keepoutLines = null;
 
   function setUpScene() {
     surface = program(SURFACE_VERTEX, SURFACE_FRAGMENT);
     flat = program(FLAT_VERTEX, FLAT_FRAGMENT);
+    cap = program(FLAT_VERTEX, CAP_FRAGMENT);
     parts = data.parts.map((part, index) => {
-      const triangles = core.flatTriangles(core.decodeFloat32(part.positions), core.decodeUint32(part.indices));
+      const indices = part.indices ? core.decodeUint32(part.indices) : null;
+      const triangles = core.flatTriangles(core.decodeFloat32(part.positions), indices);
       return {
         id: part.id,
         colour: PART_COLOURS[index % PART_COLOURS.length],
@@ -222,6 +240,47 @@
     }
   }
 
+  // 断面の切り口。部品ごとに、断面より残す側の面を深度によらず数えてstencilの偶奇を反転する。
+  // 断面の平面上の点から視線上に奇数個の面があれば、その点は部品の内部にある。その画素だけに
+  // 平面の四角形を塗る。四角形は深度検査を行い、手前の部品に隠れる。meshが閉じていることを前提とする。
+  function drawCaps(view, ghosts) {
+    if (!state.clip || !hasStencil) {
+      return;
+    }
+    const quad = buffer(core.clipQuad(state.clip, modelBox, modelRadius * 0.05));
+    gl.enable(gl.STENCIL_TEST);
+    gl.stencilMask(0xff);
+    for (const part of parts) {
+      if (state.hidden.includes(part.id) || state.ghost.includes(part.id) !== ghosts) {
+        continue;
+      }
+      gl.clear(gl.STENCIL_BUFFER_BIT);
+      gl.colorMask(false, false, false, false);
+      gl.depthMask(false);
+      gl.disable(gl.DEPTH_TEST);
+      gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.INVERT);
+      gl.useProgram(surface.handle);
+      bind(surface, part.positions, part.normals);
+      gl.drawArrays(gl.TRIANGLES, 0, part.count);
+
+      gl.colorMask(true, true, true, true);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthMask(!ghosts);
+      gl.stencilFunc(gl.NOTEQUAL, 0, 0xff);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+      gl.useProgram(cap.handle);
+      gl.uniformMatrix4fv(cap.uniforms.uViewProj, false, view.viewProj);
+      const alpha = ghosts ? GHOST_ALPHA : 1;
+      gl.uniform4fv(cap.uniforms.uColour, [...part.colour.map((c) => c * CAP_FILL), alpha]);
+      gl.uniform3fv(cap.uniforms.uCut, part.colour.map((c) => c * CAP_STRIPE));
+      bind(cap, quad, null);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+    gl.disable(gl.STENCIL_TEST);
+    gl.deleteBuffer(quad);
+  }
+
   function drawFlat(view, array, mode, colour) {
     gl.useProgram(flat.handle);
     gl.uniformMatrix4fv(flat.uniforms.uViewProj, false, view.viewProj);
@@ -260,6 +319,8 @@
     gl.disable(gl.BLEND);
     gl.depthMask(true);
     drawParts(view, false);
+    drawCaps(view, false);
+    gl.depthMask(true);
     if (keepoutLines) {
       gl.useProgram(flat.handle);
       gl.uniformMatrix4fv(flat.uniforms.uViewProj, false, view.viewProj);
@@ -272,6 +333,8 @@
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
     drawParts(view, true);
+    // drawPartsが断面の平面とuniformを設定した後に描く。
+    drawCaps(view, true);
 
     // 検出箇所は部品の内部にあることが多いため、深度によらず手前に描く。
     gl.disable(gl.DEPTH_TEST);

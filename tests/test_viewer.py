@@ -12,6 +12,7 @@ import re
 import shutil
 import struct
 import tempfile
+import tracemalloc
 import unittest
 import zlib
 
@@ -19,7 +20,7 @@ from examples.assembly_defects import lid_overlap
 from examples.defects import baseline
 from typedsolid import Box, Feature, Model, Part
 from typedsolid.cadquery import build, export, write_viewer_figure
-from typedsolid.viewer import render_viewer
+from typedsolid.viewer import MeshPart, render_viewer
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check-viewer.py"
 _spec = importlib.util.spec_from_file_location("check_viewer", SCRIPT)
@@ -81,7 +82,7 @@ class ViewerHtmlTests(TemporaryDirectoryTest):
     def test_text_cannot_close_the_script_or_inject_markup(self):
         hostile = '</script><script>alert(1)</script> & {{APP}}'
         checks = [{"rule": "part_interference", "target": hostile, "status": "fail", "message": hostile}]
-        html = render_viewer({}, checks, title=hostile)
+        html = render_viewer([], checks, title=hostile)
         self.assertNotIn("<script>alert(1)", html)
         self.assertIn("<title>&lt;/script&gt;", html)
         self.assertEqual(html.count("</script>"), 3)
@@ -103,6 +104,26 @@ class ViewerHtmlTests(TemporaryDirectoryTest):
         first = write_viewer_figure(build(lid_overlap()), self.root / "a.html").read_bytes()
         second = write_viewer_figure(build(lid_overlap()), self.root / "b.html").read_bytes()
         self.assertEqual(first, second)
+
+
+class MeshPartTests(unittest.TestCase):
+    def test_bounds_of_unindexed_triangles(self):
+        part = MeshPart("p", struct.pack("<9f", 1, -2, 3, 4, 5, -6, 0.5, 0, 9))
+        self.assertEqual(part.bounds(), {"min": [0.5, -2.0, -6.0], "max": [4.0, 5.0, 9.0]})
+        self.assertEqual(part.triangle_count(), 1)
+
+    def test_bounds_do_not_expand_every_coordinate(self):
+        """外接boxは座標を4 byteのまま走査する。全座標をPythonのfloatにすると一時的に約9倍の記憶を使う。"""
+        count = 100_000
+        part = MeshPart("p", struct.pack(f"<{count * 9}f", *range(count * 9)))
+        tracemalloc.start()
+        try:
+            bounds = part.bounds()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(bounds["max"], [count * 9 - 3.0, count * 9 - 2.0, count * 9 - 1.0])
+        self.assertLess(peak, 2 * len(part.positions))
 
 
 class ExportTests(TemporaryDirectoryTest):
@@ -142,11 +163,10 @@ class ScreenshotCheckTests(TemporaryDirectoryTest):
         path = self.root / "white.png"
         path.write_bytes(png(width, height, [b"\xff" * width * 3] * height, [0] * height))
         found = check_viewer.fractions(path)
-        self.assertEqual(found, {"location": 0.0, "part": 0.0, "cut": 0.0})
-        model = json.loads(lid_overlap().to_json())
-        checks = [{"status": "pass"}, {"status": "fail"}]
+        self.assertEqual(found, {"location": 0.0, "part": 0.0, "cap": 0.0})
+        viewer = check_viewer.Viewer("lid_overlap", ("tray", "lid"), [{"status": "pass"}, {"status": "fail"}], 17.0)
         seen = {"selected": {"location": 0.01}}
-        for scene in check_viewer.scenes(model, checks):
+        for scene in check_viewer.scenes(viewer):
             with self.subTest(scene=scene.name):
                 self.assertTrue(scene.expect(found, seen))
 
@@ -156,7 +176,10 @@ class ScreenshotCheckTests(TemporaryDirectoryTest):
         self.assertFalse(check_viewer.is_location(204, 173, 122))
         self.assertTrue(check_viewer.is_part(110, 125, 145))
         self.assertFalse(check_viewer.is_part(255, 255, 255))
-        self.assertTrue(check_viewer.is_cut(89, 94, 102))
+        # 1番目の部品色 (0.55, 0.62, 0.72) の斜線。陰影の下限 (0.5倍) の表面の色は切り口ではない。
+        self.assertTrue(check_viewer.is_cap(49, 55, 64))
+        self.assertFalse(check_viewer.is_cap(70, 79, 92))
+        self.assertEqual(len(check_viewer.CAP_COLOURS), 8)
 
 
 if __name__ == "__main__":

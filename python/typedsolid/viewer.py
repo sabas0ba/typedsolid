@@ -3,24 +3,26 @@
 HTMLは外部の資源を読まず、file://で開ける。描画は自作のWebGL 1で行い、JavaScriptの
 packageに依存しない。表示状態 (選択したcheck、注視する検出箇所、断面、部品の表示) は
 URL fragmentに書き、同じURLで同じ表示を再現できる。
+
+本moduleはCadQueryに依存しない。CadQueryの形状からmeshを作る処理は
+typedsolid.cadqueryが持ち、外部のSTLは判定に使った三角形をそのまま描く。
 """
 
+from array import array
 from collections.abc import Sequence
 import base64
+from dataclasses import dataclass
 import html
 import json
 from pathlib import Path
 import re
-import struct
+import sys
 
-import cadquery as cq
+from . import _native
 
-__all__ = ["render_viewer", "write_viewer"]
+__all__ = ["MeshPart", "render_viewer", "stl_part", "write_viewer"]
 
 ASSETS = Path(__file__).resolve().parent / "viewer_assets"
-# 曲面を三角形にする許容誤差。部品全体の外接boxの対角長に対する比と、角度 (rad)。
-TESSELLATION_RATIO = 0.001
-ANGULAR_TOLERANCE = 0.2
 # 外接boxの座標を丸める小数点以下の桁数。OCCTの許容差による端数を除く。検出箇所と同じ桁である。
 BOUNDS_DIGITS = 6
 PLACEHOLDER = re.compile(r"\{\{(TITLE|STYLE|DATA|CORE|APP)\}\}")
@@ -28,23 +30,40 @@ PLACEHOLDER = re.compile(r"\{\{(TITLE|STYLE|DATA|CORE|APP)\}\}")
 Box3 = tuple[Sequence[float], Sequence[float]]
 
 
-def _base64(fmt: str, values: list) -> str:
-    """little endianの配列をbase64にする。viewer_core.jsのdecode*が読む。"""
-    return base64.b64encode(struct.pack(f"<{len(values)}{fmt}", *values)).decode("ascii")
+@dataclass(frozen=True)
+class MeshPart:
+    """viewerに描く1部品の三角形。
+
+    positionsは頂点座標をlittle endianのf32で並べたbytes。indicesは三角形ごとの頂点番号を
+    little endianのu32で並べたbytesで、Noneならpositionsが三角形ごとに3頂点を並べたものとする。
+    """
+
+    id: str
+    positions: bytes
+    indices: bytes | None = None
+
+    def triangle_count(self) -> int:
+        return (len(self.indices) // 12) if self.indices is not None else len(self.positions) // 36
+
+    def bounds(self) -> dict:
+        """頂点の外接box。座標は4 byteのまま走査し、三角形の多いmeshでも全座標をPythonのfloatにしない。"""
+        coordinates = array("f")
+        coordinates.frombytes(self.positions)
+        if sys.byteorder == "big":
+            coordinates.byteswap()
+        return {
+            key: [round(pick(coordinates[axis::3]), BOUNDS_DIGITS) + 0.0 for axis in range(3)]
+            for key, pick in (("min", min), ("max", max))
+        }
 
 
-def _mesh(part_id: str, shape: cq.Shape, tolerance: float) -> dict:
-    vertices, triangles = shape.tessellate(tolerance, ANGULAR_TOLERANCE)
-    box = shape.BoundingBox()
-    return {
-        "id": part_id,
-        "bounds": {
-            "min": [round(v, BOUNDS_DIGITS) + 0.0 for v in (box.xmin, box.ymin, box.zmin)],
-            "max": [round(v, BOUNDS_DIGITS) + 0.0 for v in (box.xmax, box.ymax, box.zmax)],
-        },
-        "positions": _base64("f", [c for v in vertices for c in (v.x, v.y, v.z)]),
-        "indices": _base64("I", [i for triangle in triangles for i in triangle]),
-    }
+def stl_part(id: str, stl: bytes) -> MeshPart:
+    """STLの三角形をそのまま描く部品。外部形状の判定に使ったmeshと同じである。"""
+    return MeshPart(id, _native.stl_triangles(stl))
+
+
+def _base64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
 
 
 def _script_json(value: object) -> str:
@@ -66,17 +85,22 @@ def _embedded(name: str) -> str:
     return text
 
 
+def _part_data(part: MeshPart) -> dict:
+    data = {"id": part.id, "bounds": part.bounds(), "positions": _base64(part.positions)}
+    if part.indices is not None:
+        data["indices"] = _base64(part.indices)
+    return data
+
+
 def render_viewer(
-    shapes: dict[str, cq.Shape], checks: list[dict], keepouts: Sequence[tuple[str, Box3]] = (), title: str = "TypedSolid",
+    parts: Sequence[MeshPart], checks: list[dict], keepouts: Sequence[tuple[str, Box3]] = (),
+    title: str = "TypedSolid",
 ) -> str:
-    """viewerのHTML。shapesは描ける (体積を持つ) 部品に限ること。"""
-    boxes = [shape.BoundingBox() for shape in shapes.values()]
-    diagonal = max((box.DiagonalLength for box in boxes), default=1.0)
-    tolerance = TESSELLATION_RATIO * diagonal
+    """viewerのHTML。partsは三角形を1つ以上持つ部品に限ること。"""
     data = {
         "title": title,
         "units": "mm",
-        "parts": [_mesh(part_id, shape, tolerance) for part_id, shape in shapes.items()],
+        "parts": [_part_data(part) for part in parts],
         "keepouts": [{"id": keepout_id, "min": list(low), "max": list(high)} for keepout_id, (low, high) in keepouts],
         "checks": [
             {key: check[key] for key in ("rule", "target", "status", "message", "locations") if key in check}
@@ -95,11 +119,11 @@ def render_viewer(
 
 
 def write_viewer(
-    shapes: dict[str, cq.Shape], checks: list[dict], path: str | Path,
+    parts: Sequence[MeshPart], checks: list[dict], path: str | Path,
     keepouts: Sequence[tuple[str, Box3]] = (), title: str = "TypedSolid",
 ) -> Path:
     """viewerのHTMLをpathへ書く。"""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_viewer(shapes, checks, keepouts, title), encoding="utf-8")
+    target.write_text(render_viewer(parts, checks, keepouts, title), encoding="utf-8")
     return target
