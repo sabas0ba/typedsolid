@@ -24,7 +24,7 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from examples.assembly_defects import ASSEMBLY_DEFECTS
-from examples.pi4_enclosure import pi4_enclosure_defects
+from examples.pi4_enclosure import PLAN, pi4_enclosure_defects
 from typedsolid.cadquery import build, write_viewer_figure
 from typedsolid.external import inspect_file
 
@@ -224,7 +224,7 @@ def external_viewer(output: Path) -> Viewer:
     stl = output / f"{EXTERNAL}.stl"
     cq.exporters.export(shape, str(stl), tolerance=0.01, angularTolerance=0.1)
     figures = output / f"{EXTERNAL}-figures"
-    checks = inspect_file(stl, model.policy, figures=figures)
+    checks = inspect_file(stl, model.policy, figures=figures, plan=PLAN)
     shutil.copyfile(figures / "viewer.html", output / f"{EXTERNAL}.html")
     return Viewer(EXTERNAL, (EXTERNAL,), checks, shape.BoundingBox().zmax)
 

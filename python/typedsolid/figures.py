@@ -24,6 +24,8 @@ HIGHLIGHT = {
     "support_free": (UNSUPPORTED, "#1f77b4", "blue: unsupported"),
     "closed_cavity": (VOID, "#ff7f0e", "orange: enclosed void"),
     "connector_fit": (0, "#d62728", ""),
+    "resin_drain": (0, "#d62728", ""),
+    "resin_suction": (0, "#d62728", ""),
 }
 SOLID_COLOUR = "#c9ced6"
 # 1つのcheckについて描く検出箇所の数。locationsは大きい順に並ぶ。
@@ -43,13 +45,17 @@ Box3 = tuple[tuple[float, float, float], tuple[float, float, float]]
 
 @dataclass(frozen=True)
 class Figure:
-    """1枚の図。locationがNoneなら部品全体の概観で、全ruleのbitを塗る。"""
+    """1枚の図。locationがNoneなら部品全体の概観で、全ruleのbitを塗る。
+
+    planは断面を判定する製造案のidで、Noneなら採用した製造案である。
+    """
 
     name: str
     part: str
     rule: str | None
     title: str
     location: dict | None
+    plan: str | None = None
 
     def centre(self) -> tuple[float, float, float] | None:
         if self.location is None:
@@ -97,11 +103,16 @@ def plan(model: dict, checks: list[dict]) -> list[Figure]:
         stem = f"{owner}--{check['rule']}"
         if check["target"] != owner:
             stem += f"--{check['target']}"
+        # 採用していない製造案の図は、その製造案で判定した断面を描き、名前に製造案を含める。
+        plan_id = None if check.get("adopted", True) else check.get("plan")
+        heading = check["target"] if plan_id is None else f"{check['target']}, plan {plan_id} (not adopted)"
+        if plan_id is not None:
+            stem += f"--{plan_id}"
         for index, location in enumerate(check["locations"][:FIGURES_PER_CHECK]):
             figures.append(Figure(
                 f"{stem}--{index + 1}", owner, check["rule"],
-                f"{owner}: {check['rule']} ({check['target']}), location {index + 1} of {total}",
-                location,
+                f"{owner}: {check['rule']} ({heading}), location {index + 1} of {total}",
+                location, plan_id,
             ))
     return figures
 
@@ -232,19 +243,21 @@ def unique_file_name(name: str, written: list[str]) -> str:
     return candidate
 
 
-def _write(figures: list[Figure], sections_of: Callable[[str, str], str], directory: Path) -> list[str]:
-    """部品ごとに断面を求め、図をdirectoryへ書く。断面はSECTIONS_PER_CALL枚ずつ求める。"""
+def _write(
+    figures: list[Figure], sections_of: Callable[[str, str | None, str], str], directory: Path,
+) -> list[str]:
+    """部品と製造案ごとに断面を求め、図をdirectoryへ書く。断面はSECTIONS_PER_CALL枚ずつ求める。"""
     directory.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
-    by_part: dict[str, list[Figure]] = {}
+    by_part: dict[tuple[str, str | None], list[Figure]] = {}
     for figure in figures:
-        by_part.setdefault(figure.part, []).append(figure)
-    for part, group in by_part.items():
+        by_part.setdefault((figure.part, figure.plan), []).append(figure)
+    for (part, plan_id), group in by_part.items():
         per_call = SECTIONS_PER_CALL // 3
         for start in range(0, len(group), per_call):
             batch = group[start:start + per_call]
             planes = [plane for figure in batch for plane in _planes(figure)]
-            sections = json.loads(sections_of(part, json.dumps(planes)))
+            sections = json.loads(sections_of(part, plan_id, json.dumps(planes)))
             for index, figure in enumerate(batch):
                 name = unique_file_name(figure.name, written)
                 path = directory / name
@@ -257,15 +270,17 @@ def write_model_figures(model_json: str, checks: list[dict], directory: str | Pa
     """IRのモデルについて、概観と検出箇所の図をdirectoryへ書き、file名を返す。"""
     return _write(
         plan(json.loads(model_json), checks),
-        lambda part, planes: _native.voxel_sections(model_json, part, planes),
+        lambda part, plan_id, planes: _native.voxel_sections(model_json, part, plan_id, planes),
         Path(directory),
     )
 
 
-def write_stl_figures(stl: bytes, policy_json: str, target: str, checks: list[dict], directory: str | Path) -> list[str]:
-    """外部のSTLについて、概観と検出箇所の図をdirectoryへ書き、file名を返す。"""
+def write_stl_figures(
+    stl: bytes, policy_json: str, plan_json: str, target: str, checks: list[dict], directory: str | Path,
+) -> list[str]:
+    """外部のSTLについて、概観と検出箇所の図をdirectoryへ書き、file名を返す。plan_jsonは製造案。"""
     return _write(
         plan({"parts": [{"id": target}]}, checks),
-        lambda _part, planes: _native.stl_sections(stl, policy_json, planes),
+        lambda _part, _plan, planes: _native.stl_sections(stl, policy_json, plan_json, planes),
         Path(directory),
     )

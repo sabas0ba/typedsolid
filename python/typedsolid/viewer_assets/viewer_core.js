@@ -23,6 +23,9 @@
     ghost: [],
     status: "problems",
     rule: "",
+    // 製造案の絞り込み。空なら採用した製造案と、製造案に依らないcheckを示す。"*"ならすべての
+    // 製造案、それ以外は指定した製造案と、製造案に依らないcheckを示す。
+    plan: "",
     q: "",
     sort: "severity",
     yaw: 35,
@@ -297,6 +300,7 @@
       state.status = params.get("status");
     }
     state.rule = params.get("rule") || "";
+    state.plan = params.get("plan") || "";
     state.q = params.get("q") || "";
     if (SORT_KEYS.includes(params.get("sort"))) {
       state.sort = params.get("sort");
@@ -335,7 +339,7 @@
     if (state.ghost.length) {
       params.set("ghost", state.ghost.join(","));
     }
-    for (const key of ["status", "rule", "q", "sort"]) {
+    for (const key of ["status", "rule", "plan", "q", "sort"]) {
       if (state[key] !== DEFAULT_STATE[key]) {
         params.set(key, state[key]);
       }
@@ -359,12 +363,23 @@
     return check.status === status;
   }
 
+  function matchesPlan(check, plan) {
+    if (plan === "*") {
+      return true;
+    }
+    if (!check.plan) {
+      return true;
+    }
+    return plan ? check.plan === plan : check.adopted !== false;
+  }
+
   // checkは書き出し時の順番 (index) を保つ。textは大文字と小文字を区別しない部分一致。
   function filterChecks(checks, filter) {
     const text = (filter.q || "").toLowerCase();
     return checks.filter(
       (check) =>
         matchesStatus(check, filter.status || "all") &&
+        matchesPlan(check, filter.plan || "") &&
         (!filter.rule || check.rule === filter.rule) &&
         (!text || [check.rule, check.target, check.message].some((field) => field.toLowerCase().includes(text))),
     );

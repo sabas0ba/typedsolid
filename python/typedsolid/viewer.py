@@ -103,7 +103,11 @@ def render_viewer(
         "parts": [_part_data(part) for part in parts],
         "keepouts": [{"id": keepout_id, "min": list(low), "max": list(high)} for keepout_id, (low, high) in keepouts],
         "checks": [
-            {key: check[key] for key in ("rule", "target", "status", "message", "locations") if key in check}
+            {
+                key: check[key]
+                for key in ("rule", "target", "status", "message", "locations", "plan", "adopted")
+                if key in check
+            }
             for check in checks
         ],
     }

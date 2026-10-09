@@ -77,7 +77,7 @@ Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative modu
 
 `examples/electronics_enclosure.py`は80×55×24 mm、床・壁厚2 mmの上面開放の筐体を生成する。床から立つφ8 mmのboss 4個を上面z=6 mmの支持面とし、φ3 mmの穴で床とbossを貫く。前面にz=7 mmから上端までの幅20 mmのコネクタ用切り欠き、背面に3×10 mmの通気スリット5本を開ける。60×35×3 mmの基板領域をbossの上に確保し、+Zへ抜けることを検査する。寸法は説明用で、特定の基板やコネクタの仕様ではない。
 
-前面の開口は上端まで開けた切り欠きとしている。上端を閉じた窓にすると上辺が幅20 mmのbridgeとなり、既定の`bridge_max_mm` (5 mm) で`support_free`が落ちる。使用する印刷機がそれ以上を渡せることを確かめた場合は、`Policy(bridge_max_mm=...)`で指定して窓にできる。
+前面の開口は上端まで開けた切り欠きとしている。上端を閉じた窓にすると上辺が幅20 mmのbridgeとなり、既定の`bridge_max_mm` (5 mm) で`support_free`が落ちる。使用する印刷機がそれ以上を渡せることを確かめた場合は、製造案の`Fdm(bridge_max_mm=...)`で指定して窓にできる。
 
 ```bash
 .venv/bin/python examples/electronics_enclosure.py --output .work/electronics-enclosure
@@ -180,7 +180,7 @@ model = Model(parts=(tray, lid), sweeps=(corner.sweep,), fasteners=(corner.faste
 
 熱圧入インサートを使う場合は`insert=InsertSpec(name, source, hole_mm, length_mm)`を与える。インサートは境目と面一に埋め、下穴はネジの先端と`tip_clearance_mm`の分まで延ばす。検査項目は [設計](design.md#ネジ固定の検査) を参照する。
 
-材料と印刷機の値は`Profile`にまとめ、`Policy`と`Assembly`を作る。材料はIRの`Material`として`Model.materials`に渡し、部品の`material`で参照する。印刷機と設計値はIRに現れない。値はすべて必須で、既定値はない。
+材料と印刷機の値は`Profile`にまとめ、`Policy`、FDMの製造案、`Assembly`を作る。材料はIRの`Material`として`Model.materials`に渡し、部品の`material`で参照する。印刷機と設計値はIRに現れない。値はすべて必須で、既定値はない。
 
 ```python
 from typedsolid import Material, Printer, Profile
@@ -193,6 +193,7 @@ profile = Profile(
 )
 lid = Part("lid", lid.features, material=profile.material.id)
 model = Model(parts=(tray, lid), policy=profile.policy(voxel_mm=0.4),
+              default_manufacturing=profile.plan(),
               assembly=profile.assembly(steps), sweeps=(corner.sweep,),
               fasteners=(corner.fastener,), materials=(profile.material,))
 ```
@@ -210,12 +211,12 @@ clip = snap_fit(
 )
 panel = Feature("panel", Box((0, 0, 30), (40, 20, 32)))
 lid = Part("lid", (panel,) + clip.features, material=profile.material.id)
-model = Model(parts=(tray, lid), policy=profile.policy(build_direction="plus_y"),
+model = Model(parts=(tray, lid), default_manufacturing=profile.plan(up="plus_y"),
               assembly=Assembly((Step("open_lid", ("lid",), (Move("plus_z"),)),)),
               materials=(profile.material,), snap_fits=(clip.snap,))
 ```
 
-梁の長さ方向を印刷方向と平行にすると`layer`が落ちる。この例では梁が縦に立つため、印刷方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。検査項目は [設計](design.md#snap-fitの検査) を参照する。
+梁の長さ方向を、梁を持つ部品の採用した製造案の積層方向と平行にすると`layer`が落ちる。この例では梁が縦に立つため、積層方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。部品ごとに姿勢を変える場合は、`Part(manufacturing=...)`で蓋だけに与える。検査項目は [設計](design.md#snap-fitの検査) を参照する。
 
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
@@ -250,18 +251,38 @@ power = connector_opening(
 
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
-印刷姿勢は`Policy.build_direction` (既定`plus_z`)、支持なしで許す傾斜は`overhang_angle_deg` (既定45)、渡せる未支持区間の長さは`bridge_max_mm` (既定5.0) で指定する。
+肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向) に向ける方向である。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
+
+```python
+from typedsolid import Fdm, ManufacturingPlan, Orientation, Part, Resin
+
+printer = Fdm(bridge_max_mm=15.0)
+upside_down = ManufacturingPlan("fdm_upside_down", printer, "手持ちの印刷機で確かめたbridge長",
+                                orientation=Orientation("minus_z"))
+upright = ManufacturingPlan("fdm_upright", printer, "手持ちの印刷機で確かめたbridge長")
+resin = ManufacturingPlan("resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.0, bridge_max_mm=15.0,
+                                         min_drain_mm=3.0), "樹脂の推奨値")
+lid = Part("lid", features, manufacturing=(upside_down, upright, resin), adopted="fdm_upside_down")
+```
+
+製造案を複数持つ部品では`adopted`が必須である。出力の可否は採用した案で決まり、他の案のcheckは`plan`と`adopted: false`を持つ比較用の結果としてreport、図、viewerに現れる。`Resin`は光造形の案で、`min_drain_mm`で未硬化樹脂の排出路の幅を指定し、`resin_drain`と`resin_suction`が加わる。切削と射出成形はまだ扱わない。各ruleの定義は [設計](design.md#製造案) を参照する。
+
+旧版 (schema 9以前) のJSONは、`policy`の肉厚と姿勢の値を持つFDMの案`v9_policy`へ昇格して読める。
 
 ## 外部形状の検査
 
-既存の筐体など、IRで記述していないSTL (binary又はASCII) とSTEPにも、最終形状の4 rule (肉厚、断面、閉空洞、支持) を適用できる。単位はmmとみなす。閉じていないmeshは評価せず拒否する。
+既存の筐体など、IRで記述していないSTL (binary又はASCII) とSTEPにも、最終形状の4 rule (肉厚、断面、閉空洞、支持) を適用できる。`--process resin`では光造形の2 rule (排出路、吸盤) も加わる。単位はmmとみなす。閉じていないmeshは評価せず拒否する。
 
 ```bash
 .venv/bin/python -m typedsolid.external path/to/case.stl
 .venv/bin/python -m typedsolid.external path/to/case.step --min-wall-mm 1.0 --build-direction plus_y --json
+.venv/bin/python -m typedsolid.external path/to/case.stl --process resin --min-wall-mm 1.2 \
+    --overhang-angle-deg 30 --bridge-max-mm 5 --min-drain-mm 3.0
 ```
 
-すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
+製造案は`--process` (`fdm`か`resin`)、`--min-wall-mm`、`--build-direction` (製造案の`up`)、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`から1件を作る。`fdm`で省いた特性は`Fdm()`の既定値とする。`resin`は既定値を持たず、`--min-wall-mm`、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`をすべて要する。
+
+すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy, plan=...)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
 `--figures DIR`を与えると、概観と検出箇所の断面図と、3D viewer (`viewer.html`) をDIRへ書く。viewerは判定に使ったSTLの三角形をそのまま描く。三角形数とfileの大きさは標準エラーに出る。
 
@@ -311,7 +332,7 @@ make viewer-check                    # imageを作り、.work/viewer-check に�
 
 ```bash
 make example
-# .work/board-tray/board_tray.stl をslicerで開き、build_directionと同じ向きに置く
+# .work/board-tray/board_tray.stl をslicerで開き、採用した製造案のupを+Zとする向きに置く
 # サポート自動生成を有効にし、生成箇所がreport.jsonのsupport_freeと矛盾しないか確認する
 ```
 

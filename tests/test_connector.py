@@ -5,7 +5,8 @@ import json
 import unittest
 
 from typedsolid import (
-    Box, BoardConnector, Feature, Model, Part, PlugSource, Policy, board, connector_opening,
+    Box, BoardConnector, Fdm, Feature, ManufacturingPlan, Model, Part, PlugSource, Policy, board,
+    connector_opening,
 )
 from typedsolid.catalog import Board, Source
 from typedsolid.cadquery import build
@@ -13,9 +14,10 @@ from typedsolid.cadquery import build
 # 開口の上縁は幅9.6 mmのbridgeになり、既定のbridge_max_mm (5 mm) を超える。
 # 本testは開口の検査だけを見るため、bridgeの許容長を広げる。
 POLICY = Policy(
-    voxel_mm=0.5, bridge_max_mm=12.0,
+    voxel_mm=0.5,
     required=("valid_solid", "single_solid", "access_clearance", "connector_fit"),
 )
+PLAN = ManufacturingPlan("fdm", Fdm(bridge_max_mm=12.0), "test fixture")
 # testのための値であり、特定の部品の寸法ではない。
 SOURCE = PlugSource("measured", "test fixture")
 
@@ -36,7 +38,10 @@ def model(opening=None, *, extra=()) -> Model:
         Feature("front", Box((0, 0, 0), (40, 2, 14)), "wall"),
         opening.feature,
     ) + extra)
-    return Model(parts=(case,), policy=POLICY, sweeps=(opening.sweep,), connectors=(opening.connector,))
+    return Model(
+        parts=(case,), policy=POLICY, sweeps=(opening.sweep,), connectors=(opening.connector,),
+        default_manufacturing=PLAN,
+    )
 
 
 def checks(result, rule: str) -> list[dict]:
@@ -74,7 +79,7 @@ class HelperTests(unittest.TestCase):
 class IrTests(unittest.TestCase):
     def test_connector_and_source_are_serialized(self):
         data = json.loads(model().to_json())
-        self.assertEqual(data["schema_version"], 9)
+        self.assertEqual(data["schema_version"], 10)
         self.assertEqual(data["connectors"], [{
             "id": "usb", "part": "case", "opening": "usb_opening", "sweep": "usb_plug",
             "plug_mm": [9.0, 3.5], "clearance_mm": 0.3,

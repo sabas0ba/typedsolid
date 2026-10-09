@@ -53,5 +53,5 @@ sha256sum .work/external/parts_holder.stl       # 上表の値と照合する
 ## 解釈
 
 - 既知の欠陥fixture (`tests/test_enclosure_fixtures.py`) を自前のIRからSTLとSTEPへ出力し、この経路でもIRの経路と同じruleが落ちることを`tests/test_external.py`で確かめている。
-- 第三者の筐体では、判定が作者の設計前提 (肉厚、印刷の向き、slicer設定) に強く依存する。failは欠陥の断定ではなく、標準policyとの差を示す。`min_wall_mm`や`build_direction`を作者の前提に合わせて与えると、差の内訳を確かめられる。
+- 第三者の筐体では、判定が作者の設計前提 (肉厚、印刷の向き、slicer設定) に強く依存する。failは欠陥の断定ではなく、標準policyとの差を示す。`--min-wall-mm`や`--build-direction`を作者の前提に合わせて与えると、差の内訳を確かめられる。
 - 閉じていないmeshは評価しない。検査の前提 (内外が定まること) が成り立たないためである。

@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -28,6 +28,8 @@ const MAX_FASTENERS: usize = 1000;
 const MAX_MATERIALS: usize = 100;
 /// snap fitの上限。
 const MAX_SNAP_FITS: usize = 1000;
+/// 1部品が持てる製造案の数。
+const MAX_PLANS: usize = 16;
 /// コネクタ開口の上限。
 const MAX_CONNECTORS: usize = 1000;
 
@@ -293,12 +295,31 @@ pub struct Feature {
 pub struct Part {
     pub id: String,
     pub features: Vec<Feature>,
-    /// `materials`のid。材料に依存する検査 (snap fit) を持つ部品では必須。
+    /// `materials`のid。材料に依存する検査 (snap fit) を持つ部品では、これか採用した
+    /// 製造案の`material`が必要である。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<String>,
+    /// 製造案。1つ以上を持つ。
+    pub manufacturing: Vec<ManufacturingPlan>,
+    /// 出力の可否を決める製造案のid。
+    pub adopted: String,
 }
 
 impl Part {
+    /// 採用した製造案。検証済みのモデルでは必ず存在する。
+    pub fn adopted_plan(&self) -> Option<&ManufacturingPlan> {
+        self.manufacturing
+            .iter()
+            .find(|plan| plan.id == self.adopted)
+    }
+
+    /// 材料に依存する検査で使う材料のid。採用した製造案の材料を部品の材料より優先する。
+    pub fn material_id(&self) -> Option<&String> {
+        self.adopted_plan()
+            .and_then(|plan| plan.material.as_ref())
+            .or(self.material.as_ref())
+    }
+
     /// 付加形状を含むAABB。cutは範囲を広げないため対象にしない。
     pub fn bounds(&self) -> Option<([f64; 3], [f64; 3])> {
         let mut result: Option<([f64; 3], [f64; 3])> = None;
@@ -696,6 +717,134 @@ impl Material {
     }
 }
 
+/// 製造法と、その特性。値は利用者が出典とともに与え、根拠のない既定値を持たない。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Process {
+    /// 熱溶解積層。
+    Fdm {
+        /// 最終形状に要求する最小肉厚。単位はmm。
+        min_wall_mm: f64,
+        /// 支持なしで許す、積層方向に対する最大傾斜角。単位は度。
+        overhang_angle_deg: f64,
+        /// 両端が支持された未支持区間の許容長。単位はmm。
+        bridge_max_mm: f64,
+    },
+    /// 光造形 (SLA/MSLA)。層は造形板から積層方向へ積み、各層は槽の底で硬化する。
+    Resin {
+        min_wall_mm: f64,
+        overhang_angle_deg: f64,
+        bridge_max_mm: f64,
+        /// 未硬化樹脂を排出する通路に要求する最小幅。単位はmm。
+        min_drain_mm: f64,
+    },
+}
+
+impl Process {
+    pub fn min_wall_mm(&self) -> f64 {
+        match self {
+            Self::Fdm { min_wall_mm, .. } | Self::Resin { min_wall_mm, .. } => *min_wall_mm,
+        }
+    }
+
+    pub fn overhang_angle_deg(&self) -> f64 {
+        match self {
+            Self::Fdm {
+                overhang_angle_deg, ..
+            }
+            | Self::Resin {
+                overhang_angle_deg, ..
+            } => *overhang_angle_deg,
+        }
+    }
+
+    pub fn bridge_max_mm(&self) -> f64 {
+        match self {
+            Self::Fdm { bridge_max_mm, .. } | Self::Resin { bridge_max_mm, .. } => *bridge_max_mm,
+        }
+    }
+
+    /// UV樹脂の排出路の最小幅。他の製造法ではNone。
+    pub fn min_drain_mm(&self) -> Option<f64> {
+        match self {
+            Self::Resin { min_drain_mm, .. } => Some(*min_drain_mm),
+            Self::Fdm { .. } => None,
+        }
+    }
+
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        for (name, value) in [("min_wall_mm", self.min_wall_mm())]
+            .into_iter()
+            .chain(self.min_drain_mm().map(|v| ("min_drain_mm", v)))
+        {
+            if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
+                return Err(format!(
+                    "{owner}: {name} must be finite and in [0.01, 1000]"
+                ));
+            }
+        }
+        let overhang = self.overhang_angle_deg();
+        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
+            return Err(format!(
+                "{owner}: overhang_angle_deg must be finite and in [0, 89]"
+            ));
+        }
+        let bridge = self.bridge_max_mm();
+        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
+            return Err(format!(
+                "{owner}: bridge_max_mm must be finite and in [0, 1000]"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 製造時の姿勢。組立状態の座標から製造機の座標への回転を、軸平行の24通りで表す。
+///
+/// `up`は製造機の+Z (積層方向、型を開く方向など) に向ける組立座標の方向、`turn_deg`は
+/// そのあと製造機の+Z周りに回す角度 (0、90、180、270) である。FDMとUV樹脂の検査は
+/// `up`だけを使う。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Orientation {
+    pub up: Direction,
+    #[serde(default)]
+    pub turn_deg: u32,
+}
+
+/// 1つの製造案。製造法と特性、材料、姿勢の組である。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManufacturingPlan {
+    pub id: String,
+    /// `materials`のid。省略すると部品の`material`を使う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
+    pub process: Process,
+    pub orientation: Orientation,
+    /// 特性の値の出典。
+    pub source: String,
+}
+
+impl ManufacturingPlan {
+    /// 値域を確かめる。IRの検証と外部形状の評価が共有する。
+    pub fn validate(&self) -> Result<(), String> {
+        let owner = format!("manufacturing plan {}", self.id);
+        if !identifier(&self.id) {
+            return Err(format!("invalid manufacturing plan id: {}", self.id));
+        }
+        if self.source.trim().is_empty() || self.source.len() > 256 {
+            return Err(format!(
+                "{owner}: source must be non-empty and at most 256 bytes"
+            ));
+        }
+        if ![0, 90, 180, 270].contains(&self.orientation.turn_deg) {
+            return Err(format!("{owner}: turn_deg must be 0, 90, 180 or 270"));
+        }
+        self.process.validate(&owner)
+    }
+}
+
 /// 矩形断面の片持ち梁によるsnap fit。
 ///
 /// `beam`と`hook`は`part`のadd boxのfeatureである。`length_direction`は梁の根元から
@@ -778,8 +927,7 @@ impl SnapFit {
             .get(&self.part)
             .ok_or_else(|| format!("snap fit {id} refers to unknown part {}", self.part))?;
         let strain = part
-            .material
-            .as_ref()
+            .material_id()
             .and_then(|m| materials.get(m))
             .and_then(|m| m.allowable_strain);
         if strain.is_none() {
@@ -981,12 +1129,16 @@ pub enum Rule {
     SnapFit,
     FastenerRelease,
     ConnectorFit,
+    /// UV樹脂: 未硬化樹脂を排出する通路が細すぎる空洞。
+    ResinDrain,
+    /// UV樹脂: 造形中に造形板の側だけが閉じた椀となり、槽の底との間で吸盤となる空洞。
+    ResinSuction,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -1005,6 +1157,8 @@ impl Rule {
         Self::SnapFit,
         Self::FastenerRelease,
         Self::ConnectorFit,
+        Self::ResinDrain,
+        Self::ResinSuction,
         Self::Strength,
         Self::Thermal,
     ];
@@ -1016,6 +1170,9 @@ impl Rule {
         Self::ClosedCavity,
         Self::SupportFree,
     ];
+
+    /// UV樹脂の製造案だけに適用する、voxelから判定するrule。
+    pub const RESIN: [Self; 2] = [Self::ResinDrain, Self::ResinSuction];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1029,21 +1186,10 @@ pub struct Policy {
     /// cell数は3乗で増える。
     #[serde(default = "default_voxel_mm")]
     pub voxel_mm: f64,
-    /// 最終形状に要求する最小肉厚。単位はmm。primitive寸法とは別に指定する。
-    #[serde(default = "default_min_wall_mm")]
-    pub min_wall_mm: f64,
-    /// 接続部に要求する最小断面。単位はmm。
+    /// 接続部に要求する最小断面。単位はmm。製造法に依らない構造の要求である。
+    /// 肉厚、積層方向、overhang、bridgeは製造法に依るため、部品の製造案が持つ。
     #[serde(default = "default_min_neck_mm")]
     pub min_neck_mm: f64,
-    /// 印刷時に上となる方向。層はこの軸に沿って積む。
-    #[serde(default = "default_build_direction")]
-    pub build_direction: Direction,
-    /// 支持なしで許す、印刷方向に対する最大傾斜角。単位は度。
-    #[serde(default = "default_overhang_angle_deg")]
-    pub overhang_angle_deg: f64,
-    /// 両端が支持された未支持区間の許容長。単位はmm。
-    #[serde(default = "default_bridge_max_mm")]
-    pub bridge_max_mm: f64,
     pub required: Vec<Rule>,
 }
 
@@ -1062,21 +1208,9 @@ impl Policy {
         if !pitch.is_finite() || !(0.01..=10.0).contains(&pitch) {
             return Err("voxel_mm must be finite and in [0.01, 10]".into());
         }
-        for (name, value) in [
-            ("min_wall_mm", self.min_wall_mm),
-            ("min_neck_mm", self.min_neck_mm),
-        ] {
-            if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
-                return Err(format!("{name} must be finite and in [0.01, 1000]"));
-            }
-        }
-        let overhang = self.overhang_angle_deg;
-        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
-            return Err("overhang_angle_deg must be finite and in [0, 89]".into());
-        }
-        let bridge = self.bridge_max_mm;
-        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
-            return Err("bridge_max_mm must be finite and in [0, 1000]".into());
+        let neck = self.min_neck_mm;
+        if !neck.is_finite() || !(0.01..=1000.0).contains(&neck) {
+            return Err("min_neck_mm must be finite and in [0.01, 1000]".into());
         }
         let mut required = BTreeSet::new();
         for rule in &self.required {
@@ -1096,24 +1230,8 @@ fn default_voxel_mm() -> f64 {
     0.2
 }
 
-fn default_min_wall_mm() -> f64 {
-    1.2
-}
-
 fn default_min_neck_mm() -> f64 {
     1.2
-}
-
-fn default_build_direction() -> Direction {
-    Direction::PlusZ
-}
-
-fn default_overhang_angle_deg() -> f64 {
-    45.0
-}
-
-fn default_bridge_max_mm() -> f64 {
-    5.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1304,8 +1422,49 @@ fn upgrade_v8(value: &mut Value) -> Result<(), String> {
     if root.contains_key("connectors") {
         return Err("schema_version 8 does not define connectors".into());
     }
-    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    root.insert("schema_version".into(), json!(9));
     root.insert("connectors".into(), json!([]));
+    Ok(())
+}
+
+/// schema v9のJSONをv10へ変換する。v10は肉厚、積層方向、overhang、bridgeをPolicyから
+/// 部品の製造案へ移す。v9の部品は、v9のPolicyの値 (省略時はv9の既定値) を持つFDMの
+/// 製造案を1つ持ち、それを採用するものとして昇格する。
+fn upgrade_v9(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    let policy = root
+        .get_mut("policy")
+        .and_then(Value::as_object_mut)
+        .ok_or("model requires a policy object")?;
+    let mut take = |key: &str, default: Value| policy.remove(key).unwrap_or(default);
+    let min_wall = take("min_wall_mm", json!(1.2));
+    let build_direction = take("build_direction", json!("plus_z"));
+    let overhang = take("overhang_angle_deg", json!(45.0));
+    let bridge = take("bridge_max_mm", json!(5.0));
+    let plan = json!({
+        "id": "v9_policy",
+        "process": {
+            "kind": "fdm", "min_wall_mm": min_wall, "overhang_angle_deg": overhang,
+            "bridge_max_mm": bridge,
+        },
+        "orientation": {"up": build_direction},
+        "source": "schema v9 policy",
+    });
+    let parts = root
+        .get_mut("parts")
+        .and_then(Value::as_array_mut)
+        .ok_or("model requires a parts array")?;
+    for part in parts {
+        let part = part.as_object_mut().ok_or("part must be a JSON object")?;
+        for key in ["manufacturing", "adopted"] {
+            if part.contains_key(key) {
+                return Err(format!("schema_version 9 does not define part {key}"));
+            }
+        }
+        part.insert("manufacturing".into(), json!([plan.clone()]));
+        part.insert("adopted".into(), json!("v9_policy"));
+    }
+    root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
 
@@ -1341,7 +1500,7 @@ impl Model {
         // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
         const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] = [
             upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6, upgrade_v7,
-            upgrade_v8,
+            upgrade_v8, upgrade_v9,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1380,6 +1539,28 @@ impl Model {
             }
             if !part.features.iter().any(|f| f.operation == Operation::Add) {
                 return Err(format!("{} requires additive geometry", part.id));
+            }
+            if part.manufacturing.is_empty() || part.manufacturing.len() > MAX_PLANS {
+                return Err(format!(
+                    "{} requires 1..{MAX_PLANS} manufacturing plans",
+                    part.id
+                ));
+            }
+            let mut plan_ids = BTreeSet::new();
+            for plan in &part.manufacturing {
+                if !plan_ids.insert(&plan.id) {
+                    return Err(format!(
+                        "{}: duplicate manufacturing plan id {}",
+                        part.id, plan.id
+                    ));
+                }
+                plan.validate().map_err(|e| format!("{}: {e}", part.id))?;
+            }
+            if part.adopted_plan().is_none() {
+                return Err(format!(
+                    "{}: adopted plan {} is not among its manufacturing plans",
+                    part.id, part.adopted
+                ));
             }
             total += part.features.len();
             if total > 1000 {
@@ -1463,13 +1644,17 @@ impl Model {
             material.validate()?;
         }
         for part in &self.parts {
-            if let Some(material) = &part.material
-                && !materials.contains_key(material)
-            {
-                return Err(format!(
-                    "part {} refers to unknown material {material}",
-                    part.id
-                ));
+            for material in part.material.iter().chain(
+                part.manufacturing
+                    .iter()
+                    .filter_map(|plan| plan.material.as_ref()),
+            ) {
+                if !materials.contains_key(material) {
+                    return Err(format!(
+                        "part {} refers to unknown material {material}",
+                        part.id
+                    ));
+                }
             }
         }
         if self.snap_fits.len() > MAX_SNAP_FITS {
@@ -1589,6 +1774,8 @@ impl Model {
                 ]
             };
             checks.push(Check {
+                plan: None,
+                adopted: true,
                 locations,
                 rule: Rule::ConnectorFit,
                 status: if problems.is_empty() {
@@ -1734,6 +1921,8 @@ impl Model {
                 }) => format!("is removed after step {step}"),
             };
             checks.push(Check {
+                plan: None,
+                adopted: true,
                 locations: Vec::new(),
                 rule: Rule::FastenerRelease,
                 status: if problems.is_empty() {
@@ -1791,6 +1980,8 @@ impl Model {
                 if feature.operation == Operation::Add {
                     let measured = feature.shape.minimum_dimension();
                     report.checks.push(Check {
+                        plan: None,
+                        adopted: true,
                         locations: Vec::new(),
                         rule: Rule::FeatureThickness,
                         status: if measured >= self.policy.min_feature_mm { Status::Pass } else { Status::Fail },
@@ -1805,6 +1996,8 @@ impl Model {
             .filter(|r| *r != Rule::FeatureThickness)
         {
             report.checks.push(Check {
+                plan: None,
+                adopted: true,
                 locations: Vec::new(),
                 rule,
                 status: Status::NotEvaluated,
@@ -1832,13 +2025,14 @@ impl Model {
                 .geometry(part)
                 .ok_or("validated snap fit lost its beam")?;
             let allowable = part
-                .material
-                .as_ref()
+                .material_id()
                 .and_then(|id| self.materials.iter().find(|m| &m.id == id))
                 .and_then(|m| m.allowable_strain)
                 .ok_or("validated snap fit lost its material")?;
             let strain = snap.strain(geometry);
             checks.push(Check {
+                plan: None,
+                adopted: true,
                 locations: Vec::new(),
                 rule: Rule::SnapFit,
                 status: if strain <= allowable { Status::Pass } else { Status::Fail },
@@ -1848,9 +2042,16 @@ impl Model {
                     geometry.thickness_mm, snap.deflection_mm, geometry.arm_mm
                 ),
             });
-            let build = self.policy.build_direction.axis();
+            // 梁の層の向きは、梁を持つ部品の採用した製造案の姿勢で決まる。
+            let plan = part
+                .adopted_plan()
+                .ok_or("validated part lost its adopted plan")?;
+            let build_direction = plan.orientation.up;
+            let build = build_direction.axis();
             let along = snap.length_direction.axis();
             checks.push(Check {
+                plan: None,
+                adopted: true,
                 locations: Vec::new(),
                 rule: Rule::SnapFit,
                 status: if along == build {
@@ -1860,8 +2061,8 @@ impl Model {
                 },
                 target: format!("{}/layer", snap.id),
                 message: format!(
-                    "beam length along {}; build direction {}",
-                    snap.length_direction, self.policy.build_direction
+                    "beam length along {}; build direction {} (plan {} of {})",
+                    snap.length_direction, build_direction, plan.id, part.id
                 ),
             });
         }
@@ -1890,6 +2091,21 @@ pub struct Check {
     /// 検出箇所。位置を持たないcheckと、passのcheckでは空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<Location>,
+    /// 製造案に依る検査では、その製造案のid。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// 採用した製造案の検査か、製造案に依らない検査か。偽なら比較のための結果であり、
+    /// 出力の可否に用いない。
+    #[serde(default = "adopted_default", skip_serializing_if = "is_adopted")]
+    pub adopted: bool,
+}
+
+fn adopted_default() -> bool {
+    true
+}
+
+fn is_adopted(adopted: &bool) -> bool {
+    *adopted
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1901,10 +2117,12 @@ pub struct Report {
 
 impl Report {
     /// 未実施の必須検査を成功扱いしない。幾何学的証拠の真正性はbackendの責務。
+    /// 採用していない製造案の検査は比較のための結果であり、可否に用いない。
     pub fn export_allowed(&self) -> bool {
-        !self.checks.iter().any(|c| c.status == Status::Fail)
+        let adopted: Vec<&Check> = self.checks.iter().filter(|c| c.adopted).collect();
+        !adopted.iter().any(|c| c.status == Status::Fail)
             && self.required.iter().all(|rule| {
-                let checks: Vec<_> = self.checks.iter().filter(|c| c.rule == *rule).collect();
+                let checks: Vec<_> = adopted.iter().filter(|c| c.rule == *rule).collect();
                 !checks.is_empty() && checks.iter().all(|c| c.status == Status::Pass)
             })
     }
@@ -1921,6 +2139,157 @@ mod tests {
         }
     }
 
+    fn test_plan(id: &str, up: Direction) -> ManufacturingPlan {
+        ManufacturingPlan {
+            id: id.into(),
+            material: None,
+            process: Process::Fdm {
+                min_wall_mm: 1.2,
+                overhang_angle_deg: 45.0,
+                bridge_max_mm: 5.0,
+            },
+            orientation: Orientation { up, turn_deg: 0 },
+            source: "test".into(),
+        }
+    }
+
+    /// v10のJSONをv9の形にする。製造案を外し、部品の採用した製造案の値をPolicyへ戻す。
+    fn as_v9(value: &mut Value) {
+        let mut plan = None;
+        for part in value["parts"].as_array_mut().unwrap() {
+            let part = part.as_object_mut().unwrap();
+            plan = part.remove("manufacturing").map(|plans| plans[0].clone());
+            part.remove("adopted");
+        }
+        let plan = plan.unwrap();
+        let policy = value["policy"].as_object_mut().unwrap();
+        for key in ["min_wall_mm", "overhang_angle_deg", "bridge_max_mm"] {
+            policy.insert(key.into(), plan["process"][key].clone());
+        }
+        policy.insert("build_direction".into(), plan["orientation"]["up"].clone());
+        value["schema_version"] = json!(9);
+    }
+
+    #[test]
+    fn schema_v9_moves_the_policy_into_a_plan_per_part() {
+        let mut value = serde_json::to_value(two_parts()).unwrap();
+        as_v9(&mut value);
+        value["policy"]["min_wall_mm"] = json!(2.0);
+        value["policy"]["build_direction"] = json!("minus_y");
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        for part in &model.parts {
+            assert_eq!(part.adopted, "v9_policy");
+            let plan = part.adopted_plan().unwrap();
+            assert_eq!(plan.process.min_wall_mm(), 2.0);
+            assert_eq!(plan.orientation.up, Direction::MinusY);
+        }
+        // v9が持たない項目は受理しない。
+        let mut invalid = value.clone();
+        invalid["parts"][0]["adopted"] = json!("fdm");
+        assert!(Model::from_json(&invalid.to_string()).is_err());
+        // v9の既定値はv9の既定と同じ値になる。
+        let mut defaults = value.clone();
+        for key in [
+            "min_wall_mm",
+            "build_direction",
+            "overhang_angle_deg",
+            "bridge_max_mm",
+        ] {
+            defaults["policy"].as_object_mut().unwrap().remove(key);
+        }
+        let model = Model::from_json(&defaults.to_string()).unwrap();
+        let plan = model.parts[0].adopted_plan().unwrap();
+        assert_eq!(
+            plan.process,
+            Process::Fdm {
+                min_wall_mm: 1.2,
+                overhang_angle_deg: 45.0,
+                bridge_max_mm: 5.0
+            }
+        );
+        assert_eq!(plan.orientation.up, Direction::PlusZ);
+    }
+
+    #[test]
+    fn manufacturing_plans_are_validated() {
+        type Edit = fn(&mut Model);
+        let cases: [(&str, Edit); 6] = [
+            ("no plan", |m| m.parts[0].manufacturing.clear()),
+            ("unknown adopted plan", |m| {
+                m.parts[0].adopted = "resin".into()
+            }),
+            ("duplicate plan id", |m| {
+                let plan = m.parts[0].manufacturing[0].clone();
+                m.parts[0].manufacturing.push(plan);
+            }),
+            ("turn not a right angle", |m| {
+                m.parts[0].manufacturing[0].orientation.turn_deg = 45
+            }),
+            ("negative wall", |m| {
+                m.parts[0].manufacturing[0].process = Process::Fdm {
+                    min_wall_mm: -1.0,
+                    overhang_angle_deg: 45.0,
+                    bridge_max_mm: 5.0,
+                }
+            }),
+            ("unknown plan material", |m| {
+                m.parts[0].manufacturing[0].material = Some("abs".into())
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut m = model();
+            mutate(&mut m);
+            assert!(m.validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn checks_of_other_plans_do_not_block_export() {
+        let check = |adopted: bool, status: Status| Check {
+            plan: Some(if adopted { "fdm" } else { "resin" }.into()),
+            adopted,
+            locations: Vec::new(),
+            rule: Rule::SupportFree,
+            status,
+            target: "base".into(),
+            message: String::new(),
+        };
+        let report = Report {
+            required: vec![Rule::SupportFree],
+            checks: vec![check(true, Status::Pass), check(false, Status::Fail)],
+        };
+        assert!(report.export_allowed());
+        let blocked = Report {
+            required: vec![Rule::SupportFree],
+            checks: vec![check(false, Status::Pass)],
+        };
+        // 採用した製造案の結果が無ければ、必須のruleは評価されていない。
+        assert!(!blocked.export_allowed());
+    }
+
+    #[test]
+    fn snap_layer_follows_the_plan_of_the_part() {
+        let mut m = with_snap();
+        let layer = |m: &Model| {
+            m.evaluate_snap_fits()
+                .unwrap()
+                .into_iter()
+                .find(|c| c.target.ends_with("/layer"))
+                .unwrap()
+                .status
+        };
+        // 梁は+zから-zへ伸びる。部品の製造案を横向きにすれば積層面に沿う。
+        m.parts[1].manufacturing[0].orientation.up = Direction::PlusZ;
+        assert_eq!(layer(&m), Status::Fail);
+        m.parts[1].manufacturing[0].orientation.up = Direction::PlusX;
+        assert_eq!(layer(&m), Status::Pass);
+        // 他の部品の製造案は関係しない。
+        m.parts[0].manufacturing[0].orientation.up = Direction::PlusY;
+        m.parts[1].manufacturing[0].orientation.up = Direction::MinusZ;
+        assert_eq!(layer(&m), Status::Fail);
+    }
+
     fn model() -> Model {
         Model {
             schema_version: SCHEMA_VERSION,
@@ -1934,6 +2303,8 @@ mod tests {
                     shape: plate(),
                 }],
                 material: None,
+                manufacturing: vec![test_plan("fdm", Direction::PlusZ)],
+                adopted: "fdm".into(),
             }],
             keepouts: vec![],
             sweeps: vec![],
@@ -1946,11 +2317,7 @@ mod tests {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
                 voxel_mm: 0.2,
-                min_wall_mm: 1.2,
                 min_neck_mm: 1.2,
-                build_direction: Direction::PlusZ,
-                overhang_angle_deg: 45.0,
-                bridge_max_mm: 5.0,
                 required: vec![Rule::SingleSolid],
             },
         }
@@ -2013,6 +2380,7 @@ mod tests {
     #[test]
     fn mesh_volume_tolerance_defaults_when_absent() {
         let mut value = serde_json::to_value(model()).unwrap();
+        as_v9(&mut value);
         value["policy"]
             .as_object_mut()
             .unwrap()
@@ -2404,6 +2772,8 @@ mod tests {
                 },
             }],
             material: None,
+            manufacturing: vec![test_plan("fdm", Direction::PlusZ)],
+            adopted: "fdm".into(),
         });
         m
     }
@@ -2790,6 +3160,7 @@ mod tests {
     #[test]
     fn schema_v4_is_upgraded_with_no_fasteners() {
         let mut value = serde_json::to_value(model()).unwrap();
+        as_v9(&mut value);
         let root = value.as_object_mut().unwrap();
         for key in ["fasteners", "materials", "snap_fits", "connectors"] {
             root.remove(key);
@@ -2853,7 +3224,7 @@ mod tests {
     #[test]
     fn snap_fit_strain_follows_beam_theory() {
         let mut m = with_snap();
-        m.policy.build_direction = Direction::PlusX;
+        m.parts[1].manufacturing[0].orientation.up = Direction::PlusX;
         let checks = m.evaluate_snap_fits().unwrap();
         // L=12-4=8 mm、t=1.5 mm、y=1 mm: ε = 1.5·1.5·1/64。
         let geometry = m.snap_fits[0].geometry(&m.parts[1]).unwrap();
@@ -2974,6 +3345,7 @@ mod tests {
     #[test]
     fn schema_v5_is_upgraded_with_no_materials_or_snap_fits() {
         let mut value = serde_json::to_value(model()).unwrap();
+        as_v9(&mut value);
         let root = value.as_object_mut().unwrap();
         root.remove("materials");
         root.remove("snap_fits");
@@ -3037,6 +3409,7 @@ mod tests {
     #[test]
     fn schema_v6_is_upgraded_with_fixed_keepouts() {
         let mut value = serde_json::to_value(with_keepout()).unwrap();
+        as_v9(&mut value);
         value.as_object_mut().unwrap().remove("connectors");
         value["schema_version"] = json!(6);
         let model = Model::from_json(&value.to_string()).unwrap();
@@ -3168,6 +3541,7 @@ mod tests {
     #[test]
     fn schema_v7_is_upgraded_with_screws_that_stay() {
         let mut value = serde_json::to_value(with_screwed_lid(None)).unwrap();
+        as_v9(&mut value);
         value.as_object_mut().unwrap().remove("connectors");
         value["schema_version"] = json!(7);
         let model = Model::from_json(&value.to_string()).unwrap();
@@ -3343,6 +3717,7 @@ mod tests {
     #[test]
     fn schema_v8_is_upgraded_with_no_connectors() {
         let mut value = serde_json::to_value(with_connector()).unwrap();
+        as_v9(&mut value);
         value["schema_version"] = json!(8);
         assert!(Model::from_json(&value.to_string()).is_err());
         value.as_object_mut().unwrap().remove("connectors");
@@ -3359,6 +3734,8 @@ mod tests {
         };
         assert!(!r.export_allowed());
         r.checks.push(Check {
+            plan: None,
+            adopted: true,
             locations: Vec::new(),
             rule: Rule::SingleSolid,
             status: Status::Pass,
@@ -3367,6 +3744,8 @@ mod tests {
         });
         assert!(r.export_allowed());
         r.checks.push(Check {
+            plan: None,
+            adopted: true,
             locations: Vec::new(),
             rule: Rule::Thermal,
             status: Status::Fail,

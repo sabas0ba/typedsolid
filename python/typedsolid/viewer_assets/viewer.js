@@ -291,10 +291,13 @@
     gl.deleteBuffer(handle);
   }
 
-  // 選択中のcheckがあればその検出箇所だけを、なければfailしたcheckのすべての検出箇所を描く。
+  // 選択中のcheckがあればその検出箇所だけを、なければ製造案の絞り込みに合うfailしたcheckの
+  // 検出箇所を描く。既定では採用した製造案のものだけである。
   function visibleLocations() {
     const check = selectedCheck();
-    const source = check ? [check] : checks.filter((c) => c.status === "fail");
+    const source = check
+      ? [check]
+      : core.filterChecks(checks, { status: "fail", plan: state.plan });
     const out = [];
     for (const item of source) {
       item.locations.forEach((box, loc) => out.push({ check: item.index, loc, box }));
@@ -398,6 +401,18 @@
       }
     }
     rule.value = state.rule;
+    const planSelect = document.getElementById("filter-plan");
+    const plans = [...new Set(checks.filter((c) => c.plan).map((c) => c.plan))].sort();
+    if (!planSelect.options.length) {
+      planSelect.append(element("option", { value: "", text: "adopted plans" }));
+      planSelect.append(element("option", { value: "*", text: "all plans" }));
+      for (const name of plans) {
+        planSelect.append(element("option", { value: name, text: `plan ${name}` }));
+      }
+    }
+    planSelect.value = state.plan;
+    // 製造案が1つだけのモデルでは絞り込む意味がない。
+    planSelect.hidden = plans.length < 2;
     const query = document.getElementById("filter-text");
     if (document.activeElement !== query) {
       query.value = state.q;
@@ -444,7 +459,8 @@
     list.replaceChildren();
     for (const check of shown) {
       const selected = state.check === check.index;
-      const row = element("li", { class: `check ${check.status}${selected ? " selected" : ""}` }, [
+      const alternative = check.adopted === false ? " alternative" : "";
+      const row = element("li", { class: `check ${check.status}${alternative}${selected ? " selected" : ""}` }, [
         element("button", {
           class: "check-head",
           "aria-pressed": selected,
@@ -452,7 +468,10 @@
         }, [
           element("span", { class: "status", text: check.status.replace("_", " ") }),
           element("span", { class: "rule", text: check.rule }),
-          element("span", { class: "target", text: check.target }),
+          element("span", {
+            class: "target",
+            text: check.plan ? `${check.target} · plan ${check.plan}${check.adopted === false ? " (not adopted)" : ""}` : check.target,
+          }),
           element("span", { class: "count", text: check.locations.length ? String(check.locations.length) : "" }),
         ]),
       ]);
@@ -488,6 +507,7 @@
   function bindControls() {
     document.getElementById("filter-status").addEventListener("change", (event) => setState({ status: event.target.value }));
     document.getElementById("filter-rule").addEventListener("change", (event) => setState({ rule: event.target.value }));
+    document.getElementById("filter-plan").addEventListener("change", (event) => setState({ plan: event.target.value }));
     document.getElementById("filter-text").addEventListener("input", (event) => setState({ q: event.target.value }));
     document.getElementById("sort").addEventListener("change", (event) => setState({ sort: event.target.value }));
     document.getElementById("clip-axis").addEventListener("change", (event) => {

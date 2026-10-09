@@ -37,11 +37,12 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v9
+## IR v10
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
-- `Model`は`schema_version=9`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`policy`を持つ。
+- `Model`は`schema_version=10`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`policy`を持つ。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
+- `Part`は製造案`manufacturing` (1〜16件) と、そのうち採用する案のid`adopted`を持つ。IRに記述した座標は組立状態の姿勢であり、製造時の姿勢は製造案が持つ。詳細は [製造案](#製造案) を参照する。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
 - 穴は`operation=cut`のcylinder、bossは`add`のcylinderで表す。面取り・filletはOCCTのedge選択に依存するため導入しない。
@@ -53,13 +54,13 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `Sweep`は工具・ケーブル・コネクタ、またはkeepoutを取り出す際に通る領域を表す。形状は`shape` (boxか軸平行cylinder) で直接与えるか、`keepout`を参照してそのclearance込みのboxを使う。どちらか一方に限る。`direction`、`distance_mm` (正の数値か`"exit"`) を持つ。形状は包絡であり、指の入る余地などの余裕を含める。掃引自体はclearanceを持たない。
 - `after_step`を与えた掃引は、そのstepを終えた状態で評価し、取り外した部品は障害物にならない。省略すると組立完了の状態で評価する。USBは蓋を閉じたまま抜き差しでき、ネジは蓋を外してから締める、といった区別をこれで表す。
 - IDは小文字ASCII英字で始まり、小文字英数字とunderscoreのみ、64文字以内。path traversalとWindows予約名を拒否する。
-- `Policy`は`min_feature_mm`のほか、最終形状の検査に`voxel_mm`、`min_wall_mm`、`min_neck_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
+- `Policy`は`min_feature_mm`、`mesh_volume_tolerance`、`required`のほか、最終形状の検査に`voxel_mm`と`min_neck_mm`を持つ。いずれも製造法に依らない値である。肉厚、積層方向、overhang、bridgeは製造法に依るため、製造案が持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
 - `assembly`は分解手順を持つ。IRに記述した部品位置を組立完了の状態とし、`steps`を順に実行して分解する。各stepは`parts`を一体として、軸平行の直線区間を連ねた`path`に沿って動かし、以降の状態から除く。組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
 - 区間の`distance_mm`は正の数値か`"exit"`とする。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離を表し、最後の区間に限る。
 - `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0は硬い干渉だけを見る。
 - `Fastener`はネジ1本の固定を表し、`clamp`の部品を`base`の部品へ締める。`direction`は締め込む向き (頭から先端へ)、`center`は軸に垂直な面上の座標、`seat_mm`は頭の座面、`joint_mm`はclampとbaseの境目の軸方向の座標である。`screw`は長さ (座面から先端)、ねじ部の外径、頭の外径を、`through_mm`はclampの貫通穴の径を持つ。`anchor`は`self_tapping` (`pilot_mm`: 下穴径) か`insert` (`hole_mm`: 圧入前の下穴径、`length_mm`: インサート長。境目と面一に埋める) である。要求値として`min_engagement_mm`と`min_boss_wall_mm`を持つ。
 - ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
-- `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`とはめ合い隙間を作る入力に留める。
+- `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`、製造案、はめ合い隙間を作る入力に留める。
 - `SnapFit`は矩形断面の片持ち梁によるsnap fitを表す。`part`の2つのadd box feature を`beam`と`hook`として参照し、`length_direction` (梁の根元から先端への向き)、`deflection` (外すときにフックが動く向き)、`deflection_mm`、フックが掛かる`mate`、外す分解`step`を持つ。梁の寸法はboxから求め、IRに重ねて持たない。
 - Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かし、両者ともそれ以前のstepで取り外されていない。
 - `Connector`は筐体の壁に開けるコネクタ開口を表す。`part`のcut boxの`opening`、プラグを抜く`sweep` (box形状)、抜く向きに垂直なプラグ断面`plug_mm` (並びはcylinderの`center`と同じ軸順)、開口とプラグの間に各辺で要求する`clearance_mm`、値の出典`source`を持つ。`source`は`kind` (`datasheet`、`measured`、`other`) と`reference` (1〜500文字) からなる。プラグ寸法に既定値はなく、利用者が与える。
@@ -67,7 +68,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ### 旧版からの昇格
 
-`schema_version`が1〜8のJSONは、読み込み時に順に昇格してv9へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜9のJSONは、読み込み時に順に昇格してv10へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
@@ -77,8 +78,9 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - v6→v7: v6のkeepoutは取付先を持たないため、外部に固定されたものとしてそのまま受理する。v7からkeepoutは分解の障害物となるため、同じモデルでも`disassembly_path`の判定が厳しくなる場合がある。v6の入力に`attached_to`が現れた場合は拒否する。
 - v7→v8: v7のネジは外す状態と締めるkeepoutを持たないため、外さないネジとしてそのまま受理する。v8で必須になる`fastener_release`は、ネジで留めた部品を引き離す分解stepがあると落ちる。v7の入力に`release`か`clamp_keepouts`が現れた場合は拒否する。
 - v8→v9: v8はコネクタ開口を持たないため、空の`connectors`を補う。v8の入力に`connectors`が現れた場合は拒否する。
+- v9→v10: `policy`の`min_wall_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を取り除き、その値 (省略されていればv9の既定値1.2、`plus_z`、45、5.0) を持つFDMの製造案`v9_policy`を各部品へ加えて採用する。v9は部品ごとの姿勢を持たないため、全部品が同じ案となる。v9の入力に`manufacturing`か`adopted`が現れた場合は拒否する。
 
-出力は常にv9で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv10で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
@@ -92,6 +94,20 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 `valid_solid`の空判定には接触判定の許容差を流用せず、1e-12 mm³を下限とする。最小box寸法0.001 mmの立方体は1e-9 mm³であり、接触許容差を空判定に使うと正当な最小形状を無効と扱うためである。
 
+### 製造案
+
+`ManufacturingPlan`は1つの製造案であり、`id` (部品内で一意)、`process`、`orientation`、`source` (特性の値の出典、1〜256 byte)、省略可能な`material` (`materials`のid。省略すると部品の`material`) を持つ。同じ部品に、製造法、材料、姿勢の異なる複数の案を並べて比較できる。
+
+- `process`は`kind`で分岐し、製造法ごとの特性を持つ。値は機種と材料に依るため、IRは既定値を持たない (Python APIの`Fdm()`だけは旧`Policy`と同じ既定値を持つ)。
+  - `fdm` (熱溶解積層): `min_wall_mm`、`overhang_angle_deg`、`bridge_max_mm`。
+  - `resin` (光造形、SLA/MSLA): `fdm`と同じ3項目と、未硬化樹脂を排出する通路に要求する最小幅`min_drain_mm`。
+- `orientation`は組立状態の座標から製造機の座標への回転を、軸平行の24通りで表す。`up`は製造機の+Z (積層方向) に向ける組立座標の方向、`turn_deg`はそのあと製造機の+Z周りに回す角度 (0、90、180、270) である。FDMとUV樹脂の検査は`up`だけを使う。
+- 値域: `min_wall_mm`と`min_drain_mm`は0.01〜1000、`overhang_angle_deg`は0〜89、`bridge_max_mm`は0〜1000とする。
+
+**採用と比較**: 製造法に依る検査 (`final_wall_thickness`、`support_free`、UV樹脂の2 rule) は、部品の全製造案について評価し、checkに`plan` (案のid) を持たせる。採用していない案のcheckは`adopted: false`を持ち、出力の可否に用いない。出力の可否は採用した案のcheckと、製造案に依らないcheckだけで決める。必須ruleは、採用した案のcheckが1件以上あり、すべてpassであることを要する。`neck_section`と`closed_cavity`は製造法に依らない形状の検査であり、部品ごとに1件で`plan`を持たない。snap fitの`layer`は、梁を持つ部品の採用した案の`up`と照合する。
+
+**扱わない製造法**: 切削 (3軸) と射出成形は後続の段階で追加する。`up`に加えて`turn_deg`を使う検査も同様である。
+
 ## 検出箇所と図
 
 failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で持つ。passのcheckと、位置を持たないruleのcheckでは省略する。1つのcheckにつき大きい順に20件までとし、総数はmessageの末尾 (`N location(s)`) に書く。
@@ -102,6 +118,8 @@ failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で
 | `neck_section` | erosionで残った成分から材料の内部を幅優先で同時に広げ、異なる成分の前線が出会うcellの連結成分。断面の幅の半分だけ広げる。材料で繋がらない成分は前線が出会わないため、最大の成分以外を示す。材料が残らない場合は部品全体 |
 | `closed_cavity` | 外部に通じない空cellの連結成分ごとの外接box |
 | `support_free` | 支持もbridgeも得られないcellの連結成分ごとの外接box |
+| `resin_drain` | 排出路より奥にある空間の連結成分ごとの外接box。判定した球の中心から半径だけ広げる |
+| `resin_suction` | 造形中に造形板の側が閉じる空間の連結成分ごとの外接box |
 | `connector_fit` | 開口と、掃引前のプラグのbox |
 | `single_solid` | solidごとの外接box。最大のものが本体である |
 | `part_interference` | 2部品の共通部分のsolidごとの外接box |
@@ -114,7 +132,7 @@ failしたcheckは、検出箇所を軸平行のbox (`locations`、単位mm) で
 
 OCCTで判定するruleの検出箇所は、判定に使ったBooleanの結果 (共通部分、または要求領域から材料を引いた残り) のsolidごとの外接boxである。体積の大きい順に並べ、座標は小数点以下6桁に丸める。`valid_solid`は部品全体の妥当性であり、検出箇所を持たない。寸法だけで判定する`snap_fit`の`strain`と`layer`、`fastener_release`も同様である。
 
-**断面図**: `figures/`に、部品ごとの概観と、failしたcheckの検出箇所 (各checkの大きい順に3件) を通るx、y、zの3断面をSVGで書く。図は判定と同じvoxel格子とmaskから描くため、塗った箇所は判定の根拠そのものである。格子より細かい形状は図にも現れない。凡例の色は、赤が薄肉、紫が細い接続部、青が未支持、橙が閉空洞で、灰色が材料、破線が検出箇所のboxである。断面はRust coreが各cellのbit (材料、薄肉、接続部、未支持、閉空洞) を返し、PythonがSVGに描く。SVGの生成は標準libraryだけで行い、CadQueryに依存しない。
+**断面図**: `figures/`に、部品ごとの概観と、failしたcheckの検出箇所 (各checkの大きい順に3件) を通るx、y、zの3断面をSVGで書く。図は判定と同じvoxel格子とmaskから描くため、塗った箇所は判定の根拠そのものである。格子より細かい形状は図にも現れない。凡例の色は、赤が薄肉、紫が細い接続部、青が未支持、橙が閉空洞で、灰色が材料、破線が検出箇所のboxである。断面はRust coreが各cellのbit (材料、薄肉、接続部、未支持、閉空洞) を返し、PythonがSVGに描く。製造案に依るruleの図は、そのcheckの案で求めた格子から描き、採用していない案の図は名前に`--<案>`を加え、題に`plan <案> (not adopted)`と書く。UV樹脂の2 ruleは断面のbitを持たず、検出箇所の破線のboxだけを描く。SVGの生成は標準libraryだけで行い、CadQueryに依存しない。
 
 | 欠陥 | 図 |
 | --- | --- |
@@ -145,13 +163,14 @@ fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`�
 
 `export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部のSTL/STEPでは`typedsolid.external`の`--figures`が同じviewerを書く ([外部形状への適用](#外部形状への適用))。外部の資源を読まず、`file://`のまま開ける。描画は自作のWebGL 1で行い、JavaScriptのpackageに依存しない。meshは最終形状をOCCTで三角形に分割したもので、許容誤差は部品全体の外接boxの対角長の0.1%である。描ける部品がない場合も、checkの一覧を見るために書く。拒否した出力でも`.rejected/`に残る。
 
-- **check**: 状態 (fail と not evaluated、fail、not evaluated、pass、すべて)、rule、文字列 (rule、target、message の部分一致) で絞り込み、状態、rule、target、検出箇所の数で並べ替える。checkを選ぶとmessageと検出箇所の座標を示し、その検出箇所だけを赤く描く。選ばない間はfailしたcheckの検出箇所をすべて描く。画面上の赤い箱をclickすると、そのcheckを選ぶ。
+- **check**: 状態 (fail と not evaluated、fail、not evaluated、pass、すべて)、rule、製造案、文字列 (rule、target、message の部分一致) で絞り込み、状態、rule、target、検出箇所の数で並べ替える。checkを選ぶとmessageと検出箇所の座標を示し、その検出箇所だけを赤く描く。選ばない間はfailしたcheckの検出箇所をすべて描く。画面上の赤い箱をclickすると、そのcheckを選ぶ。
+- **製造案**: 既定では採用した案のcheckと製造案に依らないcheckを示す。製造案の選択で、すべての案、または1つの案 (と製造案に依らないcheck) に切り替える。採用していない案のcheckはtargetに案のidを添え、薄く示す。製造案を2件以上持つ部品がない場合は選択を出さない。
 - **注視**: 検出箇所の`focus`で、その箇所を中心に、周囲を含む距離へ視点を寄せ、箇所を半透明の赤で塗る。
 - **部品**: 部品ごとに表示と半透明を切り替える。検出箇所は部品の内部にあることが多いため、深度によらず手前に描く。keepoutは緑の線 (clearanceを含まない) で描く。
 - **断面**: x、y、zのいずれかの平面より正の側 (反転で負の側) を描かない。切り口は部品色を暗くした地に45°の斜線を入れて塗り、半透明の部品では切り口も同じ透明度で描く。切り口は、部品ごとに断面より残す側の面を深度によらず数えてstencilの偶奇を反転し、奇数の画素 (断面の平面が部品の内部にある画素) だけに平面を塗って求める。meshが閉じていることを前提とし、閉じていない部分では切り口が欠けるか余分に塗られる。stencilを得られない環境では切り口を描かず、切り口から見える部品の内面を灰色で描く。
 - **操作**: dragで回転、右dragまたはshift+dragで平行移動、wheelまたはpinchで拡大する。
 
-表示状態はURL fragmentに書く。例えば`viewer.html#check=12&loc=0&clip=z:8&ghost=tray`は、12番目 (0始まり、reportの順) のcheckを選び、その最初の検出箇所を注視し、z=8 mmで切り、`tray`を半透明にした表示である。同じURLを開くと同じ表示になり、利用者間で表示を共有できる。平行移動は記録しない。
+表示状態はURL fragmentに書く。例えば`viewer.html#check=12&loc=0&clip=z:8&ghost=tray`は、12番目 (0始まり、reportの順) のcheckを選び、その最初の検出箇所を注視し、z=8 mmで切り、`tray`を半透明にした表示である。製造案の選択は`plan=*` (すべて) か`plan=<id>`で書く。同じURLを開くと同じ表示になり、利用者間で表示を共有できる。平行移動は記録しない。
 
 DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの解釈と書き出し、checkの絞り込みと並べ替え、picking) は`viewer_core.js`に分け、`tests/js/`のnode:testで検査する。描画は`scripts/check-viewer.py`が、部品間の欠陥fixture、複数の欠陥を持つRaspberry Pi 4の筐体、その底をSTLに書き出して外部形状の経路で検査したものを、版を固定したChromiumで撮影し、表示状態ごとに部品、検出箇所、断面の色が画面に現れることを確かめる。
 
@@ -161,9 +180,13 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 | z方向の断面 (`lid_overlap`) | ![section](assets/viewer/lid_overlap--section.png) |
 | 複数の欠陥を持つ2部品の筐体の概観 (`pi4_enclosure_defects`) | ![pi4 enclosure defects](assets/viewer/pi4_enclosure_defects--overview.png) |
 
-**Raspberry Pi 4の筐体**: `examples/pi4_enclosure.py`は、部品catalogのRaspberry Pi 4 Model Bの外形、取付穴、コネクタ位置から作る底と蓋の2部品の筐体である。蓋を四隅の柱へ4本のネジで、基板を底の4本のbossへネジで締め、底の壁に6個のコネクタ開口と、プラグを抜く掃引を持つ。蓋には通気スリットを開ける。基板の高さ、PCBの厚み、コネクタの高さとプラグの断面、ネジの寸法、bridgeで渡せる長さ (15 mm) は作例が決めた説明用の値である。正常版 (`pi4_enclosure`) はすべてのruleを通り、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、2部品にまたがって6 ruleの7 checkが落ちる。`tests/test_pi4_enclosure.py`が落ちる集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+**Raspberry Pi 4の筐体**: `examples/pi4_enclosure.py`は、部品catalogのRaspberry Pi 4 Model Bの外形、取付穴、コネクタ位置から作る底と蓋の2部品の筐体である。蓋を四隅の柱へ4本のネジで、基板を底の4本のbossへネジで締め、底の壁に6個のコネクタ開口と、プラグを抜く掃引を持つ。蓋には通気スリットを開け、下面に底の壁の内側へ差し込むlipを持つ。基板の高さ、PCBの厚み、コネクタの高さとプラグの断面、ネジの寸法、bridgeで渡せる長さ (15 mm)、光造形の特性は作例が決めた説明用の値である。
 
-snap fitは持たない。IRは印刷方向をmodel全体で1つだけ持つため、蓋から垂らす梁は積層方向に沿い、正常な設計でも`snap_fit`の積層方向の検査に落ちる。部品ごとの印刷姿勢は後続の課題である。
+製造案は部品ごとに持つ。蓋は裏返して上面を造形板に置くFDMの案 (`fdm_upside_down`) を採用し、比較のため上向きの案 (`fdm_upright`) を持つ。後者はlipの上の天板が支えを持たず`support_free`に落ちる。底はFDMの案 (`fdm`) を採用し、比較のため光造形の案 (`resin`) を持つ。開いた箱を上向きに造形すると、内側が造形中に槽の底との間で閉じるため、`resin_suction`に落ちる。
+
+正常版 (`pi4_enclosure`) は採用した案ですべてのruleを通り、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、採用した案では2部品にまたがって6 ruleの7 checkが落ちる。`tests/test_pi4_enclosure.py`が採用した案と採用していない案のそれぞれで落ちる集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+
+snap fitは持たない。蓋から垂らす梁は、軸平行の姿勢では`snap_fit`の積層方向の検査と`support_free`を同時に満たさない。任意の回転を扱う段階の後に加える。
 
 ## 着脱の検査
 
@@ -225,16 +248,20 @@ snap fitは持たない。IRは印刷方向をmodel全体で1つだけ持つた�
 
 格子の間隔は`policy.voxel_mm` (既定0.2 mm)、cell数の上限は1 partあたり2億である。上限を超える入力はvalidateで拒否する。cellはvoxel中心で内外を判定するため、形状は最大で格子の半分だけ外側へ膨らむ。要求値に格子1つ分を足して判定し、量子化の誤差を失敗側へ倒す。格子より小さい形状は評価できず、`neck_section`がfailするため出力は拒否される。
 
-- `final_wall_thickness`: 各cellを通る軸方向の連続長のうち最小のものを厚さとする。扱うprimitiveは軸平行に限るため、壁は必ずいずれかの軸に沿って厚さを持つ。球のopeningで測ると角や稜線が必ず除去され、十分に厚い立体まで薄肉と判定されるため採らない。面の縁や稜線は必ず薄くなるので、一辺`min_wall_mm`の立方体に満たない領域は形状の縁として数えない。
+製造法に依る検査 (`final_wall_thickness`、`support_free`、`resin_drain`、`resin_suction`) は、部品の製造案ごとに、その案の値と姿勢で評価する ([製造案](#製造案))。格子と製造法に依らない検査の結果は部品ごとに1回だけ求め、案の間で共有する。
+
+- `final_wall_thickness`: 各cellを通る軸方向の連続長のうち最小のものを厚さとする。扱うprimitiveは軸平行に限るため、壁は必ずいずれかの軸に沿って厚さを持つ。球のopeningで測ると角や稜線が必ず除去され、十分に厚い立体まで薄肉と判定されるため採らない。面の縁や稜線は必ず薄くなるので、一辺`min_wall_mm`の立方体に満たない領域は形状の縁として数えない。この閾値は`min_wall_mm`とともに小さくなる。格子化した円柱の外周の端には1 cell幅の列が残り、`voxel_mm` 0.5、高さ5 mmのbossでは約1.25 mm³の薄肉となる。`min_wall_mm`が約1.08 mm未満では閾値を下回るため、これが薄肉として報告される。
 - `neck_section`: 半径`min_neck_mm / 2`でerosionし、6-連結の連結成分が1つに保たれるかを見る。分かれる場合は、その断面で繋がる細い接続部がある。距離場はFelzenszwalb-Huttenlocherの下位包絡線法で求める厳密なEuclidean距離であり、chamfer近似のような方向依存の誤差を持たない。
 - `closed_cavity`: 空cellを格子の外周から6-連結でflood fillし、到達できない空領域を閉空洞とする。格子より細い隙間を通じて外部に通じる空洞は、閉じていると判定される。
-- `support_free`: `policy.build_direction` (既定`plus_z`) の軸で層に分け、各層のcellが直下の層の半径`tan(overhang_angle_deg)` cell以内に材料を持つかを見る。材料が最初に現れる層はbuild plateに接するものとして支持済みとする。直下が支持されているかは問わない。支持の要否は層ごとに独立して評価し、1箇所のoverhangがその上の全体を未支持にすることを避ける。未支持のcellは、同じ層で両端を支持された材料に挟まれ、区間長が`bridge_max_mm`以内であればbridgeとして渡せるものとする。端で終わる区間は片持ちでありbridgeにならない。
+- `support_free`: 製造案の`orientation.up`の軸で層に分け、各層のcellが直下の層の半径`tan(overhang_angle_deg)` cell以内に材料を持つかを見る。材料が最初に現れる層はbuild plateに接するものとして支持済みとする。直下が支持されているかは問わない。支持の要否は層ごとに独立して評価し、1箇所のoverhangがその上の全体を未支持にすることを避ける。未支持のcellは、同じ層で両端を支持された材料に挟まれ、区間長が`bridge_max_mm`以内であればbridgeとして渡せるものとする。端で終わる区間は片持ちでありbridgeにならない。
+- `resin_drain` (UV樹脂の案に限る): 空cellのうち、材料から`(min_drain_mm + voxel_mm) / 2`以上離れたものを格子の外周から6-連結で辿る。辿れないcellは、幅`min_drain_mm`の球が外から入れない奥にあり、未硬化樹脂を排出できない。閉空洞は`closed_cavity`が扱うため除く。要求値に格子1つ分を足し、通路の幅を失敗側へ倒す。
+- `resin_suction` (UV樹脂の案に限る): `orientation.up`の軸で、材料が最初に現れる層 (造形板に接する層) から順に層を加え、それまでの層の空cellを連結する。加えた層の空cellの成分が格子の側面に触れていなければ、その層を槽の底で硬化する時点で、造形板の側が閉じた空間 (椀) となり、剥離時に吸盤として働く。幅`min_drain_mm`の球が収まらない細い椀は除く。逃がし穴の要否と位置の判断に使い、剥離力は評価しない。
 
-`support_free`はノズル径、層厚、冷却、材料といったslicerとプリンタの条件を含まない。判定は幾何のみに基づく保守的な近似であり、実際に支持なしで印刷できることを保証しない。slicerでの評価との突合は`docs/development.md`の手順による。
+`support_free`はノズル径、層厚、冷却、材料といったslicerとプリンタの条件を含まない。UV樹脂の案でも同じ層の判定を用い、樹脂のsupportの配置や剥離力は扱わない。判定は幾何のみに基づく保守的な近似であり、実際に支持なしで印刷できることを保証しない。slicerでの評価との突合は`docs/development.md`の手順による。
 
 ### 外部形状への適用
 
-既存の筐体と比較するため、IRを介さずにSTL (binary又はASCII) とSTEPへ同じ4 ruleを適用できる (`typedsolid.external`)。STEPはCadQueryで読み、弦誤差`voxel_mm/4`で三角形分割してから同じ経路で評価する。座標の単位はmmとみなす。IRの意味を要する検査 (keepout、掃引、分解、ネジ、snap fit、コネクタ開口) と`single_solid`、`valid_solid`は行わない。
+既存の筐体と比較するため、IRを介さずにSTL (binary又はASCII) とSTEPへ同じ4 ruleと、UV樹脂の案ではその2 ruleを適用できる (`typedsolid.external`)。製造案は1件を与え、採用した案として扱う。STEPはCadQueryで読み、弦誤差`voxel_mm/4`で三角形分割してから同じ経路で評価する。座標の単位はmmとみなす。IRの意味を要する検査 (keepout、掃引、分解、ネジ、snap fit、コネクタ開口) と`single_solid`、`valid_solid`は行わない。
 
 - **meshの内外**: 各(x, y) cell中心から+z方向の直線とmeshの交点を求め、winding numberが正の区間を内部とする。外向きの法線が-z成分を持つ面で+1、+z成分を持つ面で-1とする。重なった複数のsolidは和として、内向きの面で囲んだ空洞は空洞として扱う。偶奇則では重なりが外側になるため採らない。
 - **共有辺の扱い**: xy平面へ投影した三角形の内外判定では、辺上の点を辺の向きで一方の三角形だけに割り当てる。辺ごとの符号付き面積は端点を辞書順に並べてから計算し、隣り合う三角形が丸め誤差で同じ交点を二重に数えることを防ぐ。
@@ -273,7 +300,7 @@ backend例外、無効形状、空形状をfailとして保持する。依存を
 | 項目 | 内容 |
 | --- | --- |
 | `strain` | 梁の根元のひずみ ε = 1.5·t·y/L² が材料の`allowable_strain`以下 |
-| `layer` | 梁の長さ方向が`policy.build_direction`と平行でない |
+| `layer` | 梁の長さ方向が、梁を持つ部品の採用した製造案の`orientation.up`と平行でない |
 | `beam` | 梁とフックのboxが部品の最終形状の材料で埋まっている。cutで削られていない |
 | `deflection_space` | 外すstepの直前の状態で、梁とフックを`deflection_mm`だけたわむ向きへ動かした掃引が、同じ部品の他の部分、他の部品、残っているkeepoutの箱に干渉しない |
 | `retention` | たわませないフックと`mate`の相対運動が、外すstepの経路で干渉する。干渉しなければフックは何も保持していない |
@@ -300,7 +327,7 @@ Python APIの`snap_fit`は、根元の面の中心、寸法、向きから梁と
 
 プラグ外形の寸法は組み込まない。USB・HDMI等の規格書は、利用許諾が実装の評価目的に限られる、機密扱いである、有償で転載に許可を要する、のいずれかに当たり、公開するcatalogへの転記と両立しないためである。利用者は、使うプラグやケーブルの部品datasheetの値か実測値を、`source`に根拠を記して与える。
 
-縦の壁に開けた開口の上縁はbridgeとなり、`support_free`が`bridge_max_mm`と照合する。開口の幅がこれを超える場合は、印刷の向きや開口の形を見直すか、slicerのbridge設定に合わせて`bridge_max_mm`を与える。
+縦の壁に開けた開口の上縁はbridgeとなり、`support_free`が`bridge_max_mm`と照合する。開口の幅がこれを超える場合は、製造案の姿勢や開口の形を見直すか、slicerのbridge設定に合わせて製造案の`bridge_max_mm`を与える。
 
 Python APIの`connector_opening`は、抜く向き、プラグ断面の中心と寸法、嵌合状態のプラグの範囲、切り欠く壁の範囲、clearance、出典から、cut feature、`Sweep`、`Connector`を作る。catalogの`Board.connector_center`は、資料が寸法化したコネクタの辺上の位置から`center`を求める。高さ方向の中心は資料が与えないため、呼び出し側が指定する。
 

@@ -6,15 +6,17 @@ from pathlib import Path
 import unittest
 
 from typedsolid import (
-    Assembly, Box, Clearance, Feature, Keepout, Material, Model, Move, Part, Policy, Step, snap_fit,
+    Assembly, Box, Clearance, Fdm, Feature, Keepout, ManufacturingPlan, Material, Model, Move, Orientation, Part,
+    Policy, Step, snap_fit,
 )
 from typedsolid.cadquery import build
 
 # snap fitと分解だけを見る。梁を積層面に沿わせるため、印刷方向は梁の長さ (z) と直交させる。
 POLICY = Policy(
-    voxel_mm=0.5, build_direction="plus_y",
+    voxel_mm=0.5,
     required=("valid_solid", "single_solid", "part_interference", "disassembly_path", "disassembly_separation", "snap_fit"),
 )
+SIDEWAYS = ManufacturingPlan("fdm", Fdm(), "test fixture", Orientation("plus_y"))
 # testのための値であり、特定の材料の値ではない。
 PLA = Material("test_pla", "test PLA", "test fixture", allowable_strain=0.02)
 OPEN_LID = Step("open_lid", ("lid",), (Move("plus_z"),))
@@ -32,7 +34,7 @@ def clip(**overrides):
     return snap_fit("clip", **{**arguments, **overrides})
 
 
-def model(fixing=None, *, ledge: bool = True, base_extra=(), lid_extra=(), steps=(OPEN_LID,), policy=POLICY) -> Model:
+def model(fixing=None, *, ledge: bool = True, base_extra=(), lid_extra=(), steps=(OPEN_LID,), plan=SIDEWAYS) -> Model:
     fixing = fixing or clip()
     base = Part("base", (
         Feature("floor", Box((0, 0, 0), (40, 20, 2))),
@@ -40,8 +42,8 @@ def model(fixing=None, *, ledge: bool = True, base_extra=(), lid_extra=(), steps
     ) + ((Feature("ledge", Box((36, 5, 12), (38, 15, 13))),) if ledge else ()) + base_extra)
     lid = Part("lid", (Feature("panel", Box((0, 0, 30), (40, 20, 32))),) + fixing.features + lid_extra, material="test_pla")
     return Model(
-        parts=(base, lid), policy=policy, assembly=Assembly(steps),
-        materials=(PLA,), snap_fits=(fixing.snap,),
+        parts=(base, lid), policy=POLICY, assembly=Assembly(steps),
+        materials=(PLA,), snap_fits=(fixing.snap,), default_manufacturing=plan,
     )
 
 
@@ -110,7 +112,7 @@ class SnapFitTests(unittest.TestCase):
         self.assertEqual(failing(result, "disassembly_path"), set())
 
     def test_beam_along_the_build_direction_fails_the_layer_check(self):
-        result = build(model(policy=replace(POLICY, build_direction="plus_z")))
+        result = build(model(plan=replace(SIDEWAYS, orientation=Orientation("plus_z"))))
         self.assertEqual(failing(result), {"clip/layer"})
 
     def test_excess_deflection_fails_the_strain(self):

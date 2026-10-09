@@ -128,6 +128,25 @@ class ExternalShapeTests(unittest.TestCase):
         self.assertEqual(main([str(passing), "--min-neck-mm", "2.0"]), 0)
         self.assertEqual(main([str(failing_path), "--min-neck-mm", "2.0"]), 1)
 
+    def test_cli_resin_requires_every_property(self):
+        """光造形の特性は機種と樹脂に依る。FDMの既定値で補わず、省いた値を示して拒否する。"""
+        path = self.export("baseline", ".stl")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            main([str(path), "--process", "resin", "--min-drain-mm", "3.0"])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--min-wall-mm, --overhang-angle-deg, --bridge-max-mm", stderr.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main([str(path), "--min-drain-mm", "3.0"])
+        resin = [
+            str(path), "--min-neck-mm", "2.0", "--json", "--process", "resin", "--min-wall-mm", "1.2",
+            "--overhang-angle-deg", "30", "--bridge-max-mm", "5", "--min-drain-mm", "3.0",
+        ]
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            main(resin)
+        rules = [check["rule"] for check in json.loads(stdout.getvalue())]
+        self.assertEqual(rules[-2:], ["resin_drain", "resin_suction"])
+
 
 if __name__ == "__main__":
     unittest.main()

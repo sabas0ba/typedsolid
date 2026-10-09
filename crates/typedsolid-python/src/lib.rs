@@ -1,7 +1,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use typedsolid_core::{MAX_LOCATIONS, Model, Policy, Report, mesh, voxel};
+use typedsolid_core::{MAX_LOCATIONS, ManufacturingPlan, Model, Policy, Report, mesh, voxel};
 
 #[pyfunction]
 fn normalize_model(json: &str) -> PyResult<String> {
@@ -50,33 +50,48 @@ fn evaluate_connectors(json: &str) -> PyResult<String> {
     serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+fn policy_of(json: &str) -> PyResult<Policy> {
+    serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn plan_of(json: &str) -> PyResult<ManufacturingPlan> {
+    serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn planes_of(json: &str) -> PyResult<Vec<voxel::Plane>> {
+    serde_json::from_str(json).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// 外部のSTL (binary又はASCII) を読み、最終形状のruleを評価する。IRを介さない。
+/// planは製造案のJSONで、採用したものとして扱う。
 #[pyfunction]
-fn evaluate_stl_voxels(stl: &[u8], target: &str, policy: &str) -> PyResult<String> {
-    let policy: Policy =
-        serde_json::from_str(policy).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let checks = voxel::evaluate_stl(stl, target, &policy).map_err(PyValueError::new_err)?;
+fn evaluate_stl_voxels(stl: &[u8], target: &str, policy: &str, plan: &str) -> PyResult<String> {
+    let policy = policy_of(policy)?;
+    let plan = plan_of(plan)?;
+    let checks = voxel::evaluate_stl(stl, target, &policy, &plan).map_err(PyValueError::new_err)?;
     serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// IRの1部品の断面。planesは[{"axis": "x", "coordinate": 1.0}, ...]。
+/// IRの1部品の断面。planesは[{"axis": "x", "coordinate": 1.0}, ...]。planは製造案のidで、
+/// Noneなら採用した製造案で判定する。
 #[pyfunction]
-fn voxel_sections(json: &str, part: &str, planes: &str) -> PyResult<String> {
+#[pyo3(signature = (json, part, plan, planes))]
+fn voxel_sections(json: &str, part: &str, plan: Option<&str>, planes: &str) -> PyResult<String> {
     let model = Model::from_json(json).map_err(PyValueError::new_err)?;
-    let planes: Vec<voxel::Plane> =
-        serde_json::from_str(planes).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let sections = voxel::sections_of_part(&model, part, &planes).map_err(PyValueError::new_err)?;
+    let planes = planes_of(planes)?;
+    let sections =
+        voxel::sections_of_part(&model, part, plan, &planes).map_err(PyValueError::new_err)?;
     serde_json::to_string(&sections).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// 外部のSTLの断面。
+/// 外部のSTLの断面。planは製造案のJSON。
 #[pyfunction]
-fn stl_sections(stl: &[u8], policy: &str, planes: &str) -> PyResult<String> {
-    let policy: Policy =
-        serde_json::from_str(policy).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let planes: Vec<voxel::Plane> =
-        serde_json::from_str(planes).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let sections = voxel::sections_of_stl(stl, &policy, &planes).map_err(PyValueError::new_err)?;
+fn stl_sections(stl: &[u8], policy: &str, plan: &str, planes: &str) -> PyResult<String> {
+    let policy = policy_of(policy)?;
+    let plan = plan_of(plan)?;
+    let planes = planes_of(planes)?;
+    let sections =
+        voxel::sections_of_stl(stl, &policy, &plan, &planes).map_err(PyValueError::new_err)?;
     serde_json::to_string(&sections).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 

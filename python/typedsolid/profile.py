@@ -3,13 +3,13 @@
 値はすべて利用者が与える。材料の許容ひずみや印刷機のはめ合い隙間は機種・材料の
 ロットや設定で変わり、根拠のない既定値を組み込まないためである。材料はIRの
 `Material`であり、Model.materialsに渡して部品へ割り当てる。印刷機と設計値は
-IRに現れず、PolicyとAssemblyを組み立てる入力として使う。
+IRに現れず、Policy、FDMの製造案、Assemblyを組み立てる入力として使う。
 """
 
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .model import Assembly, Direction, Material, Policy, Step
+from .model import Assembly, Direction, Fdm, ManufacturingPlan, Material, Orientation, Policy, Step
 
 
 @dataclass(frozen=True)
@@ -35,15 +35,18 @@ class Profile:
 
     def policy(self, **overrides: Any) -> Policy:
         """profileの値を持つPolicy。voxel_mm、requiredなどprofileにない値はoverridesで与える。"""
-        base = Policy(
-            min_feature_mm=self.min_feature_mm,
-            min_wall_mm=self.min_wall_mm,
-            min_neck_mm=self.min_neck_mm,
-            build_direction=self.build_direction,
-            overhang_angle_deg=self.overhang_angle_deg,
-            bridge_max_mm=self.bridge_max_mm,
-        )
+        base = Policy(min_feature_mm=self.min_feature_mm, min_neck_mm=self.min_neck_mm)
         return replace(base, **overrides)
+
+    def plan(self, id: str = "fdm", up: Direction | None = None, turn_deg: int = 0) -> ManufacturingPlan:
+        """profileの印刷機と材料によるFDMの製造案。upを省くとprofileの積層方向とする。"""
+        return ManufacturingPlan(
+            id,
+            Fdm(self.min_wall_mm, self.overhang_angle_deg, self.bridge_max_mm),
+            f"profile: printer {self.printer.name}, material {self.material.name}",
+            Orientation(up or self.build_direction, turn_deg),
+            self.material.id,
+        )
 
     def assembly(self, steps: tuple[Step, ...]) -> Assembly:
         """印刷機のはめ合い隙間を既定値とするAssembly。stepごとの上書きはStepで行う。"""
