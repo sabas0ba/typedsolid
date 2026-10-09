@@ -34,6 +34,14 @@ test("flat triangles repeat vertices and carry the face normal", () => {
   close(reversed.normals.slice(0, 3), [0, 0, -1]);
 });
 
+test("triangles without indices are read three vertices at a time", () => {
+  const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
+  const result = core.flatTriangles(positions, null);
+  close(result.positions, positions);
+  close(result.normals.slice(0, 3), [0, 0, 1]);
+  close(result.normals.slice(9, 12), [1, 0, 0]);
+});
+
 test("matrix product, inverse and projection agree", () => {
   const view = core.lookAt([10, -10, 10], [0, 0, 0], [0, 0, 1]);
   const projection = core.perspective(Math.PI / 4, 1.5, 0.1, 100);

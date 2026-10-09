@@ -4,7 +4,15 @@
 自前のIRから出力し、IRを介さない経路でも同じruleが落ちることを確かめる。
 """
 
+import base64
+import contextlib
+import io
+import json
 from pathlib import Path
+import re
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -74,6 +82,45 @@ class ExternalShapeTests(unittest.TestCase):
     def test_unknown_format_is_refused(self):
         with self.assertRaisesRegex(ValueError, "対応する形式"):
             inspect_file(self.root / "case.obj", POLICY)
+
+    def test_viewer_draws_the_judged_triangles(self):
+        """viewerは判定に使ったSTLの三角形をそのまま埋め込み、checkと検出箇所を持つ。"""
+        path = self.export("thin_wall", ".stl")
+        figures = self.root / "thin_wall_figures"
+        checks = inspect_file(path, POLICY, figures=figures)
+        html = (figures / "viewer.html").read_text(encoding="utf-8")
+        data = json.loads(re.search(r'id="viewer-data">(.*?)</script>', html, re.S).group(1))
+        (part,) = data["parts"]
+        self.assertEqual(part["id"], "thin_wall")
+        self.assertNotIn("indices", part)
+        stl = path.read_bytes()
+        (count,) = struct.unpack("<I", stl[80:84])
+        self.assertEqual(len(base64.b64decode(part["positions"])), count * 36)
+        self.assertEqual(part["bounds"], {"min": [0.0, 0.0, 0.0], "max": [36.0, 26.0, 14.0]})
+        self.assertEqual([(c["rule"], c["status"]) for c in data["checks"]], [(c["rule"], c["status"]) for c in checks])
+        thin = next(c for c in data["checks"] if c["rule"] == "final_wall_thickness")
+        self.assertTrue(thin["locations"])
+
+    def test_cli_reports_the_viewer_size_on_stderr(self):
+        path = self.export("baseline", ".stl")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            main([str(path), "--min-neck-mm", "2.0", "--json", "--figures", str(self.root / "cli_figures")])
+        self.assertEqual(len(json.loads(stdout.getvalue())), 4)
+        self.assertRegex(stderr.getvalue(), r"viewer: .*viewer\.html \(\d+ triangles, \d+\.\d MB\)")
+
+    def test_stl_viewer_does_not_need_cadquery(self):
+        """外部のSTLの検査と図は、CadQueryを読み込まずに書ける。"""
+        path = self.export("baseline", ".stl")
+        script = (
+            "import sys\n"
+            "from typedsolid.external import inspect_file\n"
+            "from typedsolid import Policy\n"
+            f"inspect_file({str(path)!r}, Policy(min_neck_mm=2.0), figures={str(self.root / 'plain_figures')!r})\n"
+            "assert 'cadquery' not in sys.modules, 'cadquery was imported'\n"
+        )
+        subprocess.run([sys.executable, "-c", script], check=True)
+        self.assertTrue((self.root / "plain_figures" / "viewer.html").exists())
 
     def test_cli_exit_status_follows_the_result(self):
         passing = self.export("baseline", ".stl")

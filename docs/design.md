@@ -143,7 +143,7 @@ fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`�
 
 ### 3D viewer
 
-`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部の資源を読まず、`file://`のまま開ける。描画は自作のWebGL 1で行い、JavaScriptのpackageに依存しない。meshは最終形状をOCCTで三角形に分割したもので、許容誤差は部品全体の外接boxの対角長の0.1%である。描ける部品がない場合も、checkの一覧を見るために書く。拒否した出力でも`.rejected/`に残る。
+`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部のSTL/STEPでは`typedsolid.external`の`--figures`が同じviewerを書く ([外部形状への適用](#外部形状への適用))。外部の資源を読まず、`file://`のまま開ける。描画は自作のWebGL 1で行い、JavaScriptのpackageに依存しない。meshは最終形状をOCCTで三角形に分割したもので、許容誤差は部品全体の外接boxの対角長の0.1%である。描ける部品がない場合も、checkの一覧を見るために書く。拒否した出力でも`.rejected/`に残る。
 
 - **check**: 状態 (fail と not evaluated、fail、not evaluated、pass、すべて)、rule、文字列 (rule、target、message の部分一致) で絞り込み、状態、rule、target、検出箇所の数で並べ替える。checkを選ぶとmessageと検出箇所の座標を示し、その検出箇所だけを赤く描く。選ばない間はfailしたcheckの検出箇所をすべて描く。画面上の赤い箱をclickすると、そのcheckを選ぶ。
 - **注視**: 検出箇所の`focus`で、その箇所を中心に、周囲を含む距離へ視点を寄せ、箇所を半透明の赤で塗る。
@@ -153,7 +153,7 @@ fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`�
 
 表示状態はURL fragmentに書く。例えば`viewer.html#check=12&loc=0&clip=z:8&ghost=tray`は、12番目 (0始まり、reportの順) のcheckを選び、その最初の検出箇所を注視し、z=8 mmで切り、`tray`を半透明にした表示である。同じURLを開くと同じ表示になり、利用者間で表示を共有できる。平行移動は記録しない。
 
-DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの解釈と書き出し、checkの絞り込みと並べ替え、picking) は`viewer_core.js`に分け、`tests/js/`のnode:testで検査する。描画は`scripts/check-viewer.py`が部品間の欠陥fixtureを版を固定したChromiumで撮影し、表示状態ごとに部品、検出箇所、断面の色が画面に現れることを確かめる。
+DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの解釈と書き出し、checkの絞り込みと並べ替え、picking) は`viewer_core.js`に分け、`tests/js/`のnode:testで検査する。描画は`scripts/check-viewer.py`が、部品間の欠陥fixture、複数の欠陥を持つRaspberry Pi 4の筐体、その底をSTLに書き出して外部形状の経路で検査したものを、版を固定したChromiumで撮影し、表示状態ごとに部品、検出箇所、断面の色が画面に現れることを確かめる。
 
 | 表示 | 画像 |
 | --- | --- |
@@ -239,6 +239,7 @@ snap fitは持たない。IRは印刷方向をmodel全体で1つだけ持つた�
 - **meshの内外**: 各(x, y) cell中心から+z方向の直線とmeshの交点を求め、winding numberが正の区間を内部とする。外向きの法線が-z成分を持つ面で+1、+z成分を持つ面で-1とする。重なった複数のsolidは和として、内向きの面で囲んだ空洞は空洞として扱う。偶奇則では重なりが外側になるため採らない。
 - **共有辺の扱い**: xy平面へ投影した三角形の内外判定では、辺上の点を辺の向きで一方の三角形だけに割り当てる。辺ごとの符号付き面積は端点を辞書順に並べてから計算し、隣り合う三角形が丸め誤差で同じ交点を二重に数えることを防ぐ。
 - **格子**: meshの外接boxから半cellずらし、軸平行な面がcell中心を通らないようにする。IRのrasterizeとはcell中心の位置が異なるため、境界に接する形状では占有cell数が一致しない。
+- **図とviewer**: `--figures DIR`で、断面図と3D viewer (`viewer.html`) をDIRへ書く。viewerは判定に使ったSTLの三角形をそのまま描き、間引かない (STEPは判定と同じ分割)。三角形の読み出しはRust coreのSTL parserが行い、CadQueryを読み込まない。CLIはviewerの三角形数と大きさを標準エラーに書く。100万三角形で約50 MBが目安である。
 - **拒否する入力**: 向き付きで対にならない辺があるmesh (閉じていないか、向きが不整合) と、winding numberが負になるか0に戻らない列があるmesh (向きが不整合) は評価せず拒否する。長さ0の辺は面を区切らないため数えない。T字接続 (隣の三角形の辺の途中に頂点がある) のmeshは、幾何的に閉じていても辺が対にならないため拒否される。
 
 **斜めの壁の肉厚**: `final_wall_thickness`は軸方向の連続長を厚さとするため、軸に対して傾いた壁では厚さを過大に測る。45°に傾いた厚さtの壁の連続長は√2·tとなり、薄い壁が通ることがある。IRは軸平行のprimitiveに限るためこの誤差を持たないが、外部形状では検出漏れの側に倒れる。比較結果はこの制約の下で読む。

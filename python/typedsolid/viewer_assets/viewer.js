@@ -127,7 +127,8 @@
     surface = program(SURFACE_VERTEX, SURFACE_FRAGMENT);
     flat = program(FLAT_VERTEX, FLAT_FRAGMENT);
     parts = data.parts.map((part, index) => {
-      const triangles = core.flatTriangles(core.decodeFloat32(part.positions), core.decodeUint32(part.indices));
+      const indices = part.indices ? core.decodeUint32(part.indices) : null;
+      const triangles = core.flatTriangles(core.decodeFloat32(part.positions), indices);
       return {
         id: part.id,
         colour: PART_COLOURS[index % PART_COLOURS.length],

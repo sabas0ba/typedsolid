@@ -81,7 +81,7 @@ class ViewerHtmlTests(TemporaryDirectoryTest):
     def test_text_cannot_close_the_script_or_inject_markup(self):
         hostile = '</script><script>alert(1)</script> & {{APP}}'
         checks = [{"rule": "part_interference", "target": hostile, "status": "fail", "message": hostile}]
-        html = render_viewer({}, checks, title=hostile)
+        html = render_viewer([], checks, title=hostile)
         self.assertNotIn("<script>alert(1)", html)
         self.assertIn("<title>&lt;/script&gt;", html)
         self.assertEqual(html.count("</script>"), 3)
@@ -143,10 +143,9 @@ class ScreenshotCheckTests(TemporaryDirectoryTest):
         path.write_bytes(png(width, height, [b"\xff" * width * 3] * height, [0] * height))
         found = check_viewer.fractions(path)
         self.assertEqual(found, {"location": 0.0, "part": 0.0, "cut": 0.0})
-        model = json.loads(lid_overlap().to_json())
-        checks = [{"status": "pass"}, {"status": "fail"}]
+        viewer = check_viewer.Viewer("lid_overlap", ("tray", "lid"), [{"status": "pass"}, {"status": "fail"}], 17.0)
         seen = {"selected": {"location": 0.01}}
-        for scene in check_viewer.scenes(model, checks):
+        for scene in check_viewer.scenes(viewer):
             with self.subTest(scene=scene.name):
                 self.assertTrue(scene.expect(found, seen))
 

@@ -1,4 +1,7 @@
-"""部品間の欠陥fixtureの3D viewerを書き出し、headless Chromiumで表示状態ごとに撮影して画素を検査する。
+"""欠陥fixtureの3D viewerを書き出し、headless Chromiumで表示状態ごとに撮影して画素を検査する。
+
+対象は、部品間の欠陥fixture、複数の欠陥を持つRaspberry Pi 4の筐体、およびその底をSTLに
+書き出して外部形状の経路 (typedsolid.external) で検査したものである。
 
 Chromiumは既定でdocker/viewerのimageの中で、networkを持たずに動かす。--chromiumで手元の
 binaryを指定することもできる。表示状態はURL fragmentで与える。各状態で、部品、検出箇所、
@@ -9,7 +12,6 @@ binaryを指定することもできる。表示状態はURL fragmentで与え�
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import shutil
@@ -22,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from examples.assembly_defects import ASSEMBLY_DEFECTS
 from examples.pi4_enclosure import pi4_enclosure_defects
 from typedsolid.cadquery import build, write_viewer_figure
+from typedsolid.external import inspect_file
 
 WIDTH, HEIGHT = 1200, 760
 # 右側のpanelを除いた描画領域の幅。viewer.cssの列幅 (380 px) に合わせる。
@@ -36,6 +39,18 @@ MIN_LINE_FRACTION = 0.0002
 DOCS = (("post_in_keepout", "selected"), ("lid_overlap", "section"), ("pi4_enclosure_defects", "overview"))
 # 撮影するfixture。部品間の欠陥を1つずつ持つものと、複数の欠陥を同時に持つ筐体である。
 FIXTURES = tuple(factory for factory, _ in ASSEMBLY_DEFECTS) + (pi4_enclosure_defects,)
+# 外部形状の経路で撮影するSTLの名前。pi4_enclosure_defectsの底を書き出す。
+EXTERNAL = "pi4_base_stl"
+
+
+@dataclass(frozen=True)
+class Viewer:
+    """書き出したviewer。scenesが表示状態を決めるのに使う。"""
+
+    name: str
+    parts: tuple[str, ...]
+    checks: list[dict]
+    top_mm: float
 
 
 # ---- PNG ----
@@ -137,12 +152,12 @@ class Scene:
     expect: Callable[[dict[str, float], dict[str, dict[str, float]]], list[str]]
 
 
-def scenes(model: dict, checks: list[dict]) -> list[Scene]:
+def scenes(viewer: Viewer) -> list[Scene]:
     """fixtureごとの表示状態と、画面に現れるべきもの。"""
-    failing = next(i for i, check in enumerate(checks) if check["status"] == "fail")
-    parts = ",".join(part["id"] for part in model["parts"])
+    failing = next(i for i, check in enumerate(viewer.checks) if check["status"] == "fail")
+    parts = ",".join(viewer.parts)
     # 断面はz方向の中央。部品の内側の面が切り口から見える。
-    top = max(f["shape"]["max"][2] for part in model["parts"] for f in part["features"] if f["shape"]["kind"] == "box")
+    top = viewer.top_mm
     return [
         # 検出箇所の線が画面に現れること。小さい箇所の線は画素が少ないため、下限は0でない最小の目安とする。
         Scene("overview", "", lambda f, _: _require(f, part=0.05, location=MIN_LINE_FRACTION)),
@@ -176,20 +191,40 @@ def shoot(command: list[str], inside: Path, html: str, fragment: str, png: str) 
     )
 
 
+def model_viewer(factory, output: Path) -> Viewer:
+    """IRのモデルを検査し、exportと同じviewerを書く。"""
+    result = build(factory())
+    write_viewer_figure(result, output / f"{factory.__name__}.html")
+    top = max(shape.BoundingBox().zmax for shape in result.shapes.values())
+    return Viewer(factory.__name__, tuple(result.shapes), result.report["checks"], top)
+
+
+def external_viewer(output: Path) -> Viewer:
+    """複数の欠陥を持つ筐体の底をSTLに書き出し、外部形状の経路で検査してviewerを書く。"""
+    import cadquery as cq
+
+    model = pi4_enclosure_defects()
+    shape = build(model).shapes["base"]
+    stl = output / f"{EXTERNAL}.stl"
+    cq.exporters.export(shape, str(stl), tolerance=0.01, angularTolerance=0.1)
+    figures = output / f"{EXTERNAL}-figures"
+    checks = inspect_file(stl, model.policy, figures=figures)
+    shutil.copyfile(figures / "viewer.html", output / f"{EXTERNAL}.html")
+    return Viewer(EXTERNAL, (EXTERNAL,), checks, shape.BoundingBox().zmax)
+
+
 def run(args: argparse.Namespace) -> list[str]:
     """撮影して検査し、満たされなかった項目を返す。"""
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     command, inside = chromium_command(args, output)
     problems = []
-    for factory in FIXTURES:
+    viewers = [model_viewer(factory, output) for factory in FIXTURES] + [external_viewer(output)]
+    for viewer in viewers:
         seen: dict[str, dict[str, float]] = {}
-        model = factory()
-        result = build(model)
-        html = f"{factory.__name__}.html"
-        write_viewer_figure(result, output / html)
-        for scene in scenes(json.loads(result.model_json), result.report["checks"]):
-            png = f"{factory.__name__}--{scene.name}.png"
+        html = f"{viewer.name}.html"
+        for scene in scenes(viewer):
+            png = f"{viewer.name}--{scene.name}.png"
             shoot(command, inside, html, scene.fragment, png)
             found = fractions(output / png)
             missing = scene.expect(found, seen)

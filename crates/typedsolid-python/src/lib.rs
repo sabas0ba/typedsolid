@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use typedsolid_core::{MAX_LOCATIONS, Model, Policy, Report, mesh, voxel};
 
 #[pyfunction]
@@ -79,6 +80,22 @@ fn stl_sections(stl: &[u8], policy: &str, planes: &str) -> PyResult<String> {
     serde_json::to_string(&sections).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// STLの三角形の頂点座標。三角形ごとに9個のlittle endianのf32を並べる。
+/// 3D viewerが、判定に使ったmeshをそのまま描くために使う。
+#[pyfunction]
+fn stl_triangles<'py>(py: Python<'py>, stl: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    let triangles = mesh::parse_stl(stl).map_err(PyValueError::new_err)?;
+    let mut out = Vec::with_capacity(triangles.len() * 36);
+    for triangle in &triangles {
+        for vertex in triangle.vertices() {
+            for coordinate in vertex {
+                out.extend_from_slice(&(coordinate as f32).to_le_bytes());
+            }
+        }
+    }
+    Ok(PyBytes::new(py, &out))
+}
+
 /// 出力STLの構造検査。解析失敗は例外にせず、failのcheckとして返す。
 #[pyfunction]
 fn inspect_mesh(
@@ -109,6 +126,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_stl_voxels, module)?)?;
     module.add_function(wrap_pyfunction!(voxel_sections, module)?)?;
     module.add_function(wrap_pyfunction!(stl_sections, module)?)?;
+    module.add_function(wrap_pyfunction!(stl_triangles, module)?)?;
     module.add_function(wrap_pyfunction!(inspect_mesh, module)?)?;
     module.add_function(wrap_pyfunction!(export_allowed, module)?)?;
     // backendが求める検出箇所も同じ上限で切る。

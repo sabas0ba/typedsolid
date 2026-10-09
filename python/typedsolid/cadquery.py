@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 from typing import Any
 
@@ -31,7 +32,7 @@ from .cache import Cache
 from .figures import write_model_figures
 from .model import Model
 from .projection import write_projections
-from .viewer import write_viewer
+from .viewer import MeshPart, write_viewer
 
 Progress = Callable[[str], None]
 # 検出箇所と、並べ替えに使う体積の組。
@@ -53,6 +54,9 @@ FIGURES_DIR = "figures"
 PROJECTION_DIR = "projection"
 # 3D viewer。部品のmeshと検査結果を埋め込んだ1つのHTMLである。
 VIEWER_FILE = "viewer.html"
+# viewerのmeshの弦誤差。部品全体の外接boxの対角長に対する比と、角度 (rad)。
+TESSELLATION_RATIO = 0.001
+ANGULAR_TOLERANCE = 0.2
 REJECTED_FILES = ("report.json", FIGURES_DIR)
 GEOMETRY_RULES = (
     "valid_solid", "single_solid", "keepout_clearance", "access_clearance", "part_interference",
@@ -817,7 +821,20 @@ def write_viewer_figure(
     keepouts = [(keepout["id"], _aabb(keepout["shape"])) for keepout in data["keepouts"]]
     name = title or "TypedSolid: " + ", ".join(part["id"] for part in data["parts"])
     embedded = result.report["checks"] if checks is None else checks
-    return write_viewer(_drawable(result), embedded, path, keepouts, name)
+    shapes = _drawable(result)
+    diagonal = max((shape.BoundingBox().DiagonalLength for shape in shapes.values()), default=1.0)
+    parts = [_mesh_part(part_id, shape, TESSELLATION_RATIO * diagonal) for part_id, shape in shapes.items()]
+    return write_viewer(parts, embedded, path, keepouts, name)
+
+
+def _mesh_part(part_id: str, shape: cq.Shape, tolerance: float) -> MeshPart:
+    """最終形状をOCCTで三角形に分割した部品。"""
+    vertices, triangles = shape.tessellate(tolerance, ANGULAR_TOLERANCE)
+    positions = [c for v in vertices for c in (v.x, v.y, v.z)]
+    indices = [i for triangle in triangles for i in triangle]
+    return MeshPart(
+        part_id, struct.pack(f"<{len(positions)}f", *positions), struct.pack(f"<{len(indices)}I", *indices),
+    )
 
 
 def _drawable(result: Build) -> dict[str, cq.Shape]:

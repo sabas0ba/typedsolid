@@ -63,13 +63,14 @@
   }
 
   // 三角形ごとに頂点を複製し、面の法線を付ける。陰影で面の境界を見せるためである。
+  // indicesがnullなら、positionsは三角形ごとに3頂点を並べたもの (STLの三角形) とする。
   function flatTriangles(positions, indices) {
-    const count = indices.length;
+    const count = indices ? indices.length : positions.length / 3;
     const outPositions = new Float32Array(count * 3);
     const outNormals = new Float32Array(count * 3);
     for (let t = 0; t < count; t += 3) {
       const p = [0, 1, 2].map((k) => {
-        const i = indices[t + k] * 3;
+        const i = (indices ? indices[t + k] : t + k) * 3;
         return [positions[i], positions[i + 1], positions[i + 2]];
       });
       const n = normalize(cross(subtract(p[1], p[0]), subtract(p[2], p[0])));

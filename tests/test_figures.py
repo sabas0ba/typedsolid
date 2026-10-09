@@ -213,7 +213,7 @@ class ExternalTests(TemporaryDirectoryTest):
         cavity = next(c for c in checks if c["rule"] == "closed_cavity")
         self.assertEqual(cavity["status"], "fail")
         written = sorted(p.name for p in (self.root / "figures").iterdir())
-        self.assertEqual(written, ["case--closed_cavity--1.svg", "case--overview.svg"])
+        self.assertEqual(written, ["case--closed_cavity--1.svg", "case--overview.svg", "viewer.html"])
         self.assertIn(HIGHLIGHT["closed_cavity"][1], fills(self.root / "figures" / "case--closed_cavity--1.svg"))
 
 
