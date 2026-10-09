@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
 
 /// 1 partあたりのcell数の上限。超える入力はvalidateで拒否する。
 pub const MAX_GRID_CELLS: u64 = 200_000_000;
+/// 切削の判定で、工具を平面上で走査する作業量の上限。段取り1つあたりである。
+pub const MAX_MILLING_WORK: u64 = 2_000_000_000;
 /// 外周を必ず空にするための余白。cell数で表す。
 const PADDING_CELLS: u64 = 1;
 
-/// rasterizeに必要なcell数。座標が有限であることは呼び出し前に検証されている。
-pub fn grid_cells(part: &Part, pitch: f64) -> Option<u64> {
+/// rasterizeに必要な各軸のcell数。座標が有限であることは呼び出し前に検証されている。
+pub fn grid_size(part: &Part, pitch: f64) -> Option<[u64; 3]> {
     let (low, high) = part.bounds()?;
-    let mut cells: u64 = 1;
+    let mut size = [0u64; 3];
     for axis in 0..3 {
         let span = high[axis] - low[axis];
         if !span.is_finite() || span < 0.0 {
@@ -27,9 +29,16 @@ pub fn grid_cells(part: &Part, pitch: f64) -> Option<u64> {
         if !count.is_finite() || count < 0.0 || count > u64::MAX as f64 {
             return None;
         }
-        cells = cells.checked_mul(count as u64 + 1 + 2 * PADDING_CELLS)?;
+        size[axis] = (count as u64).checked_add(1 + 2 * PADDING_CELLS)?;
     }
-    Some(cells)
+    Some(size)
+}
+
+/// rasterizeに必要なcell数。
+pub fn grid_cells(part: &Part, pitch: f64) -> Option<u64> {
+    grid_size(part, pitch)?
+        .into_iter()
+        .try_fold(1u64, |cells, count| cells.checked_mul(count))
 }
 
 /// 軸平行の占有格子。cellはvoxel中心で内外を判定する。
@@ -655,6 +664,9 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
     let mut checks = Vec::new();
     for part in &model.parts {
         let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
+        for plan in &part.manufacturing {
+            check_milling_work(grid.size, model.policy.voxel_mm, plan, &part.id)?;
+        }
         let plans: Vec<(&ManufacturingPlan, bool)> = part
             .manufacturing
             .iter()
@@ -676,6 +688,7 @@ pub fn evaluate_stl(
 ) -> Result<Vec<Check>, String> {
     plan.validate()?;
     let grid = stl_grid(bytes, policy)?;
+    check_milling_work(grid.size, policy.voxel_mm, plan, target)?;
     Ok(evaluate_grid(&grid, target, policy, &[(plan, true)]))
 }
 
@@ -821,6 +834,7 @@ pub fn sections_of_stl(
 ) -> Result<Vec<Section>, String> {
     plan.validate()?;
     let grid = stl_grid(bytes, policy)?;
+    check_milling_work(grid.size, policy.voxel_mm, plan, "mesh")?;
     grid.sections(&grid.analyse(policy, &Limits::of(plan)), planes)
 }
 
@@ -849,6 +863,127 @@ impl Limits {
 /// 製造法に当てはまらないmaskは空である。断面の塗り分けでは空のmaskを偽として読む。
 fn marked(mask: &[bool], index: usize) -> bool {
     mask.get(index).copied().unwrap_or(false)
+}
+
+/// 工具の半径をcell数で表したもの。量子化の誤差を失敗側へ倒すため、半cellを加える。
+fn tool_radius_cells(tool_diameter_mm: f64, pitch: f64) -> f64 {
+    (tool_diameter_mm / 2.0 + pitch / 2.0) / pitch
+}
+
+/// 円板の行`offset`に含まれるcellの、行の中心からの最大のずれ。`disc_offsets`と同じ円板である。
+fn half_width(radius: f64, offset: isize) -> usize {
+    let mut width = (radius * radius - (offset * offset) as f64).max(0.0).sqrt() as usize;
+    while ((offset * offset) as f64) + ((width + 1) * (width + 1)) as f64 <= radius * radius {
+        width += 1;
+    }
+    while width > 0 && ((offset * offset) as f64) + (width * width) as f64 > radius * radius {
+        width -= 1;
+    }
+    width
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Extreme {
+    Max,
+    Min,
+}
+
+/// 平面 (`dims`は行数と列数) の各点で、半径`radius` cellの円板に含まれる値の最大か最小。
+/// 平面の外は除く。円板を行ごとの区間に分け、各行で区間の極値を単調な待ち行列で求めるため、
+/// 計算量は平面の点数と円板の行数の積である。円板の全cellを数えると半径の2乗に比例する。
+fn disc_extreme(values: &[u32], dims: [usize; 2], radius: f64, extreme: Extreme) -> Vec<u32> {
+    let [rows, columns] = dims;
+    let reach = radius.floor() as isize;
+    let mut result = vec![
+        match extreme {
+            Extreme::Max => 0,
+            Extreme::Min => u32::MAX,
+        };
+        values.len()
+    ];
+    let mut window = vec![0u32; columns];
+    let mut queue = std::collections::VecDeque::with_capacity(columns);
+    let better = |x: u32, y: u32| match extreme {
+        Extreme::Max => x >= y,
+        Extreme::Min => x <= y,
+    };
+    for offset in -reach..=reach {
+        let half = half_width(radius, offset);
+        for row in 0..rows {
+            let Some(source) = row.checked_add_signed(offset).filter(|r| *r < rows) else {
+                continue;
+            };
+            let line = &values[source * columns..(source + 1) * columns];
+            queue.clear();
+            let mut next = 0usize;
+            for (column, slot) in window.iter_mut().enumerate() {
+                let last = (column + half).min(columns - 1);
+                while next <= last {
+                    while queue
+                        .back()
+                        .is_some_and(|back| better(line[next], line[*back]))
+                    {
+                        queue.pop_back();
+                    }
+                    queue.push_back(next);
+                    next += 1;
+                }
+                let first = column.saturating_sub(half);
+                while queue.front().is_some_and(|front| *front < first) {
+                    queue.pop_front();
+                }
+                *slot = line[*queue.front().expect("the window holds its own column")];
+            }
+            for (target, value) in result[row * columns..(row + 1) * columns]
+                .iter_mut()
+                .zip(window.iter())
+            {
+                if better(*value, *target) {
+                    *target = *value;
+                }
+            }
+        }
+    }
+    result
+}
+
+/// 切削の判定に要する作業量。段取りごとの、工具の半径だけ広げた平面の点数と、
+/// 平面を走査する円板の行数の積の最大である。平面の点数も返す。切削でなければ0とする。
+pub fn milling_work(size: [usize; 3], pitch: f64, plan: &ManufacturingPlan) -> Option<(u64, u64)> {
+    let Process::Milling {
+        tool_diameter_mm, ..
+    } = &plan.process
+    else {
+        return Some((0, 0));
+    };
+    let margin = tool_radius_cells(*tool_diameter_mm, pitch).floor() as u64;
+    let mut work = (0u64, 0u64);
+    for orientation in plan.setups() {
+        let [first, second] = orientation.up.axis().plane();
+        let plane = (size[first] as u64)
+            .checked_add(margin.checked_mul(2)?)?
+            .checked_mul((size[second] as u64).checked_add(margin.checked_mul(2)?)?)?;
+        let total = plane.checked_mul(margin.checked_mul(2)?.checked_add(1)?)?;
+        work = (work.0.max(total), work.1.max(plane));
+    }
+    Some(work)
+}
+
+/// 切削の判定に要する作業量が上限以内か。工具の径が格子に対して大きすぎる入力を、
+/// 評価で記憶を使い尽くす前に拒否する。
+pub fn check_milling_work(
+    size: [usize; 3],
+    pitch: f64,
+    plan: &ManufacturingPlan,
+    owner: &str,
+) -> Result<(), String> {
+    match milling_work(size, pitch, plan) {
+        Some((work, plane)) if work <= MAX_MILLING_WORK && plane <= MAX_GRID_CELLS => Ok(()),
+        _ => Err(format!(
+            "{owner}: manufacturing plan {} needs more than {MAX_MILLING_WORK} steps or {MAX_GRID_CELLS} plane cells to trace the tool at voxel_mm={pitch}; use a coarser grid or a smaller tool",
+            plan.id
+        )),
+    }
 }
 
 /// 半径`radius` cellの円板に含まれる平面上のずれ。
@@ -1096,8 +1231,7 @@ impl Grid {
             let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
             (0..3).all(|axis| (stock_low[axis]..=stock_high[axis]).contains(&cell[axis]))
         };
-        let radius = (tool_diameter_mm / 2.0 + self.pitch / 2.0) / self.pitch;
-        let disc = disc_offsets(radius);
+        let radius = tool_radius_cells(tool_diameter_mm, self.pitch);
         let around = disc_offsets(1.5);
         let margin = radius.floor() as usize;
         let reach = (tool_length_mm / self.pitch).floor() as usize;
@@ -1112,47 +1246,30 @@ impl Grid {
             let wide = [extent[0] + 2 * margin, extent[1] + 2 * margin];
             let at = |a: usize, b: usize| a * wide[1] + b;
             // 各列で、材料の最上cellの1つ上の層。材料が無い列は0。
-            let mut above = vec![0usize; wide[0] * wide[1]];
+            let mut above = vec![0u32; wide[0] * wide[1]];
             for a in 0..extent[0] {
                 for b in 0..extent[1] {
                     let top = (0..layers)
                         .rev()
                         .find(|layer| self.occupied[frame.cell(self, *layer, a, b)]);
-                    above[at(a + margin, b + margin)] = top.map_or(0, |layer| layer + 1);
+                    above[at(a + margin, b + margin)] = top.map_or(0, |layer| layer as u32 + 1);
                 }
             }
             let surface = above.iter().copied().max().unwrap_or(0);
-            let deepest = surface.saturating_sub(reach);
+            let deepest = surface.saturating_sub(reach as u32);
             // 中心qに置いた工具の先端が下りられる層。円板の下の材料より上で、届く深さまで。
-            let mut tip = vec![0usize; above.len()];
-            for a in 0..wide[0] {
-                for b in 0..wide[1] {
-                    let highest = disc
-                        .iter()
-                        .filter_map(|(da, db)| {
-                            let na = a.checked_add_signed(*da).filter(|v| *v < wide[0])?;
-                            let nb = b.checked_add_signed(*db).filter(|v| *v < wide[1])?;
-                            Some(above[at(na, nb)])
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    tip[at(a, b)] = highest.max(deepest);
-                }
+            let mut tip = disc_extreme(&above, wide, radius, Extreme::Max);
+            for value in &mut tip {
+                *value = (*value).max(deepest);
             }
+            // 列を覆う工具の位置のうち、最も深く下りられるもの。
+            let floor = disc_extreme(&tip, wide, radius, Extreme::Min);
+            drop(tip);
             for a in 0..extent[0] {
                 for b in 0..extent[1] {
                     let (ca, cb) = (a + margin, b + margin);
-                    let thin_floor = above[at(ca, cb)].max(deepest);
-                    // 列を覆う工具の位置のうち、最も深く下りられるもの。
-                    let tool_floor = disc
-                        .iter()
-                        .map(|(da, db)| {
-                            let na = ca.checked_add_signed(*da).expect("inside the margin");
-                            let nb = cb.checked_add_signed(*db).expect("inside the margin");
-                            tip[at(na, nb)]
-                        })
-                        .min()
-                        .unwrap_or(usize::MAX);
+                    let thin_floor = above[at(ca, cb)].max(deepest) as usize;
+                    let tool_floor = floor[at(ca, cb)] as usize;
                     for layer in thin_floor..layers {
                         thin_reach[frame.cell(self, layer, a, b)] = true;
                     }
@@ -2761,6 +2878,53 @@ mod tests {
         assert_eq!(status(&thick, Rule::MoldThickWall), Status::Fail);
         let lump = locations(&thick, Rule::MoldThickWall)[0];
         assert!(encloses(&lump, [11.0, 11.0, 3.0]), "{lump:?}");
+    }
+
+    #[test]
+    fn disc_extremes_match_the_disc_offsets() {
+        // 値は決まった擬似乱数列とし、円板の全cellを数える方法と比べる。
+        let dims = [9usize, 13usize];
+        let values: Vec<u32> = (0..dims[0] * dims[1])
+            .map(|i| ((i * 7919 + 13) % 31) as u32)
+            .collect();
+        for radius in [0.5, 1.5, 2.0, 3.5, 4.2, 20.0] {
+            let offsets = disc_offsets(radius);
+            for extreme in [Extreme::Max, Extreme::Min] {
+                let fast = disc_extreme(&values, dims, radius, extreme);
+                for a in 0..dims[0] {
+                    for b in 0..dims[1] {
+                        let inside = offsets.iter().filter_map(|(da, db)| {
+                            let na = a.checked_add_signed(*da).filter(|v| *v < dims[0])?;
+                            let nb = b.checked_add_signed(*db).filter(|v| *v < dims[1])?;
+                            Some(values[na * dims[1] + nb])
+                        });
+                        let slow = match extreme {
+                            Extreme::Max => inside.max(),
+                            Extreme::Min => inside.min(),
+                        }
+                        .unwrap();
+                        assert_eq!(fast[a * dims[1] + b], slow, "radius {radius} at {a},{b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tool_too_large_for_the_grid_is_rejected() {
+        let mut model = model_with(
+            tunnel(),
+            Setup {
+                plan: milling(1000.0, 30.0, Direction::PlusZ, &[]),
+                ..policy(0.5, 0.5, 0.05)
+            },
+        );
+        let error = model.validate().unwrap_err();
+        assert!(error.contains("smaller tool"), "{error}");
+        // 格子を粗くすれば受理する。
+        model.policy.voxel_mm = 0.5;
+        model.parts[0].manufacturing[0] = milling(20.0, 30.0, Direction::PlusZ, &[]);
+        model.validate().unwrap();
     }
 
     #[test]

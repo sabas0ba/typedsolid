@@ -1720,6 +1720,12 @@ impl Model {
                     ));
                 }
             }
+            if let Some(size) = voxel::grid_size(part, pitch) {
+                let size = size.map(|count| count as usize);
+                for plan in &part.manufacturing {
+                    voxel::check_milling_work(size, pitch, plan, &part.id)?;
+                }
+            }
         }
         let mut ids = BTreeSet::new();
         for keepout in &self.keepouts {
