@@ -78,6 +78,7 @@ MESH_RULES = ("mesh_manifold", "mesh_volume")
 # IRから直接rasterizeして判定する。backendのtopologyに依存しない。
 VOXEL_RULES = (
     "final_wall_thickness", "neck_section", "closed_cavity", "support_free", "resin_drain", "resin_suction",
+    "milling_reach", "milling_corner", "mold_undercut", "mold_thick_wall", "mold_draft",
 )
 AXES = "xyz"
 # 各軸の負側・正側の面名。indexは軸番号に対応する。

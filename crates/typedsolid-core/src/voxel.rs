@@ -5,7 +5,7 @@
 
 use crate::{
     Axis, Check, Direction, Location, MAX_LOCATIONS, ManufacturingPlan, Model, Operation, Part,
-    Policy, Rule, Status, mesh,
+    Policy, Process, Rule, Status, mesh,
 };
 use serde::{Deserialize, Serialize};
 
@@ -762,7 +762,10 @@ impl Grid {
                                     (self.occupied[index], SECTION_SOLID),
                                     (analysis.manufacture.thin[index], SECTION_THIN),
                                     (analysis.structure.neck[index], SECTION_NECK),
-                                    (analysis.manufacture.unsupported[index], SECTION_UNSUPPORTED),
+                                    (
+                                        marked(&analysis.manufacture.unsupported, index),
+                                        SECTION_UNSUPPORTED,
+                                    ),
                                     (analysis.structure.void[index], SECTION_VOID),
                                 ]
                                 .into_iter()
@@ -825,23 +828,36 @@ pub fn sections_of_stl(
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub min_wall_mm: f64,
-    pub build_direction: Direction,
-    pub overhang_angle_deg: f64,
-    pub bridge_max_mm: f64,
-    /// UV樹脂の排出路の最小幅。他の製造法ではNone。
-    pub min_drain_mm: Option<f64>,
+    /// 製造案の`orientation.up`。積層方向、工具を下ろす側、型を開く軸の基準である。
+    pub up: Direction,
+    pub process: Process,
+    /// 段取りごとの`up`。切削以外は`up`だけである。
+    pub setups: Vec<Direction>,
 }
 
 impl Limits {
     pub fn of(plan: &ManufacturingPlan) -> Self {
         Self {
             min_wall_mm: plan.process.min_wall_mm(),
-            build_direction: plan.orientation.up,
-            overhang_angle_deg: plan.process.overhang_angle_deg(),
-            bridge_max_mm: plan.process.bridge_max_mm(),
-            min_drain_mm: plan.process.min_drain_mm(),
+            up: plan.orientation.up,
+            process: plan.process.clone(),
+            setups: plan.setups().map(|orientation| orientation.up).collect(),
         }
     }
+}
+
+/// 製造法に当てはまらないmaskは空である。断面の塗り分けでは空のmaskを偽として読む。
+fn marked(mask: &[bool], index: usize) -> bool {
+    mask.get(index).copied().unwrap_or(false)
+}
+
+/// 半径`radius` cellの円板に含まれる平面上のずれ。
+fn disc_offsets(radius: f64) -> Vec<(isize, isize)> {
+    let reach = radius.floor() as isize;
+    (-reach..=reach)
+        .flat_map(|da| (-reach..=reach).map(move |db| (da, db)))
+        .filter(|(da, db)| ((da * da + db * db) as f64) <= radius * radius)
+        .collect()
 }
 
 /// 形状だけで決まる判定材料。製造案に依らず、部品ごとに1回求める。
@@ -855,22 +871,35 @@ pub struct Structure {
     enclosed: usize,
 }
 
-/// 製造案に依る判定材料。
+/// 製造案に依る判定材料。製造法に当てはまらないmaskは空である。
 pub struct Manufacture {
     /// 一辺`min_wall_mm`の立方体以上の大きさを持つ薄肉領域。
     pub thin: Vec<bool>,
-    /// bridgeでも支持されないcell。
+    /// FDMとUV樹脂: bridgeでも支持されないcell。
     pub unsupported: Vec<bool>,
-    /// UV樹脂: 細い通路の奥にあり、樹脂が抜けない空間。他の製造法では空。
+    /// UV樹脂: 細い通路の奥にあり、樹脂が抜けない空間。
     pub trapped: Vec<bool>,
-    /// UV樹脂: 造形中に造形板の側だけが閉じた椀となる空間。他の製造法では空。
+    /// UV樹脂: 造形中に造形板の側だけが閉じた椀となる空間。
     pub suction: Vec<bool>,
+    /// 切削: どの段取りからも細い工具が届かない素材内の空間。
+    pub unreachable: Vec<bool>,
+    /// 切削: 細い工具なら届くが、工具の径では削れない素材内の空間。
+    pub corner: Vec<bool>,
+    /// 射出成形: 型を開く軸のどちら側へも抜けない空間。
+    pub undercut: Vec<bool>,
+    /// 射出成形: 内接球の直径が最大肉厚を超える材料の芯。
+    pub thick: Vec<bool>,
     thin_regions: usize,
     largest_thin: usize,
     unsupported_cells: usize,
     spanned_cells: usize,
     trapped_regions: usize,
     suction_regions: usize,
+    unreachable_cells: usize,
+    corner_cells: usize,
+    undercut_cells: usize,
+    /// 最も厚い箇所の内接球の直径の上界。単位はcell。
+    thickest_cells: f64,
 }
 
 /// 最終形状のruleが検出したcellのmaskと、messageに書く集計値。
@@ -957,45 +986,286 @@ impl Grid {
             .filter(|size| *size >= minimum_cells)
             .collect();
 
-        let support = self.support(
-            limits.build_direction,
-            limits.overhang_angle_deg,
-            limits.bridge_max_mm,
-        );
-        let unsupported: Vec<bool> = self
-            .occupied
-            .iter()
-            .zip(support.supported.iter())
-            .zip(support.bridged.iter())
-            .map(|((solid, held), spanned)| *solid && !*held && !*spanned)
-            .collect();
-        let unsupported_cells = unsupported.iter().filter(|cell| **cell).count();
-        let spanned_cells = support.bridged.iter().filter(|cell| **cell).count();
+        let count = self.occupied.len();
+        let (unsupported, unsupported_cells, spanned_cells) = match limits.process.layering() {
+            Some((overhang, bridge)) => {
+                let support = self.support(limits.up, overhang, bridge);
+                let unsupported: Vec<bool> = self
+                    .occupied
+                    .iter()
+                    .zip(support.supported.iter())
+                    .zip(support.bridged.iter())
+                    .map(|((solid, held), spanned)| *solid && !*held && !*spanned)
+                    .collect();
+                let cells = unsupported.iter().filter(|cell| **cell).count();
+                let spanned = support.bridged.iter().filter(|cell| **cell).count();
+                (unsupported, cells, spanned)
+            }
+            None => (Vec::new(), 0, 0),
+        };
 
-        let (trapped, suction) = match limits.min_drain_mm {
+        let (trapped, suction) = match limits.process.min_drain_mm() {
             Some(drain) => (
                 self.trapped_resin(drain, void),
-                self.suction_cups(limits.build_direction, drain),
+                self.suction_cups(limits.up, drain),
             ),
-            None => (
-                vec![false; self.occupied.len()],
-                vec![false; self.occupied.len()],
-            ),
+            None => (Vec::new(), Vec::new()),
         };
-        let trapped_regions = self.labels(&trapped).1.len();
-        let suction_regions = self.labels(&suction).1.len();
+        let (unreachable, corner) = match &limits.process {
+            Process::Milling {
+                tool_diameter_mm,
+                tool_length_mm,
+                ..
+            } => self.milling_leftovers(&limits.setups, *tool_diameter_mm, *tool_length_mm),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let (undercut, thick, thickest_cells) = match &limits.process {
+            Process::Molding { max_wall_mm, .. } => {
+                let (thick, thickest) = self.thick_sections(*max_wall_mm);
+                (self.undercuts(limits.up), thick, thickest)
+            }
+            _ => (Vec::new(), Vec::new(), 0.0),
+        };
+        let cells = |mask: &[bool]| mask.iter().filter(|cell| **cell).count();
+        debug_assert!(
+            [&unreachable, &corner, &undercut, &thick]
+                .iter()
+                .all(|mask| mask.is_empty() || mask.len() == count)
+        );
         Manufacture {
             thin,
             unsupported,
+            trapped_regions: self.labels(&trapped).1.len(),
+            suction_regions: self.labels(&suction).1.len(),
             trapped,
             suction,
+            unreachable_cells: cells(&unreachable),
+            corner_cells: cells(&corner),
+            undercut_cells: cells(&undercut),
+            unreachable,
+            corner,
+            undercut,
+            thick,
             thin_regions: kept.len(),
             largest_thin: kept.iter().copied().max().unwrap_or(0),
             unsupported_cells,
             spanned_cells,
-            trapped_regions,
-            suction_regions,
+            thickest_cells,
         }
+    }
+
+    /// 材料のcellを含む最小のindex範囲。材料が無ければNone。
+    fn material_bounds(&self) -> Option<([usize; 3], [usize; 3])> {
+        let mut low = [usize::MAX; 3];
+        let mut high = [0usize; 3];
+        let [nx, ny, _] = self.size;
+        for (index, solid) in self.occupied.iter().enumerate() {
+            if *solid {
+                let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
+                for axis in 0..3 {
+                    low[axis] = low[axis].min(cell[axis]);
+                    high[axis] = high[axis].max(cell[axis]);
+                }
+            }
+        }
+        (low[0] != usize::MAX).then_some((low, high))
+    }
+
+    /// 3軸の切削で削り残す素材内の空間。素材は材料の外接boxとする。
+    ///
+    /// 返り値は、どの段取りからも径0の工具が届かない空間 (undercutと届かない深さ) と、
+    /// 径0の工具なら届くが`tool_diameter_mm`の工具では削れない空間 (内角の丸みと細い溝) である。
+    /// 工具は平端の円柱で、段取りの`up`の側から下ろす。先端の高さは、工具の円板の下にある
+    /// 材料の最上面より上に限る。素材の上面から`tool_length_mm`より深くは届かない。
+    /// 量子化の誤差を失敗側へ倒すため、工具の半径に半cellを加え、届く深さは切り捨てる。
+    /// 一方、工具軸に垂直な層で8-連結の2 cell以下の削り残しは、格子化した円弧と円板の差で
+    /// 生じるため、削れたものとみなす。工具の半径が1.5 cellを超えれば、鋭い内角は層内で
+    /// 3 cell以上を削り残す。
+    fn milling_leftovers(
+        &self,
+        setups: &[Direction],
+        tool_diameter_mm: f64,
+        tool_length_mm: f64,
+    ) -> (Vec<bool>, Vec<bool>) {
+        let count = self.occupied.len();
+        let Some((stock_low, stock_high)) = self.material_bounds() else {
+            return (vec![false; count], vec![false; count]);
+        };
+        let [nx, ny, _] = self.size;
+        let in_stock = |index: usize| {
+            let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
+            (0..3).all(|axis| (stock_low[axis]..=stock_high[axis]).contains(&cell[axis]))
+        };
+        let radius = (tool_diameter_mm / 2.0 + self.pitch / 2.0) / self.pitch;
+        let disc = disc_offsets(radius);
+        let around = disc_offsets(1.5);
+        let margin = radius.floor() as usize;
+        let reach = (tool_length_mm / self.pitch).floor() as usize;
+        let mut thin_reach = vec![false; count];
+        let mut tool_reach = vec![false; count];
+        let mut reached = vec![false; count];
+        for direction in setups {
+            let frame = Layered::new(*direction);
+            let layers = self.size[frame.up];
+            let extent = [self.size[frame.plane[0]], self.size[frame.plane[1]]];
+            // 工具の中心は格子の外にも置ける。円板の半径だけ広げた平面で扱う。
+            let wide = [extent[0] + 2 * margin, extent[1] + 2 * margin];
+            let at = |a: usize, b: usize| a * wide[1] + b;
+            // 各列で、材料の最上cellの1つ上の層。材料が無い列は0。
+            let mut above = vec![0usize; wide[0] * wide[1]];
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let top = (0..layers)
+                        .rev()
+                        .find(|layer| self.occupied[frame.cell(self, *layer, a, b)]);
+                    above[at(a + margin, b + margin)] = top.map_or(0, |layer| layer + 1);
+                }
+            }
+            let surface = above.iter().copied().max().unwrap_or(0);
+            let deepest = surface.saturating_sub(reach);
+            // 中心qに置いた工具の先端が下りられる層。円板の下の材料より上で、届く深さまで。
+            let mut tip = vec![0usize; above.len()];
+            for a in 0..wide[0] {
+                for b in 0..wide[1] {
+                    let highest = disc
+                        .iter()
+                        .filter_map(|(da, db)| {
+                            let na = a.checked_add_signed(*da).filter(|v| *v < wide[0])?;
+                            let nb = b.checked_add_signed(*db).filter(|v| *v < wide[1])?;
+                            Some(above[at(na, nb)])
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    tip[at(a, b)] = highest.max(deepest);
+                }
+            }
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let (ca, cb) = (a + margin, b + margin);
+                    let thin_floor = above[at(ca, cb)].max(deepest);
+                    // 列を覆う工具の位置のうち、最も深く下りられるもの。
+                    let tool_floor = disc
+                        .iter()
+                        .map(|(da, db)| {
+                            let na = ca.checked_add_signed(*da).expect("inside the margin");
+                            let nb = cb.checked_add_signed(*db).expect("inside the margin");
+                            tip[at(na, nb)]
+                        })
+                        .min()
+                        .unwrap_or(usize::MAX);
+                    for layer in thin_floor..layers {
+                        thin_reach[frame.cell(self, layer, a, b)] = true;
+                    }
+                    for layer in tool_floor.min(layers)..layers {
+                        reached[frame.cell(self, layer, a, b)] = true;
+                    }
+                }
+            }
+            let left = |layer: usize, a: usize, b: usize| {
+                let index = frame.cell(self, layer, a, b);
+                !self.occupied[index] && !reached[index] && in_stock(index)
+            };
+            // 層内で8-連結の削り残しのうち、2 cell以下のものは格子化の差として削れたものとする。
+            let mut seen = vec![false; extent[0] * extent[1]];
+            let mut component = Vec::new();
+            for layer in 0..layers {
+                seen.fill(false);
+                for a in 0..extent[0] {
+                    for b in 0..extent[1] {
+                        let index = frame.cell(self, layer, a, b);
+                        tool_reach[index] |= reached[index];
+                        if seen[a * extent[1] + b] || !left(layer, a, b) {
+                            continue;
+                        }
+                        component.clear();
+                        let mut stack = vec![(a, b)];
+                        seen[a * extent[1] + b] = true;
+                        while let Some((ca, cb)) = stack.pop() {
+                            component.push((ca, cb));
+                            for (da, db) in &around {
+                                let (Some(na), Some(nb)) = (
+                                    ca.checked_add_signed(*da).filter(|v| *v < extent[0]),
+                                    cb.checked_add_signed(*db).filter(|v| *v < extent[1]),
+                                ) else {
+                                    continue;
+                                };
+                                if !seen[na * extent[1] + nb] && left(layer, na, nb) {
+                                    seen[na * extent[1] + nb] = true;
+                                    stack.push((na, nb));
+                                }
+                            }
+                        }
+                        if component.len() <= 2 {
+                            for (ca, cb) in &component {
+                                tool_reach[frame.cell(self, layer, *ca, *cb)] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            reached.fill(false);
+        }
+        let mut unreachable = vec![false; count];
+        let mut corner = vec![false; count];
+        for index in 0..count {
+            if self.occupied[index] || !in_stock(index) {
+                continue;
+            }
+            unreachable[index] = !thin_reach[index];
+            corner[index] = thin_reach[index] && !tool_reach[index];
+        }
+        (unreachable, corner)
+    }
+
+    /// 2枚型で、`direction`の軸のどちら側へも抜けない空cell。列の最初と最後の材料の間にある。
+    fn undercuts(&self, direction: Direction) -> Vec<bool> {
+        let frame = Layered::new(direction);
+        let layers = self.size[frame.up];
+        let extent = [self.size[frame.plane[0]], self.size[frame.plane[1]]];
+        let mut undercut = vec![false; self.occupied.len()];
+        for a in 0..extent[0] {
+            for b in 0..extent[1] {
+                let solid = |layer: usize| self.occupied[frame.cell(self, layer, a, b)];
+                let (Some(first), Some(last)) = (
+                    (0..layers).find(|layer| solid(*layer)),
+                    (0..layers).rev().find(|layer| solid(*layer)),
+                ) else {
+                    continue;
+                };
+                for layer in first..last {
+                    if !solid(layer) {
+                        undercut[frame.cell(self, layer, a, b)] = true;
+                    }
+                }
+            }
+        }
+        undercut
+    }
+
+    /// 内接球の直径が`max_wall_mm`を超える材料の芯と、最大の直径の上界 (cell)。
+    ///
+    /// 空cellの中心までの距離がd cellの材料cellを中心とする内接球の直径は、表面までの
+    /// 半cellを除いた(2d - 1) cellと見積もれる。量子化の誤差を失敗側へ倒すため、これに
+    /// grid間隔を足した2d cellが最大肉厚を超えれば厚肉とする。軸方向の連続長と異なり、
+    /// 壁の角を厚肉と誤らない。
+    fn thick_sections(&self, max_wall_mm: f64) -> (Vec<bool>, f64) {
+        let empty: Vec<bool> = self.occupied.iter().map(|cell| !cell).collect();
+        let distance = self.distance_squared(&empty);
+        let limit = max_wall_mm / 2.0 / self.pitch;
+        let thick = self
+            .occupied
+            .iter()
+            .zip(distance.iter())
+            .map(|(solid, squared)| *solid && *squared > limit * limit)
+            .collect();
+        let deepest = self
+            .occupied
+            .iter()
+            .zip(distance.iter())
+            .filter(|(solid, _)| **solid)
+            .map(|(_, squared)| *squared)
+            .fold(0.0f64, f64::max);
+        (thick, 2.0 * deepest.sqrt())
     }
 
     /// 幅`min_drain_mm`の球が外から入れない空間のうち、その球が収まる部分。
@@ -1351,49 +1621,133 @@ fn evaluate_grid(
             &made.thin,
             0.0,
         ));
-        checks.push(located(
-            planned_check(
-                Rule::SupportFree,
-                made.unsupported_cells == 0,
-                format!(
-                    "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
-                    made.unsupported_cells as f64 * cell_mm3,
-                    limits.overhang_angle_deg,
-                    limits.build_direction,
-                    made.spanned_cells as f64 * cell_mm3,
-                    limits.bridge_max_mm,
-                    pitch
-                ),
-            ),
-            &made.unsupported,
-            0.0,
-        ));
-        if let Some(drain) = limits.min_drain_mm {
-            checks.push(located(
+        match limits.process.layering() {
+            Some((overhang, bridge)) => checks.push(located(
                 planned_check(
-                    Rule::ResinDrain,
-                    made.trapped_regions == 0,
+                    Rule::SupportFree,
+                    made.unsupported_cells == 0,
                     format!(
-                        "{} pocket(s) drain only through passages narrower than {drain} mm; grid {pitch} mm; fully enclosed voids are reported by closed_cavity",
-                        made.trapped_regions
+                        "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
+                        made.unsupported_cells as f64 * cell_mm3,
+                        overhang,
+                        limits.up,
+                        made.spanned_cells as f64 * cell_mm3,
+                        bridge,
+                        pitch
                     ),
                 ),
-                &made.trapped,
-                // 判定したcellは通路の幅の球の中心であり、空間はその半径だけ広い。
-                (drain + pitch) / 2.0,
-            ));
-            checks.push(located(
-                planned_check(
-                    Rule::ResinSuction,
-                    made.suction_regions == 0,
-                    format!(
-                        "{} cup(s) sealed toward the build plate while printing along {}; cups narrower than {drain} mm are ignored; grid {pitch} mm",
-                        made.suction_regions, limits.build_direction
-                    ),
-                ),
-                &made.suction,
+                &made.unsupported,
                 0.0,
-            ));
+            )),
+            // 積層しない製造法には支持の要否が無い。対象が無いことを明示してpassとする。
+            None => checks.push(planned_check(
+                Rule::SupportFree,
+                true,
+                format!(
+                    "not applicable to {}: the part is not built in layers",
+                    limits.process.name()
+                ),
+            )),
+        }
+        match &limits.process {
+            Process::Resin { min_drain_mm, .. } => {
+                let drain = *min_drain_mm;
+                checks.push(located(
+                    planned_check(
+                        Rule::ResinDrain,
+                        made.trapped_regions == 0,
+                        format!(
+                            "{} pocket(s) drain only through passages narrower than {drain} mm; grid {pitch} mm; fully enclosed voids are reported by closed_cavity",
+                            made.trapped_regions
+                        ),
+                    ),
+                    &made.trapped,
+                    // 判定したcellは通路の幅の球の中心であり、空間はその半径だけ広い。
+                    (drain + pitch) / 2.0,
+                ));
+                checks.push(located(
+                    planned_check(
+                        Rule::ResinSuction,
+                        made.suction_regions == 0,
+                        format!(
+                            "{} cup(s) sealed toward the build plate while printing along {}; cups narrower than {drain} mm are ignored; grid {pitch} mm",
+                            made.suction_regions, limits.up
+                        ),
+                    ),
+                    &made.suction,
+                    0.0,
+                ));
+            }
+            Process::Milling {
+                tool_diameter_mm,
+                tool_length_mm,
+                ..
+            } => {
+                let setups: Vec<String> = limits.setups.iter().map(ToString::to_string).collect();
+                let setups = setups.join(", ");
+                checks.push(located(
+                    planned_check(
+                        Rule::MillingReach,
+                        made.unreachable_cells == 0,
+                        format!(
+                            "{:.3} mm³ of the stock cannot be reached by a tool lowered from {setups} within {tool_length_mm} mm of the stock top; grid {pitch} mm; fixturing is not modelled",
+                            made.unreachable_cells as f64 * cell_mm3
+                        ),
+                    ),
+                    &made.unreachable,
+                    0.0,
+                ));
+                checks.push(located(
+                    planned_check(
+                        Rule::MillingCorner,
+                        made.corner_cells == 0,
+                        format!(
+                            "{:.3} mm³ is left by a {tool_diameter_mm} mm tool in inner corners with a radius below {} mm and gaps narrower than the tool; grid {pitch} mm",
+                            made.corner_cells as f64 * cell_mm3,
+                            (tool_diameter_mm + pitch) / 2.0
+                        ),
+                    ),
+                    &made.corner,
+                    0.0,
+                ));
+            }
+            Process::Molding { max_wall_mm, .. } => {
+                checks.push(located(
+                    planned_check(
+                        Rule::MoldUndercut,
+                        made.undercut_cells == 0,
+                        format!(
+                            "{:.3} mm³ cannot be released toward {} or the opposite direction; side actions are not modelled; grid {pitch} mm",
+                            made.undercut_cells as f64 * cell_mm3,
+                            limits.up
+                        ),
+                    ),
+                    &made.undercut,
+                    0.0,
+                ));
+                let thick_regions = grid.labels(&made.thick).1.len();
+                checks.push(located(
+                    planned_check(
+                        Rule::MoldThickWall,
+                        thick_regions == 0,
+                        format!(
+                            "{thick_regions} region(s) thicker than {max_wall_mm} mm; thickest at most {:.3} mm; grid {pitch} mm",
+                            made.thickest_cells * pitch
+                        ),
+                    ),
+                    &made.thick,
+                    // 判定したcellは内接球の中心であり、厚肉部はその半径だけ広い。
+                    max_wall_mm / 2.0,
+                ));
+                let mut draft = planned_check(
+                    Rule::MoldDraft,
+                    false,
+                    "not evaluated: axis-aligned boxes and cylinders carry no draft; add draft in the mold design".into(),
+                );
+                draft.status = Status::NotEvaluated;
+                checks.push(draft);
+            }
+            Process::Fdm { .. } => {}
         }
     }
     checks
@@ -2194,6 +2548,219 @@ mod tests {
             required: vec![],
         };
         assert!(report.export_allowed());
+    }
+
+    fn milling(diameter: f64, length: f64, up: Direction, more: &[Direction]) -> ManufacturingPlan {
+        ManufacturingPlan {
+            id: "milling".into(),
+            material: None,
+            process: Process::Milling {
+                min_wall_mm: 0.5,
+                tool_diameter_mm: diameter,
+                tool_length_mm: length,
+                additional_setups: more
+                    .iter()
+                    .map(|up| Orientation {
+                        up: *up,
+                        turn_deg: 0,
+                    })
+                    .collect(),
+            },
+            orientation: Orientation { up, turn_deg: 0 },
+            source: "test".into(),
+        }
+    }
+
+    fn molding(max_wall: f64, up: Direction) -> ManufacturingPlan {
+        ManufacturingPlan {
+            id: "molding".into(),
+            material: None,
+            process: Process::Molding {
+                min_wall_mm: 0.5,
+                max_wall_mm: max_wall,
+            },
+            orientation: Orientation { up, turn_deg: 0 },
+            source: "test".into(),
+        }
+    }
+
+    fn z_cylinder(id: &str, center: [f64; 2], radius: f64, span: [f64; 2]) -> Feature {
+        cut(
+            id,
+            Shape::Cylinder {
+                axis: crate::Axis::Z,
+                center,
+                radius,
+                span,
+            },
+        )
+    }
+
+    /// 30 mm角、高さ10 mmの塊の上面から、16 mm角、深さ8 mmのpocketを削る。
+    /// `fillet`が正なら、pocketの縦の内角をその半径で丸める。
+    fn pocket(fillet: f64) -> Part {
+        let (low, high, z) = (7.0, 23.0, [2.0, 11.0]);
+        let mut features = vec![add("block", box_shape([0.; 3], [30., 30., 10.]))];
+        if fillet > 0.0 {
+            let r = fillet;
+            features.push(cut(
+                "pocket_x",
+                box_shape([low + r, low, z[0]], [high - r, high, z[1]]),
+            ));
+            features.push(cut(
+                "pocket_y",
+                box_shape([low, low + r, z[0]], [high, high - r, z[1]]),
+            ));
+            for (index, center) in [
+                [low + r, low + r],
+                [high - r, low + r],
+                [low + r, high - r],
+                [high - r, high - r],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                features.push(z_cylinder(&format!("corner_{index}"), center, r, z));
+            }
+        } else {
+            features.push(cut(
+                "pocket",
+                box_shape([low, low, z[0]], [high, high, z[1]]),
+            ));
+        }
+        part(features)
+    }
+
+    #[test]
+    fn sharp_inner_corners_are_left_by_the_tool() {
+        let sharp = evaluate(&model_with(
+            pocket(0.0),
+            with_plan(milling(3.0, 20.0, Direction::PlusZ, &[])),
+        ))
+        .unwrap();
+        assert_eq!(status(&sharp, Rule::MillingReach), Status::Pass);
+        assert_eq!(status(&sharp, Rule::MillingCorner), Status::Fail);
+        // 4つの縦の内角に1件ずつ残る。
+        let corners = locations(&sharp, Rule::MillingCorner);
+        assert_eq!(corners.len(), 4, "{corners:?}");
+        assert!(
+            corners.iter().any(|c| encloses(c, [7.25, 7.25, 5.0])),
+            "{corners:?}"
+        );
+        // 積層しない製造法に支持の要否は無い。
+        assert_eq!(status(&sharp, Rule::SupportFree), Status::Pass);
+
+        // 工具の半径に格子1つ分を加えた丸みなら削り残さない。
+        let rounded = evaluate(&model_with(
+            pocket(2.0),
+            with_plan(milling(3.0, 20.0, Direction::PlusZ, &[])),
+        ))
+        .unwrap();
+        let corner = rounded
+            .iter()
+            .find(|c| c.rule == Rule::MillingCorner)
+            .unwrap();
+        assert_eq!(
+            corner.status,
+            Status::Pass,
+            "{} {:?}",
+            corner.message,
+            corner.locations
+        );
+        assert_eq!(status(&rounded, Rule::MillingReach), Status::Pass);
+    }
+
+    #[test]
+    fn a_short_tool_does_not_reach_the_pocket_floor() {
+        let short = evaluate(&model_with(
+            pocket(2.0),
+            with_plan(milling(3.0, 5.0, Direction::PlusZ, &[])),
+        ))
+        .unwrap();
+        assert_eq!(status(&short, Rule::MillingReach), Status::Fail);
+        let floor = locations(&short, Rule::MillingReach)[0];
+        assert!(encloses(&floor, [15.0, 15.0, 3.0]), "{floor:?}");
+        assert!(floor.max[2] <= 5.5, "{floor:?}");
+    }
+
+    /// 20×10×10 mmの塊を、x方向に4 mm角の穴が貫く。
+    fn tunnel() -> Part {
+        part(vec![
+            add("block", box_shape([0.; 3], [20., 10., 10.])),
+            cut("tunnel", box_shape([-1., 3., 3.], [21., 7., 7.])),
+        ])
+    }
+
+    #[test]
+    fn side_holes_need_another_setup() {
+        let top_only = evaluate(&model_with(
+            tunnel(),
+            with_plan(milling(3.0, 30.0, Direction::PlusZ, &[])),
+        ))
+        .unwrap();
+        assert_eq!(status(&top_only, Rule::MillingReach), Status::Fail);
+        let hole = locations(&top_only, Rule::MillingReach)[0];
+        assert!(encloses(&hole, [10.0, 5.0, 5.0]), "{hole:?}");
+
+        let both_ends = evaluate(&model_with(
+            tunnel(),
+            with_plan(milling(3.0, 30.0, Direction::PlusZ, &[Direction::PlusX])),
+        ))
+        .unwrap();
+        assert_eq!(status(&both_ends, Rule::MillingReach), Status::Pass);
+        // 穴の縦横の内角は、軸に沿って下ろす工具でも丸く残る。
+        assert_eq!(status(&both_ends, Rule::MillingCorner), Status::Fail);
+    }
+
+    #[test]
+    fn a_side_hole_is_an_undercut_for_a_vertical_mold() {
+        let vertical = evaluate(&model_with(
+            tunnel(),
+            with_plan(molding(4.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        assert_eq!(status(&vertical, Rule::MoldUndercut), Status::Fail);
+        let hole = locations(&vertical, Rule::MoldUndercut)[0];
+        assert!(encloses(&hole, [10.0, 5.0, 5.0]), "{hole:?}");
+        // 穴の軸に沿って型を開けば抜ける。
+        let along = evaluate(&model_with(
+            tunnel(),
+            with_plan(molding(4.0, Direction::MinusX)),
+        ))
+        .unwrap();
+        assert_eq!(status(&along, Rule::MoldUndercut), Status::Pass);
+        // 抜き勾配は評価しない。
+        assert_eq!(status(&along, Rule::MoldDraft), Status::NotEvaluated);
+        assert_eq!(status(&along, Rule::SupportFree), Status::Pass);
+    }
+
+    #[test]
+    fn thick_sections_are_found_by_the_inscribed_sphere() {
+        // 板と、それに立つ壁。どこも厚さ2 mmである。
+        let tee = part(vec![
+            add("plate", box_shape([0.; 3], [20., 20., 2.])),
+            add("wall", box_shape([9., 0., 0.], [11., 20., 15.])),
+        ]);
+        // 交差部の内接円の直径は2.5 mmであり、格子の誤差を加えても4 mmに収まる。
+        let thin = evaluate(&model_with(
+            tee.clone(),
+            with_plan(molding(4.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        assert_eq!(status(&thin, Rule::MoldThickWall), Status::Pass);
+        // 3 mmでは、格子の誤差を失敗側へ倒した交差部が上限を超える。
+        let strict = evaluate(&model_with(tee, with_plan(molding(3.0, Direction::PlusZ)))).unwrap();
+        let junction = locations(&strict, Rule::MoldThickWall)[0];
+        assert!(encloses(&junction, [10.0, 10.0, 1.0]), "{junction:?}");
+
+        let lump = part(vec![
+            add("plate", box_shape([0.; 3], [20., 20., 2.])),
+            add("boss", box_shape([8., 8., 0.], [14., 14., 6.])),
+        ]);
+        let thick = evaluate(&model_with(lump, with_plan(molding(4.0, Direction::PlusZ)))).unwrap();
+        assert_eq!(status(&thick, Rule::MoldThickWall), Status::Fail);
+        let lump = locations(&thick, Rule::MoldThickWall)[0];
+        assert!(encloses(&lump, [11.0, 11.0, 3.0]), "{lump:?}");
     }
 
     #[test]

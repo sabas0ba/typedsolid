@@ -79,7 +79,7 @@ class HelperTests(unittest.TestCase):
 class IrTests(unittest.TestCase):
     def test_connector_and_source_are_serialized(self):
         data = json.loads(model().to_json())
-        self.assertEqual(data["schema_version"], 10)
+        self.assertEqual(data["schema_version"], 11)
         self.assertEqual(data["connectors"], [{
             "id": "usb", "part": "case", "opening": "usb_opening", "sweep": "usb_plug",
             "plug_mm": [9.0, 3.5], "clearance_mm": 0.3,
