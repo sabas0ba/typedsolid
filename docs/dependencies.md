@@ -43,3 +43,22 @@ auditはinstall前の調査であり、通常のローカルtestとCI unit test�
 PR #2 の作業時に、既存のRust 21 package / Python 45 distributionを変更せず、`scripts/audit-dependencies.py`でOSVと公開日時を再照合した。全66件に該当advisoryはなく、全版が既存cutoff (2026-08-29) を満たした。あわせて[CadQuery 2.8.0](https://pypi.org/project/cadquery/2.8.0/)・[maturin 1.15.0](https://pypi.org/project/maturin/1.15.0/)の配布情報と、[CadQuery security](https://github.com/CadQuery/cadquery/security)・[maturin security](https://github.com/PyO3/maturin/security)を再確認した。確認した範囲で導入停止に該当する公開情報はなかった。依存数と保守集中の評価は上記の調査を引き継ぐ。全推移依存のmaintainer権限や未知の侵害を保証するものではない。
 
 照合の対象は2026-09-13時点のlockであり、以後`Cargo.lock`と`requirements-dev.lock`は変更していない。`requirements-figures.lock`は、CIのcore検査で図を再生成するためにmaturinだけを持つlockである。`requirements-dev.lock`と同じ`uv pip compile`の条件 (`--exclude-newer 2026-08-29`) で生成し、maturin 1.15.0の配布hashは`requirements-dev.lock`と一致する。新たな依存は加えていない。OSVのデータは時間経過で変わるため、この記録は現在の無該当を示さない。
+
+## 3D viewerの検査 (2026-10-07)
+
+3D viewer自体はJavaScriptのpackageを使わず、自作のWebGL 1と標準のAPIだけで書く。検査のために次の3件を利用者の承認を得て加えた。いずれもnpmのpackageを入れない。cutoffは2026-09-30とした。
+
+| 対象 | 固定版 | 目的・確認 |
+|---|---|---|
+| Node.js | v24.21.0 (LTS、2026-09-08公開) | `node:test`でviewerの純粋な関数を検査する。`scripts/bootstrap-node.sh`がnodejs.orgの公式tarballを取得し、sha256 `fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6`と照合する。値の出典である`SHASUMS256.txt`は、release key `5BE8A3F6C8A5C01D106C0AD820B1A390B168D356`による署名を検証した |
+| Node.js (Nix) | nixpkgsの`nodejs_24` 24.18.0 | 既存のnixpkgs revisionのまま開発シェルに加えた。2026-07のsecurity releaseより前の版だが、修正対象 (HTTP/2、TLS、DNS、Permission Model等) は`node --test`でローカルのtestを走らせる用途に影響しない。nixpkgsの更新は別に扱う |
+| debian:trixie-slim | `trixie-20260918-slim`、index digest `sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a` | 撮影用imageの基礎。Docker公式image。2026-09-19公開 |
+| chromium (Debian) | `154.0.8037.57-1~deb13u1` (snapshot.debian.org `debian-security/20260929T215738Z`) | 撮影用imageでviewerを描く。依存packageは`debian/20260930T203251Z`から入る。aptはimage内のDebianの鍵でRelease署名を検証する |
+
+- nodejs.orgの配布とrelease経路について、侵害の報告は確認できなかった。v24.21.0より後のsecurity releaseは調査時点でなかった。
+- Debian公式imageの現行tagについて、侵害の報告は確認できなかった。
+- chromiumは、採用版より後の`154.0.8037.92-1~deb13u1` (2026-10-01、cutoffより後) で32件のCVEが修正されている ([OSV](https://osv.dev/list?ecosystem=Debian%3A13&q=chromium))。撮影は`docker run --network none`で行い、自分で書き出したローカルのHTMLだけを開くため、外部のweb contentが入る経路はない。この前提を外す用途 (外部のpageを開く等) に使わない。Debian security trackerのDSA番号は、調査環境から到達できず確認していない。
+- security archiveのReleaseは7日で期限が切れるため、固定した時刻の内容を使うには`Check-Valid-Until: no`が要る。slim imageはCA証明書を持たないため、取得はDebianの既定と同じHTTPで行い、真正性はRelease署名とhashで確かめる。
+- imageの大きさは約1.1 GB、buildは約2分である。CIではmain更新時のintegration jobだけで作る。
+
+出典: [Node.js releases](https://nodejs.org/dist/index.json)、[v24.21.0 SHASUMS256.txt](https://nodejs.org/dist/v24.21.0/SHASUMS256.txt)、[Node.js release keys](https://github.com/nodejs/node#release-keys)、[Node.js vulnerability feed](https://nodejs.org/en/feed/vulnerability.xml)、[debian tags](https://hub.docker.com/_/debian/tags)、[snapshot.debian.org chromium](https://snapshot.debian.org/package/chromium/)。

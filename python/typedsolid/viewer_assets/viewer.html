@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="typedsolid">
+<title>{{TITLE}}</title>
+<style>
+{{STYLE}}
+</style>
+</head>
+<body>
+<main class="layout">
+  <section class="stage">
+    <canvas id="view" aria-label="3D view of the parts and the reported locations"></canvas>
+    <p id="no-webgl" class="notice" hidden>WebGL is not available in this browser. The check list is still shown.</p>
+    <p class="hint">drag: rotate · right drag or shift+drag: pan · wheel or pinch: zoom · click a red box: select its check</p>
+  </section>
+  <aside class="panel">
+    <h1 id="title"></h1>
+    <section>
+      <h2>Checks <span id="check-count" class="muted"></span></h2>
+      <div class="controls">
+        <select id="filter-status" aria-label="status">
+          <option value="problems">fail and not evaluated</option>
+          <option value="fail">fail</option>
+          <option value="not_evaluated">not evaluated</option>
+          <option value="pass">pass</option>
+          <option value="all">all</option>
+        </select>
+        <select id="filter-rule" aria-label="rule"></select>
+        <input id="filter-text" type="search" placeholder="search rule, target, message" aria-label="search">
+        <select id="sort" aria-label="sort">
+          <option value="severity">sort: status</option>
+          <option value="rule">sort: rule</option>
+          <option value="target">sort: target</option>
+          <option value="locations">sort: locations</option>
+        </select>
+      </div>
+      <ul id="checks" class="checks"></ul>
+    </section>
+    <section>
+      <h2>Parts</h2>
+      <ul id="parts" class="parts"></ul>
+    </section>
+    <section>
+      <h2>Section <span id="clip-label" class="muted"></span></h2>
+      <div class="controls">
+        <select id="clip-axis" aria-label="section axis">
+          <option value="">off</option>
+          <option value="x">x</option>
+          <option value="y">y</option>
+          <option value="z">z</option>
+        </select>
+        <input id="clip-value" type="range" aria-label="section position">
+        <label><input id="clip-flip" type="checkbox"> keep the other side</label>
+      </div>
+      <button id="reset-view" type="button">reset view</button>
+    </section>
+    <p class="legend">red: reported location · green: keepout (without clearance) · grey: cut face</p>
+  </aside>
+</main>
+<script type="application/json" id="viewer-data">{{DATA}}</script>
+<script>
+{{CORE}}
+</script>
+<script>
+{{APP}}
+</script>
+</body>
+</html>

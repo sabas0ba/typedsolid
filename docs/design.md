@@ -141,6 +141,30 @@ fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`�
 
 第三者の筐体の図は、形状の派生画像となるため文書に載せない。利用者が手元で`typedsolid.external`の`--figures`を使って確かめる。
 
+### 3D viewer
+
+`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部の資源を読まず、`file://`のまま開ける。描画は自作のWebGL 1で行い、JavaScriptのpackageに依存しない。meshは最終形状をOCCTで三角形に分割したもので、許容誤差は部品全体の外接boxの対角長の0.1%である。描ける部品がない場合も、checkの一覧を見るために書く。拒否した出力でも`.rejected/`に残る。
+
+- **check**: 状態 (fail と not evaluated、fail、not evaluated、pass、すべて)、rule、文字列 (rule、target、message の部分一致) で絞り込み、状態、rule、target、検出箇所の数で並べ替える。checkを選ぶとmessageと検出箇所の座標を示し、その検出箇所だけを赤く描く。選ばない間はfailしたcheckの検出箇所をすべて描く。画面上の赤い箱をclickすると、そのcheckを選ぶ。
+- **注視**: 検出箇所の`focus`で、その箇所を中心に、周囲を含む距離へ視点を寄せ、箇所を半透明の赤で塗る。
+- **部品**: 部品ごとに表示と半透明を切り替える。検出箇所は部品の内部にあることが多いため、深度によらず手前に描く。keepoutは緑の線 (clearanceを含まない) で描く。
+- **断面**: x、y、zのいずれかの平面より正の側 (反転で負の側) を描かない。切り口から見える部品の内面を灰色で描く。断面のcapは描かない。
+- **操作**: dragで回転、右dragまたはshift+dragで平行移動、wheelまたはpinchで拡大する。
+
+表示状態はURL fragmentに書く。例えば`viewer.html#check=12&loc=0&clip=z:8&ghost=tray`は、12番目 (0始まり、reportの順) のcheckを選び、その最初の検出箇所を注視し、z=8 mmで切り、`tray`を半透明にした表示である。同じURLを開くと同じ表示になり、利用者間で表示を共有できる。平行移動は記録しない。
+
+DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの解釈と書き出し、checkの絞り込みと並べ替え、picking) は`viewer_core.js`に分け、`tests/js/`のnode:testで検査する。描画は`scripts/check-viewer.py`が部品間の欠陥fixtureを版を固定したChromiumで撮影し、表示状態ごとに部品、検出箇所、断面の色が画面に現れることを確かめる。
+
+| 表示 | 画像 |
+| --- | --- |
+| checkの選択と部品の半透明 (`post_in_keepout`) | ![selected check](assets/viewer/post_in_keepout--selected.png) |
+| z方向の断面 (`lid_overlap`) | ![section](assets/viewer/lid_overlap--section.png) |
+| 複数の欠陥を持つ2部品の筐体の概観 (`pi4_enclosure_defects`) | ![pi4 enclosure defects](assets/viewer/pi4_enclosure_defects--overview.png) |
+
+**Raspberry Pi 4の筐体**: `examples/pi4_enclosure.py`は、部品catalogのRaspberry Pi 4 Model Bの外形、取付穴、コネクタ位置から作る底と蓋の2部品の筐体である。蓋を四隅の柱へ4本のネジで、基板を底の4本のbossへネジで締め、底の壁に6個のコネクタ開口と、プラグを抜く掃引を持つ。蓋には通気スリットを開ける。基板の高さ、PCBの厚み、コネクタの高さとプラグの断面、ネジの寸法、bridgeで渡せる長さ (15 mm) は作例が決めた説明用の値である。正常版 (`pi4_enclosure`) はすべてのruleを通り、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、2部品にまたがって6 ruleの7 checkが落ちる。`tests/test_pi4_enclosure.py`が落ちる集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+
+snap fitは持たない。IRは印刷方向をmodel全体で1つだけ持つため、蓋から垂らす梁は積層方向に沿い、正常な設計でも`snap_fit`の積層方向の検査に落ちる。部品ごとの印刷姿勢は後続の課題である。
+
 ## 着脱の検査
 
 分解stepごとに、動かす部品の最終形状を区間ごとに掃引し、残っている部品との共通体積を求める。判定はOCCTのBooleanで行う。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。

@@ -6,7 +6,7 @@
 
 ## セットアップ (Nix)
 
-`nix develop`はrust-toolchain.tomlの指定どおりのRust toolchain、Python 3.12、uv、C compiler、poppler-utilsを提供する。`.envrc`があるためdirenvでも入れる。
+`nix develop`はrust-toolchain.tomlの指定どおりのRust toolchain、Python 3.12、uv、C compiler、poppler-utils、Node.js (3D viewerの検査用) を提供する。`.envrc`があるためdirenvでも入れる。
 
 ```bash
 nix develop
@@ -31,19 +31,22 @@ Linux x86_64でRustが未導入の場合、次を実行する。公式配布arch
 
 ```bash
 bash scripts/bootstrap-rust.sh
+bash scripts/bootstrap-node.sh
 uv venv --python python3.12 .venv
 uv pip sync --python .venv/bin/python --require-hashes --only-binary :all: requirements-dev.lock
 make check
 ```
 
-既存のrustupを使う場合はbootstrapを省略できる。`rust-toolchain.toml`の固定版を使用する。`make`は`.work/toolchain/bin`があれば優先する。Pythonだけの代替ルール実装や、native moduleがない場合の自動fallbackは用意しない。
+`scripts/bootstrap-node.sh`はnodejs.orgの公式tarballのSHA-256を照合し、Node.jsを`.work/node`にだけ置く。3D viewerのJavaScriptを`node:test`で検査するためだけに使い、npmのpackageは入れない。既存のNode.js (22以上) を使う場合は省略できる。既存のrustupを使う場合はbootstrapを省略できる。`rust-toolchain.toml`の固定版を使用する。`make`は`.work/toolchain/bin`があれば優先する。Pythonだけの代替ルール実装や、native moduleがない場合の自動fallbackは用意しない。
 
 ## 検証
 
 ```bash
 make rust-check    # fmt / clippy / Rust tests
+make js-test       # 3D viewerのJavaScript (node:test)
 make python-test   # native module build / Python integration tests
-make check         # 両方
+make check         # 上の3つ
+make viewer-check  # 3D viewerをcontainerのChromiumで撮影し、画素を検査する (Dockerが必要)
 make example       # .work/board-tray に出力。既存なら拒否。cacheは.work/cache
 make clean-cache   # 生成cacheを消す
 ```
@@ -289,6 +292,19 @@ except ValueError as error:
 
 図の読み方と各ruleの検出箇所の定義は [設計](design.md#検出箇所と図) を参照する。
 
+## 3D viewer
+
+`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部の資源を読まないため、browserで`file://`のまま開ける。`build`の結果からは`typedsolid.cadquery.write_viewer_figure(result, path)`で書ける。操作と表示状態のURLは [設計](design.md#3d-viewer) を参照する。
+
+viewerの描画は、`docker/viewer/Dockerfile`のimageの中のChromiumで撮影して確かめる。
+
+```bash
+make viewer-check                    # imageを作り、.work/viewer-check に撮影結果を書く
+.venv/bin/python scripts/check-viewer.py --chromium /path/to/chromium   # containerを使わない場合
+```
+
+撮影は`docker run --network none`で行い、書き出したローカルのHTMLだけを開く。各fixtureで概観、checkの選択と半透明、検出箇所の注視、断面の4状態を撮り、部品、検出箇所、断面の色が画面に現れることを確かめる。scriptやWebGLが失敗すると画面が白く残り、検査が落ちる。docsの画像は`--docs docs/assets/viewer`で撮影結果から複製する。画素の値はChromiumの版で変わりうるため、docsの画像とは照合しない。
+
 ## slicerとの突合
 
 `support_free`は幾何のみに基づく近似であり、ノズル径、層厚、冷却、材料を含まない。実機で用いる場合は、出力したSTLをslicerへ読み込み、同じ印刷姿勢でサポート生成の要否を比較する。
@@ -320,6 +336,8 @@ PRはLinux上の軽量core検査、main更新・手動実行はCadQuery統合テ
 core検査は、欠陥fixtureの断面図をCadQueryを使わずに再生成し、`docs/assets/figures/`の図と一致することも確かめる。Python環境にはmaturinだけを`requirements-figures.lock`から入れる。検出箇所の表はjob summaryに書く。図を変える変更では`scripts/render-figures.py --output docs/assets/figures --defects-only`で再生成してcommitし、PR本文から参照する。artifactのupload用actionは依存を増やさないため使わない。
 
 投影図は隠線処理にCadQueryを使うため、main更新時のintegration jobで部品間の欠陥fixtureの図を再生成し、`docs/assets/projections/`の図と一致することを確かめる。図を変える変更では`scripts/render-projections.py --output docs/assets/projections`で再生成してcommitする。
+
+3D viewerのJavaScriptはcore検査で`node:test`により検査する。Node.jsは`scripts/bootstrap-node.sh`で取得し、新しいactionは使わない。描画の撮影は約1.1 GBのimageを作るため、main更新時のintegration jobだけで行う。
 
 ## 打ち切りと再開
 
