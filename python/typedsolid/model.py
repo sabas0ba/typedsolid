@@ -17,7 +17,7 @@ Rule = Literal[
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
     "support_free", "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
-    "fastener_release", "connector_fit", "strength", "thermal",
+    "fastener_release", "connector_fit", "resin_drain", "resin_suction", "strength", "thermal",
 ]
 SourceKind = Literal["datasheet", "measured", "other"]
 
@@ -62,11 +62,72 @@ def boss(id: str, axis: Axis, center: Vec2, diameter: float, span: Vec2, role: R
 
 
 @dataclass(frozen=True)
+class Fdm:
+    """熱溶解積層の特性。既定値は旧版のPolicyの既定値と同じであり、特定の機種の値ではない。"""
+
+    # 最終形状に要求する最小肉厚。primitive寸法 (Policy.min_feature_mm) とは別に指定する。
+    min_wall_mm: float = 1.2
+    # 支持なしで許す、積層方向に対する最大傾斜角。単位は度。
+    overhang_angle_deg: float = 45.0
+    # 両端が支持された未支持区間の許容長。
+    bridge_max_mm: float = 5.0
+    kind: Literal["fdm"] = "fdm"
+
+
+@dataclass(frozen=True)
+class Resin:
+    """光造形 (SLA/MSLA) の特性。値は機種と樹脂に依るため既定値を持たない。
+
+    min_drain_mmは未硬化樹脂を排出する通路に要求する最小幅である。
+    """
+
+    min_wall_mm: float
+    overhang_angle_deg: float
+    bridge_max_mm: float
+    min_drain_mm: float
+    kind: Literal["resin"] = "resin"
+
+
+Process = Fdm | Resin
+
+
+@dataclass(frozen=True)
+class Orientation:
+    """製造時の姿勢。upは製造機の+Z (積層方向) に向ける組立座標の方向、turn_degはそのあと
+    製造機の+Z周りに回す角度 (0、90、180、270)。"""
+
+    up: Direction = "plus_z"
+    turn_deg: int = 0
+
+
+@dataclass(frozen=True)
+class ManufacturingPlan:
+    """製造案。製造法と特性、材料、姿勢の組。sourceは特性の値の出典。
+
+    materialはModel.materialsのidで、省略すると部品のmaterialを使う。
+    """
+
+    id: str
+    process: Process
+    source: str
+    orientation: Orientation = field(default_factory=Orientation)
+    material: str | None = None
+
+
+# 製造案を持たない部品に補う製造案。旧版のPolicyの既定値と同じ値を持つ。
+DEFAULT_PLAN = ManufacturingPlan("fdm", Fdm(), "typedsolid default (same as the former Policy defaults)")
+
+
+@dataclass(frozen=True)
 class Part:
     id: str
     features: tuple[Feature, ...]
-    # Model.materialsのid。snap fitを持つ部品では必須。
+    # Model.materialsのid。snap fitを持つ部品では、これか採用した製造案のmaterialが必要。
     material: str | None = None
+    # 製造案。空ならModel.default_manufacturingを1つ持つものとする。
+    manufacturing: tuple[ManufacturingPlan, ...] = ()
+    # 出力の可否を決める製造案のid。製造案が1つなら省略できる。
+    adopted: str | None = None
 
 
 @dataclass(frozen=True)
@@ -277,16 +338,9 @@ class Policy:
     mesh_volume_tolerance: float = 0.01
     # 最終形状をrasterizeする格子の間隔。細かいほど正確になり、cell数は3乗で増える。
     voxel_mm: float = 0.2
-    # 最終形状に要求する最小肉厚。primitive寸法 (min_feature_mm) とは別に指定する。
-    min_wall_mm: float = 1.2
-    # 接続部に要求する最小断面。
+    # 接続部に要求する最小断面。製造法に依らない構造の要求である。肉厚、積層方向、
+    # overhang、bridgeは製造法に依るため、部品の製造案 (ManufacturingPlan) が持つ。
     min_neck_mm: float = 1.2
-    # 印刷時に上となる方向。層はこの軸に沿って積む。
-    build_direction: Direction = "plus_z"
-    # 支持なしで許す、印刷方向に対する最大傾斜角。単位は度。
-    overhang_angle_deg: float = 45.0
-    # 両端が支持された未支持区間の許容長。
-    bridge_max_mm: float = 5.0
     required: tuple[Rule, ...] = (
         "feature_thickness", "valid_solid", "single_solid", "keepout_clearance",
         "access_clearance", "part_interference",
@@ -326,7 +380,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 9
+    schema_version: int = 10
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
@@ -335,9 +389,19 @@ class Model:
     materials: tuple[Material, ...] = ()
     snap_fits: tuple[SnapFit, ...] = ()
     connectors: tuple[Connector, ...] = ()
+    # 製造案を持たない部品に補う製造案。
+    default_manufacturing: ManufacturingPlan = DEFAULT_PLAN
 
     def to_json(self) -> str:
         data = _expand_access(_without_unset(asdict(self)))
+        default = data.pop("default_manufacturing")
+        for part in data["parts"]:
+            if not part["manufacturing"]:
+                part["manufacturing"] = [default]
+            if "adopted" not in part:
+                if len(part["manufacturing"]) != 1:
+                    raise ValueError(f"part {part['id']}: adopted is required with several manufacturing plans")
+                part["adopted"] = part["manufacturing"][0]["id"]
         return _native.normalize_model(json.dumps(data, allow_nan=False))
 
     def preflight(self) -> dict:

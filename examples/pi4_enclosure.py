@@ -2,19 +2,26 @@
 
 基板の外形、取付穴、コネクタの辺上の位置は部品catalogの値 (公式の機械図) を使う。
 catalogが持たない値、すなわち基板の高さ、PCBの厚み、コネクタの高さ、プラグの断面、
-ネジの寸法、印刷機がbridgeで渡せる長さは、この作例が決めた説明用の値であり、
+ネジの寸法、印刷機がbridgeで渡せる長さ、光造形の特性は、この作例が決めた説明用の値であり、
 製品の仕様ではない。
 
-蓋は四隅の柱へネジで締める。基板は底の4本のbossへネジで締め、蓋を外してから外す。
-snap fitは持たない。現在のIRは印刷方向をmodel全体で1つだけ持ち、蓋から垂らす梁は
-積層方向に沿うため、正常な設計でもsnap_fitの積層方向の検査に落ちるためである。
+蓋は四隅の柱へネジで締め、下面のlipを底の壁の内側へ差し込む。基板は底の4本のbossへ
+ネジで締め、蓋を外してから外す。
+
+製造案は部品ごとに持つ。蓋は裏返してFDMで造形する案を採用し、上面を造形板に置く案を
+比較のために持つ。後者はlipの上の天板が支えを持たず、support_freeに落ちる。底はFDMの案を
+採用し、光造形の案を比較のために持つ。光造形の案は開いた箱を上向きに造形するため、
+resin_suctionに落ちる。採用しない案のcheckは出力の可否に用いない。
+
+snap fitは持たない。蓋から垂らす梁は、軸平行の造形姿勢ではsnap_fitの積層方向の検査と
+support_freeを同時に満たさないため、任意の回転を扱えるようになるまで保留する。
 """
 
 from dataclasses import replace
 
 from typedsolid import (
-    Assembly, Box, Clearance, Feature, Model, Move, Part, PlugSource, Policy, Release, ScrewSpec, Step,
-    Sweep, board, boss, connector_opening, hole, screw_fixing,
+    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Model, Move, Orientation, Part, PlugSource, Policy,
+    Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole, screw_fixing,
 )
 
 PI4 = board("raspberry_pi_4_model_b")
@@ -40,8 +47,19 @@ POST_CENTERS = {
     "front_left": (4.25, 4.25), "front_right": (LENGTH_MM - 4.25, 4.25),
     "back_left": (4.25, WIDTH_MM - 4.25), "back_right": (LENGTH_MM - 4.25, WIDTH_MM - 4.25),
 }
+POLICY = Policy(voxel_mm=0.5)
 # 例とする印刷機は15 mmまでのbridgeを渡せるものとする。コネクタ開口の上縁はbridgeになる。
-POLICY = Policy(voxel_mm=0.5, bridge_max_mm=15.0)
+PRINTER = Fdm(bridge_max_mm=15.0)
+PRINTER_SOURCE = "example printer assumed to bridge 15 mm"
+PLAN = ManufacturingPlan("fdm", PRINTER, PRINTER_SOURCE)
+# 蓋は上面を造形板に置き、lipを上へ積む。
+LID_UPSIDE_DOWN = ManufacturingPlan("fdm_upside_down", PRINTER, PRINTER_SOURCE, orientation=Orientation("minus_z"))
+LID_UPRIGHT = ManufacturingPlan("fdm_upright", PRINTER, PRINTER_SOURCE)
+# 比較用の光造形。値は作例が決めた説明用の値であり、特定の機種と樹脂の値ではない。
+RESIN = ManufacturingPlan(
+    "resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.0, bridge_max_mm=15.0, min_drain_mm=3.0),
+    "example values for the typedsolid example, not a printer specification",
+)
 SOURCE = PlugSource("other", "example value for the typedsolid example, not a connector specification")
 # 説明用のネジ寸法。特定の製品の値ではない。
 LID_SCREW = ScrewSpec(
@@ -60,6 +78,12 @@ CONNECTORS = {
     "ethernet": ("plus_x", 8.35, (11.7, 8.0)),
 }
 CLEARANCE_MM = 0.5
+# 蓋のlip。底の壁の内面から隙間を取り、四隅のネジ柱の手前で止める。
+LIP_GAP_MM = 0.5
+LIP_MM = 2.0
+LIP_HEIGHT_MM = 3.0
+# 柱の外周 (中心4.25 mm、半径3 mm) から0.75 mm離す。
+LIP_END_MM = 8.0
 
 
 def shell() -> tuple[Feature, ...]:
@@ -115,6 +139,18 @@ def board_screws():
     ]
 
 
+def lid_lip() -> tuple[Feature, ...]:
+    """蓋の下面から垂らす4本のlip。底の壁の内側に沿い、蓋の水平方向の位置を決める。"""
+    inner = WALL_MM + LIP_GAP_MM
+    z = (HEIGHT_MM - LIP_HEIGHT_MM, HEIGHT_MM)
+    return (
+        Feature("lip_front", Box((LIP_END_MM, inner, z[0]), (LENGTH_MM - LIP_END_MM, inner + LIP_MM, z[1])), "wall"),
+        Feature("lip_back", Box((LIP_END_MM, WIDTH_MM - inner - LIP_MM, z[0]), (LENGTH_MM - LIP_END_MM, WIDTH_MM - inner, z[1])), "wall"),
+        Feature("lip_left", Box((inner, LIP_END_MM, z[0]), (inner + LIP_MM, WIDTH_MM - LIP_END_MM, z[1])), "wall"),
+        Feature("lip_right", Box((LENGTH_MM - inner - LIP_MM, LIP_END_MM, z[0]), (LENGTH_MM - inner, WIDTH_MM - LIP_END_MM, z[1])), "wall"),
+    )
+
+
 def lid_vents(pitch_mm: float, count: int) -> tuple[Feature, ...]:
     """蓋の中央に並ぶ幅3 mmの通気スリット。"""
     start = LENGTH_MM / 2.0 - pitch_mm * (count - 1) / 2.0 - 1.5
@@ -146,10 +182,11 @@ def model(
         opening_features.append(feature)
     base = Part("base", shell() + tuple(opening_features) + tuple(
         feature for fixing in lid_fixings + board_fixings for feature in fixing.base_features
-    ) + base_extra)
+    ) + base_extra, manufacturing=(PLAN, RESIN), adopted=PLAN.id)
     lid = Part("lid", (
         Feature("panel", Box((0, 0, HEIGHT_MM), (LENGTH_MM, WIDTH_MM, HEIGHT_MM + LID_MM)), "base"),
-    ) + tuple(feature for fixing in lid_fixings for feature in fixing.clamp_features) + lid_vents(*vents))
+    ) + lid_lip() + tuple(feature for fixing in lid_fixings for feature in fixing.clamp_features) + lid_vents(*vents),
+        manufacturing=(LID_UPSIDE_DOWN, LID_UPRIGHT), adopted=LID_UPSIDE_DOWN.id)
     # 基板は底のbossの上面に接するため、下面のclearanceだけを0とする。
     keepout = PI4.keepout(
         "pi4", ORIGIN, BOARD_HEIGHT_MM, Clearance(default=0.5, minus_z=0.0), attached_to="base",
@@ -176,6 +213,7 @@ def pi4_enclosure() -> Model:
 
 def pi4_enclosure_defects() -> Model:
     """5種類の欠陥を同時に入れた筐体。2部品にまたがり、6つのruleの7つのcheckが落ちる。
+    採用しない製造案では、正常版と同じcheckに加えて両部品の薄肉が落ちる。
 
     - 蓋の通気スリットの間隔を詰め、桟を1 mmにする (蓋のfinal_wall_thickness)。
     - 床の上面を基板の下で削り、残りを0.8 mmにする (底のfinal_wall_thickness)。
@@ -199,9 +237,14 @@ def pi4_enclosure_defects() -> Model:
     )
 
 
-# 落ちるruleとtargetの組。testとviewerの撮影が同じ一覧を使う。
+# 落ちるcheck。採用した製造案と製造案に依らないcheckは(rule, target)、採用しない製造案の
+# checkは(rule, target, plan)で表す。testとviewerの撮影が同じ一覧を使う。
+ALTERNATIVES = {
+    ("resin_suction", "base", "resin"),
+    ("support_free", "lid", "fdm_upright"),
+}
 PI4_CASES = (
-    (pi4_enclosure, set()),
+    (pi4_enclosure, set(), ALTERNATIVES),
     (pi4_enclosure_defects, {
         ("final_wall_thickness", "lid"),
         ("final_wall_thickness", "base"),
@@ -210,5 +253,8 @@ PI4_CASES = (
         ("access_clearance", "pi4_lift/base"),
         ("access_clearance", "ethernet_plug/base"),
         ("connector_fit", "ethernet"),
+    }, ALTERNATIVES | {
+        ("final_wall_thickness", "base", "resin"),
+        ("final_wall_thickness", "lid", "fdm_upright"),
     }),
 )

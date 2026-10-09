@@ -23,7 +23,7 @@ _spec.loader.exec_module(render_figures)
 NS = "{http://www.w3.org/2000/svg}"
 
 
-def fake_sections(_part: str, planes: str) -> str:
+def fake_sections(_part: str, _plan: str | None, planes: str) -> str:
     """1 cellの材料だけを持つ断面。描画の経路だけを確かめるtestで使う。"""
     return json.dumps([
         {"axis": plane["axis"], "plane_coordinate": 0.0, "origin": [0.0, 0.0], "pitch": 1.0, "rows": ["1"]}
@@ -83,6 +83,19 @@ class PlanTests(unittest.TestCase):
         ]
         names = [f.name for f in plan(model, checks)]
         self.assertEqual(names[1:], ["case--connector_fit--usb--1", "case--connector_fit--power--1"])
+
+    def test_figures_of_other_plans_name_the_plan(self):
+        location = {"min": [0, 0, 0], "max": [1, 1, 1]}
+        checks = [
+            {"rule": "support_free", "status": "fail", "target": "p", "message": "", "locations": [location],
+             "plan": plan, "adopted": plan == "fdm"}
+            for plan in ("fdm", "resin")
+        ]
+        figures = plan({"parts": [{"id": "p"}]}, checks)[1:]
+        self.assertEqual([(f.name, f.plan) for f in figures], [
+            ("p--support_free--1", None), ("p--support_free--resin--1", "resin"),
+        ])
+        self.assertIn("plan resin (not adopted)", figures[1].title)
 
     def test_passing_and_unknown_rules_get_no_location_figures(self):
         checks = [
@@ -153,9 +166,9 @@ class RenderTests(TemporaryDirectoryTest):
         ]
         calls = []
 
-        def counting(part, planes):
+        def counting(part, plan, planes):
             calls.append(len(json.loads(planes)))
-            return fake_sections(part, planes)
+            return fake_sections(part, plan, planes)
 
         names = figures_module._write(plan(model, checks), counting, self.root)
         self.assertEqual(len(names), 101)

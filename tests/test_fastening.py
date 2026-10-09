@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 
 from typedsolid import (
-    Assembly, Box, Feature, InsertSpec, Material, Model, Part, Policy, Printer, Profile, Release, ScrewSpec,
+    Assembly, Box, Fdm, Feature, InsertSpec, Material, Model, Part, Policy, Printer, Profile, Release, ScrewSpec,
     Step, Move, hole, screw_fixing,
 )
 from typedsolid import _native
@@ -158,14 +158,15 @@ class ProfileTests(unittest.TestCase):
         bridge_max_mm=8.0, build_direction="plus_z",
     )
 
-    def test_policy_carries_the_profile_values(self):
+    def test_policy_and_plan_carry_the_profile_values(self):
         policy = self.PROFILE.policy(voxel_mm=0.5)
-        self.assertEqual(
-            (policy.min_wall_mm, policy.min_neck_mm, policy.min_feature_mm, policy.overhang_angle_deg,
-             policy.bridge_max_mm, policy.build_direction, policy.voxel_mm),
-            (1.6, 2.0, 0.8, 50.0, 8.0, "plus_z", 0.5),
-        )
+        self.assertEqual((policy.min_neck_mm, policy.min_feature_mm, policy.voxel_mm), (2.0, 0.8, 0.5))
         self.assertIn("fastener_fit", policy.required)
+        plan = self.PROFILE.plan()
+        self.assertEqual(plan.process, Fdm(min_wall_mm=1.6, overhang_angle_deg=50.0, bridge_max_mm=8.0))
+        self.assertEqual((plan.orientation.up, plan.material), ("plus_z", "test_pla"))
+        self.assertIn("test_printer", plan.source)
+        self.assertEqual(self.PROFILE.plan("lid", up="minus_z").orientation.up, "minus_z")
 
     def test_assembly_uses_the_printer_fit_clearance(self):
         steps = (Step("open_lid", ("lid",), (Move("plus_z"),)),)

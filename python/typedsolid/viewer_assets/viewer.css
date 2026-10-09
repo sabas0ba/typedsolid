@@ -207,3 +207,8 @@ button {
     border-top: 1px solid var(--line);
   }
 }
+
+/* 採用していない製造案のcheck。出力の可否に用いない比較の結果である。 */
+.check.alternative .check-head {
+  opacity: 0.7;
+}

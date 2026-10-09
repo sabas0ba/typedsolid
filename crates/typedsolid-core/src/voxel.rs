@@ -4,8 +4,8 @@
 //! 得る。厚さ・接続部・空洞はいずれも同じoccupancyから導く。
 
 use crate::{
-    Axis, Check, Direction, Location, MAX_LOCATIONS, Model, Operation, Part, Policy, Rule, Status,
-    mesh,
+    Axis, Check, Direction, Location, MAX_LOCATIONS, ManufacturingPlan, Model, Operation, Part,
+    Policy, Rule, Status, mesh,
 };
 use serde::{Deserialize, Serialize};
 
@@ -621,7 +621,21 @@ fn transform(f: &[f64], d: &mut [f64], vertices: &mut [usize], breaks: &mut [f64
 }
 
 fn check(rule: Rule, target: &str, passed: bool, message: String) -> Check {
+    planned(rule, target, None, true, passed, message)
+}
+
+/// 製造案に依るcheck。planは製造案のid、adoptedは採用した製造案か。
+fn planned(
+    rule: Rule,
+    target: &str,
+    plan: Option<&str>,
+    adopted: bool,
+    passed: bool,
+    message: String,
+) -> Check {
     Check {
+        plan: plan.map(Into::into),
+        adopted,
         locations: Vec::new(),
         rule,
         status: if passed { Status::Pass } else { Status::Fail },
@@ -634,20 +648,35 @@ fn check(rule: Rule, target: &str, passed: bool, message: String) -> Check {
 ///
 /// 量子化の誤差は最大でgrid間隔1つ分である。要求値に間隔を加えた厚さを満たす場合のみ
 /// passとし、判定を失敗側へ倒す。
+///
+/// 製造案に依るrule (肉厚、支持、UV樹脂) は部品の製造案ごとに評価し、checkに製造案の
+/// idと採用の有無を持たせる。形状だけで決まるrule (接続部、閉空洞) は部品ごとに1回である。
 pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
     let mut checks = Vec::new();
     for part in &model.parts {
         let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
-        checks.extend(evaluate_grid(&grid, &part.id, &model.policy));
+        let plans: Vec<(&ManufacturingPlan, bool)> = part
+            .manufacturing
+            .iter()
+            .map(|plan| (plan, plan.id == part.adopted))
+            .collect();
+        checks.extend(evaluate_grid(&grid, &part.id, &model.policy, &plans));
     }
     Ok(checks)
 }
 
 /// 外部のSTL (binary又はASCII) を読み、IRを介さずに最終形状のruleを評価する。
 /// 座標の単位はmmとみなす。meshは閉じている必要があり、閉じていなければ拒否する。
-pub fn evaluate_stl(bytes: &[u8], target: &str, policy: &Policy) -> Result<Vec<Check>, String> {
+/// 製造案は1つで、採用したものとして扱う。
+pub fn evaluate_stl(
+    bytes: &[u8],
+    target: &str,
+    policy: &Policy,
+    plan: &ManufacturingPlan,
+) -> Result<Vec<Check>, String> {
+    plan.validate()?;
     let grid = stl_grid(bytes, policy)?;
-    Ok(evaluate_grid(&grid, target, policy))
+    Ok(evaluate_grid(&grid, target, policy, &[(plan, true)]))
 }
 
 /// STLを読み、閉じていることを確かめてから格子にする。
@@ -731,10 +760,10 @@ impl Grid {
                                 let index = self.index(cell[0], cell[1], cell[2]);
                                 let bits = [
                                     (self.occupied[index], SECTION_SOLID),
-                                    (analysis.thin[index], SECTION_THIN),
-                                    (analysis.neck[index], SECTION_NECK),
-                                    (analysis.unsupported[index], SECTION_UNSUPPORTED),
-                                    (analysis.void[index], SECTION_VOID),
+                                    (analysis.manufacture.thin[index], SECTION_THIN),
+                                    (analysis.structure.neck[index], SECTION_NECK),
+                                    (analysis.manufacture.unsupported[index], SECTION_UNSUPPORTED),
+                                    (analysis.structure.void[index], SECTION_VOID),
                                 ]
                                 .into_iter()
                                 .filter(|(set, _)| *set)
@@ -757,10 +786,11 @@ impl Grid {
     }
 }
 
-/// IRの1部品を格子にし、指定した平面の断面を返す。
+/// IRの1部品を格子にし、指定した製造案で判定した断面を返す。planを省くと採用した製造案とする。
 pub fn sections_of_part(
     model: &Model,
     part_id: &str,
+    plan_id: Option<&str>,
     planes: &[Plane],
 ) -> Result<Vec<Section>, String> {
     model.validate()?;
@@ -769,68 +799,102 @@ pub fn sections_of_part(
         .iter()
         .find(|p| p.id == part_id)
         .ok_or_else(|| format!("unknown part {part_id}"))?;
+    let wanted = plan_id.unwrap_or(&part.adopted);
+    let plan = part
+        .manufacturing
+        .iter()
+        .find(|plan| plan.id == wanted)
+        .ok_or_else(|| format!("part {part_id} has no manufacturing plan {wanted}"))?;
     let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
-    grid.sections(&grid.analyse(&model.policy), planes)
+    grid.sections(&grid.analyse(&model.policy, &Limits::of(plan)), planes)
 }
 
-/// 外部のSTLを格子にし、指定した平面の断面を返す。
+/// 外部のSTLを格子にし、指定した製造案で判定した断面を返す。
 pub fn sections_of_stl(
     bytes: &[u8],
     policy: &Policy,
+    plan: &ManufacturingPlan,
     planes: &[Plane],
 ) -> Result<Vec<Section>, String> {
+    plan.validate()?;
     let grid = stl_grid(bytes, policy)?;
-    grid.sections(&grid.analyse(policy), planes)
+    grid.sections(&grid.analyse(policy, &Limits::of(plan)), planes)
+}
+
+/// 製造案から決まる判定の値。IRの部品と外部形状で共有する。
+#[derive(Debug, Clone)]
+pub struct Limits {
+    pub min_wall_mm: f64,
+    pub build_direction: Direction,
+    pub overhang_angle_deg: f64,
+    pub bridge_max_mm: f64,
+    /// UV樹脂の排出路の最小幅。他の製造法ではNone。
+    pub min_drain_mm: Option<f64>,
+}
+
+impl Limits {
+    pub fn of(plan: &ManufacturingPlan) -> Self {
+        Self {
+            min_wall_mm: plan.process.min_wall_mm(),
+            build_direction: plan.orientation.up,
+            overhang_angle_deg: plan.process.overhang_angle_deg(),
+            bridge_max_mm: plan.process.bridge_max_mm(),
+            min_drain_mm: plan.process.min_drain_mm(),
+        }
+    }
+}
+
+/// 形状だけで決まる判定材料。製造案に依らず、部品ごとに1回求める。
+pub struct Structure {
+    /// erosionで分かれた成分どうしを繋ぐ細い接続部。
+    pub neck: Vec<bool>,
+    /// 外部に通じない空cell。
+    pub void: Vec<bool>,
+    core_cells: usize,
+    core_components: usize,
+    enclosed: usize,
+}
+
+/// 製造案に依る判定材料。
+pub struct Manufacture {
+    /// 一辺`min_wall_mm`の立方体以上の大きさを持つ薄肉領域。
+    pub thin: Vec<bool>,
+    /// bridgeでも支持されないcell。
+    pub unsupported: Vec<bool>,
+    /// UV樹脂: 細い通路の奥にあり、樹脂が抜けない空間。他の製造法では空。
+    pub trapped: Vec<bool>,
+    /// UV樹脂: 造形中に造形板の側だけが閉じた椀となる空間。他の製造法では空。
+    pub suction: Vec<bool>,
+    thin_regions: usize,
+    largest_thin: usize,
+    unsupported_cells: usize,
+    spanned_cells: usize,
+    trapped_regions: usize,
+    suction_regions: usize,
 }
 
 /// 最終形状のruleが検出したcellのmaskと、messageに書く集計値。
 ///
 /// 判定と図示が同じmaskを使い、図に描いた箇所と判定の根拠を一致させる。
 pub struct Analysis {
-    /// 一辺`min_wall_mm`の立方体以上の大きさを持つ薄肉領域。
-    pub thin: Vec<bool>,
-    /// erosionで分かれた成分どうしを繋ぐ細い接続部。
-    pub neck: Vec<bool>,
-    /// 外部に通じない空cell。
-    pub void: Vec<bool>,
-    /// bridgeでも支持されないcell。
-    pub unsupported: Vec<bool>,
-    thin_regions: usize,
-    largest_thin: usize,
-    core_cells: usize,
-    core_components: usize,
-    enclosed: usize,
-    unsupported_cells: usize,
-    spanned_cells: usize,
+    pub structure: Structure,
+    pub manufacture: Manufacture,
 }
 
 impl Grid {
-    /// 4つの最終形状ruleの判定材料を求める。
-    pub fn analyse(&self, policy: &Policy) -> Analysis {
-        let pitch = self.pitch;
-        // 量子化の誤差を失敗側へ倒すため、要求値にgrid間隔を足した長さを求める。
-        let required_run = ((policy.min_wall_mm + pitch) / pitch).ceil() as usize;
-        let runs = self.axial_runs();
-        let thin_cells: Vec<bool> = self
-            .occupied
-            .iter()
-            .zip(runs.iter())
-            .map(|(solid, run)| *solid && *run < required_run)
-            .collect();
-        // 面の縁や稜線は必ず薄くなる。一辺min_wall_mmの立方体に満たない領域は
-        // 形状の縁であり、壁の薄さを示さないため数えない。
-        let minimum_cells = (policy.min_wall_mm.powi(3) / pitch.powi(3)).ceil() as usize;
-        let (labels, sizes) = self.labels(&thin_cells);
-        let thin: Vec<bool> = labels
-            .iter()
-            .map(|label| *label > 0 && sizes[*label as usize - 1] >= minimum_cells)
-            .collect();
-        let kept: Vec<usize> = sizes
-            .iter()
-            .copied()
-            .filter(|size| *size >= minimum_cells)
-            .collect();
+    /// 1つの製造案での判定材料を求める。断面図はこれを描く。
+    pub fn analyse(&self, policy: &Policy, limits: &Limits) -> Analysis {
+        let structure = self.structure(policy);
+        let manufacture = self.manufacture(limits, &structure.void);
+        Analysis {
+            structure,
+            manufacture,
+        }
+    }
 
+    /// 細い接続部と閉空洞。
+    pub fn structure(&self, policy: &Policy) -> Structure {
+        let pitch = self.pitch;
         let neck_radius = (policy.min_neck_mm + pitch) / 2.0 / pitch;
         let core = self.eroded(neck_radius);
         let core_cells = core.iter().filter(|cell| **cell).count();
@@ -856,14 +920,47 @@ impl Grid {
         } else {
             vec![false; self.occupied.len()]
         };
-
         let void = self.enclosed_void_mask();
         let enclosed = void.iter().filter(|cell| **cell).count();
+        Structure {
+            neck,
+            void,
+            core_cells,
+            core_components: core_sizes.len(),
+            enclosed,
+        }
+    }
+
+    /// 肉厚、支持、UV樹脂の排出と吸着。
+    pub fn manufacture(&self, limits: &Limits, void: &[bool]) -> Manufacture {
+        let pitch = self.pitch;
+        // 量子化の誤差を失敗側へ倒すため、要求値にgrid間隔を足した長さを求める。
+        let required_run = ((limits.min_wall_mm + pitch) / pitch).ceil() as usize;
+        let runs = self.axial_runs();
+        let thin_cells: Vec<bool> = self
+            .occupied
+            .iter()
+            .zip(runs.iter())
+            .map(|(solid, run)| *solid && *run < required_run)
+            .collect();
+        // 面の縁や稜線は必ず薄くなる。一辺min_wall_mmの立方体に満たない領域は
+        // 形状の縁であり、壁の薄さを示さないため数えない。
+        let minimum_cells = (limits.min_wall_mm.powi(3) / pitch.powi(3)).ceil() as usize;
+        let (labels, sizes) = self.labels(&thin_cells);
+        let thin: Vec<bool> = labels
+            .iter()
+            .map(|label| *label > 0 && sizes[*label as usize - 1] >= minimum_cells)
+            .collect();
+        let kept: Vec<usize> = sizes
+            .iter()
+            .copied()
+            .filter(|size| *size >= minimum_cells)
+            .collect();
 
         let support = self.support(
-            policy.build_direction,
-            policy.overhang_angle_deg,
-            policy.bridge_max_mm,
+            limits.build_direction,
+            limits.overhang_angle_deg,
+            limits.bridge_max_mm,
         );
         let unsupported: Vec<bool> = self
             .occupied
@@ -874,19 +971,187 @@ impl Grid {
             .collect();
         let unsupported_cells = unsupported.iter().filter(|cell| **cell).count();
         let spanned_cells = support.bridged.iter().filter(|cell| **cell).count();
-        Analysis {
+
+        let (trapped, suction) = match limits.min_drain_mm {
+            Some(drain) => (
+                self.trapped_resin(drain, void),
+                self.suction_cups(limits.build_direction, drain),
+            ),
+            None => (
+                vec![false; self.occupied.len()],
+                vec![false; self.occupied.len()],
+            ),
+        };
+        let trapped_regions = self.labels(&trapped).1.len();
+        let suction_regions = self.labels(&suction).1.len();
+        Manufacture {
             thin,
-            neck,
-            void,
             unsupported,
+            trapped,
+            suction,
             thin_regions: kept.len(),
             largest_thin: kept.iter().copied().max().unwrap_or(0),
-            core_cells,
-            core_components: core_sizes.len(),
-            enclosed,
             unsupported_cells,
             spanned_cells,
+            trapped_regions,
+            suction_regions,
         }
+    }
+
+    /// 幅`min_drain_mm`の球が外から入れない空間のうち、その球が収まる部分。
+    ///
+    /// 材料から球の半径より遠い空cellを、外周から辿る。辿れないcellは、通路が排出に
+    /// 必要な幅より細い奥にある。閉空洞はclosed_cavityが扱うため除く。通路の幅を
+    /// 失敗側へ倒すため、要求値にgrid間隔を足した幅で判定する。
+    fn trapped_resin(&self, min_drain_mm: f64, void: &[bool]) -> Vec<bool> {
+        let radius = (min_drain_mm + self.pitch) / 2.0 / self.pitch;
+        let distance = self.distance_squared(&self.occupied);
+        let wide: Vec<bool> = self
+            .occupied
+            .iter()
+            .zip(distance.iter())
+            .map(|(solid, squared)| !*solid && *squared >= radius * radius)
+            .collect();
+        let reached = self.reachable_from_boundary(&wide);
+        wide.iter()
+            .zip(reached.iter())
+            .zip(void.iter())
+            .map(|((open, seen), enclosed)| *open && !*seen && !*enclosed)
+            .collect()
+    }
+
+    /// 造形中のある層で、外周へ通じず造形板の側が閉じている空間 (椀)。
+    ///
+    /// 層を造形板の側から順に加え、それまでの層の空cellを連結する。加えた層の空cellの
+    /// 成分が外周に触れていなければ、その層の硬化時に槽の底との間で閉じた空間となる。
+    /// 材料が最初に現れる層が造形板に接し、それより前の層は数えない。幅`min_drain_mm`の
+    /// 球が収まらない細い椀は除く。
+    fn suction_cups(&self, direction: Direction, min_drain_mm: f64) -> Vec<bool> {
+        let frame = Layered::new(direction);
+        let layers = self.size[frame.up];
+        let extent = [self.size[frame.plane[0]], self.size[frame.plane[1]]];
+        let count = self.occupied.len();
+        let mut parent: Vec<usize> = (0..count).collect();
+        let mut open = vec![false; count];
+        let mut cup = vec![false; count];
+
+        fn find(parent: &mut [usize], mut index: usize) -> usize {
+            while parent[index] != index {
+                parent[index] = parent[parent[index]];
+                index = parent[index];
+            }
+            index
+        }
+        fn union(parent: &mut [usize], open: &mut [bool], a: usize, b: usize) {
+            let (ra, rb) = (find(parent, a), find(parent, b));
+            if ra != rb {
+                parent[rb] = ra;
+                open[ra] = open[ra] || open[rb];
+            }
+        }
+
+        let has_material = |layer: usize| {
+            (0..extent[0])
+                .any(|a| (0..extent[1]).any(|b| self.occupied[frame.cell(self, layer, a, b)]))
+        };
+        let Some(first) = (0..layers).find(|layer| has_material(*layer)) else {
+            return cup;
+        };
+        for layer in first..layers {
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let index = frame.cell(self, layer, a, b);
+                    if self.occupied[index] {
+                        continue;
+                    }
+                    if a == 0 || b == 0 || a + 1 == extent[0] || b + 1 == extent[1] {
+                        open[index] = true;
+                    }
+                    if layer > first {
+                        let below = frame.cell(self, layer - 1, a, b);
+                        if !self.occupied[below] {
+                            union(&mut parent, &mut open, below, index);
+                        }
+                    }
+                    if a > 0 {
+                        let left = frame.cell(self, layer, a - 1, b);
+                        if !self.occupied[left] {
+                            union(&mut parent, &mut open, left, index);
+                        }
+                    }
+                    if b > 0 {
+                        let back = frame.cell(self, layer, a, b - 1);
+                        if !self.occupied[back] {
+                            union(&mut parent, &mut open, back, index);
+                        }
+                    }
+                }
+            }
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let index = frame.cell(self, layer, a, b);
+                    if !self.occupied[index] {
+                        let root = find(&mut parent, index);
+                        cup[index] = !open[root];
+                    }
+                }
+            }
+        }
+        // 幅`min_drain_mm`の球が収まる椀だけを数える。距離はcell中心から材料のcell中心までで
+        // あり、材料の表面までの距離より半cell長いため、その分を要求に加える。
+        let radius = (min_drain_mm + self.pitch) / 2.0 / self.pitch;
+        let distance = self.distance_squared(&self.occupied);
+        let (labels, sizes) = self.labels(&cup);
+        let mut wide_component = vec![false; sizes.len()];
+        for (label, squared) in labels.iter().zip(distance.iter()) {
+            if *label > 0 && *squared >= radius * radius {
+                wide_component[*label as usize - 1] = true;
+            }
+        }
+        labels
+            .iter()
+            .map(|label| *label > 0 && wide_component[*label as usize - 1])
+            .collect()
+    }
+
+    /// 外周の`mask`のcellから`mask`内を6-連結で辿れるcell。
+    fn reachable_from_boundary(&self, mask: &[bool]) -> Vec<bool> {
+        let mut reached = vec![false; mask.len()];
+        let mut stack = Vec::new();
+        let [nx, ny, nz] = self.size;
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let on_boundary =
+                        x == 0 || y == 0 || z == 0 || x + 1 == nx || y + 1 == ny || z + 1 == nz;
+                    let index = self.index(x, y, z);
+                    if on_boundary && mask[index] && !reached[index] {
+                        reached[index] = true;
+                        stack.push(index);
+                    }
+                }
+            }
+        }
+        while let Some(index) = stack.pop() {
+            let x = index % nx;
+            let y = (index / nx) % ny;
+            let z = index / (nx * ny);
+            for (dx, dy, dz) in NEIGHBOURS {
+                let (Some(nx_), Some(ny_), Some(nz_)) = (
+                    checked_step(x, dx, nx),
+                    checked_step(y, dy, ny),
+                    checked_step(z, dz, nz),
+                ) else {
+                    continue;
+                };
+                let neighbour = self.index(nx_, ny_, nz_);
+                if mask[neighbour] && !reached[neighbour] {
+                    reached[neighbour] = true;
+                    stack.push(neighbour);
+                }
+            }
+        }
+        reached
     }
 
     /// 6-連結の連結成分のlabel (0は対象外、kは1始まり) と、各成分のcell数。
@@ -999,8 +1264,13 @@ impl Grid {
     }
 }
 
-/// 1つの占有格子に対する最終形状のrule。
-fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
+/// 1つの占有格子に対する最終形状のrule。plansは製造案と、採用したものかの組である。
+fn evaluate_grid(
+    grid: &Grid,
+    target: &str,
+    policy: &Policy,
+    plans: &[(&ManufacturingPlan, bool)],
+) -> Vec<Check> {
     let pitch = grid.pitch;
     let solid_cells = grid.occupied_cells();
     if solid_cells == 0 {
@@ -1010,89 +1280,158 @@ fn evaluate_grid(grid: &Grid, target: &str, policy: &Policy) -> Vec<Check> {
             .map(|rule| check(rule, target, false, "rasterized geometry is empty".into()))
             .collect();
     }
-    let analysis = grid.analyse(policy);
     let cell_mm3 = pitch.powi(3);
-    let located = |rule: Rule, passed: bool, message: String, mask: &[bool], margin: f64| {
-        let mut result = check(rule, target, passed, message);
-        if !passed {
+    let located = |mut result: Check, mask: &[bool], margin: f64| {
+        if result.status == Status::Fail {
             let (locations, total) = grid.locations(mask, margin);
             result.message.push_str(&format!("; {total} location(s)"));
             result.locations = locations;
         }
         result
     };
-    vec![
+
+    let structure = grid.structure(policy);
+    let mut checks = vec![
         located(
-            Rule::FinalWallThickness,
-            analysis.thin_regions == 0,
-            format!(
-                "{} region(s) thinner than {} mm; largest {:.3} mm³ of {:.3} mm³; grid {} mm; regions below {} mm³ are treated as edges",
-                analysis.thin_regions,
-                policy.min_wall_mm,
-                analysis.largest_thin as f64 * cell_mm3,
-                solid_cells as f64 * cell_mm3,
-                pitch,
-                policy.min_wall_mm.powi(3)
+            check(
+                Rule::NeckSection,
+                target,
+                structure.core_components == 1,
+                if structure.core_cells == 0 {
+                    format!(
+                        "no material survives a {} mm section; grid {} mm",
+                        policy.min_neck_mm, pitch
+                    )
+                } else {
+                    format!(
+                        "{} component(s) remain after eroding to a {} mm section; grid {} mm",
+                        structure.core_components, policy.min_neck_mm, pitch
+                    )
+                },
             ),
-            &analysis.thin,
-            0.0,
-        ),
-        located(
-            Rule::NeckSection,
-            analysis.core_components == 1,
-            if analysis.core_cells == 0 {
-                format!(
-                    "no material survives a {} mm section; grid {} mm",
-                    policy.min_neck_mm, pitch
-                )
-            } else {
-                format!(
-                    "{} component(s) remain after eroding to a {} mm section; grid {} mm",
-                    analysis.core_components, policy.min_neck_mm, pitch
-                )
-            },
-            &analysis.neck,
+            &structure.neck,
             // 前線が出会う面は薄いため、断面の幅だけ広げて接続部を囲む。
             policy.min_neck_mm / 2.0,
         ),
         located(
-            Rule::ClosedCavity,
-            analysis.enclosed == 0,
-            format!(
-                "{} enclosed void cell(s); grid {} mm; cavities reachable only through gaps below the grid size are not distinguished",
-                analysis.enclosed, pitch
+            check(
+                Rule::ClosedCavity,
+                target,
+                structure.enclosed == 0,
+                format!(
+                    "{} enclosed void cell(s); grid {} mm; cavities reachable only through gaps below the grid size are not distinguished",
+                    structure.enclosed, pitch
+                ),
             ),
-            &analysis.void,
+            &structure.void,
             0.0,
         ),
-        located(
-            Rule::SupportFree,
-            analysis.unsupported_cells == 0,
-            format!(
-                "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
-                analysis.unsupported_cells as f64 * cell_mm3,
-                policy.overhang_angle_deg,
-                policy.build_direction,
-                analysis.spanned_cells as f64 * cell_mm3,
-                policy.bridge_max_mm,
-                pitch
+    ];
+
+    for (plan, adopted) in plans {
+        let limits = Limits::of(plan);
+        let made = grid.manufacture(&limits, &structure.void);
+        let planned_check = |rule: Rule, passed: bool, message: String| {
+            planned(rule, target, Some(&plan.id), *adopted, passed, message)
+        };
+        checks.push(located(
+            planned_check(
+                Rule::FinalWallThickness,
+                made.thin_regions == 0,
+                format!(
+                    "{} region(s) thinner than {} mm; largest {:.3} mm³ of {:.3} mm³; grid {} mm; regions below {} mm³ are treated as edges",
+                    made.thin_regions,
+                    limits.min_wall_mm,
+                    made.largest_thin as f64 * cell_mm3,
+                    solid_cells as f64 * cell_mm3,
+                    pitch,
+                    limits.min_wall_mm.powi(3)
+                ),
             ),
-            &analysis.unsupported,
+            &made.thin,
             0.0,
-        ),
-    ]
+        ));
+        checks.push(located(
+            planned_check(
+                Rule::SupportFree,
+                made.unsupported_cells == 0,
+                format!(
+                    "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
+                    made.unsupported_cells as f64 * cell_mm3,
+                    limits.overhang_angle_deg,
+                    limits.build_direction,
+                    made.spanned_cells as f64 * cell_mm3,
+                    limits.bridge_max_mm,
+                    pitch
+                ),
+            ),
+            &made.unsupported,
+            0.0,
+        ));
+        if let Some(drain) = limits.min_drain_mm {
+            checks.push(located(
+                planned_check(
+                    Rule::ResinDrain,
+                    made.trapped_regions == 0,
+                    format!(
+                        "{} pocket(s) drain only through passages narrower than {drain} mm; grid {pitch} mm; fully enclosed voids are reported by closed_cavity",
+                        made.trapped_regions
+                    ),
+                ),
+                &made.trapped,
+                // 判定したcellは通路の幅の球の中心であり、空間はその半径だけ広い。
+                (drain + pitch) / 2.0,
+            ));
+            checks.push(located(
+                planned_check(
+                    Rule::ResinSuction,
+                    made.suction_regions == 0,
+                    format!(
+                        "{} cup(s) sealed toward the build plate while printing along {}; cups narrower than {drain} mm are ignored; grid {pitch} mm",
+                        made.suction_regions, limits.build_direction
+                    ),
+                ),
+                &made.suction,
+                0.0,
+            ));
+        }
+    }
+    checks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Feature, Policy, Role, Shape, Units};
+    use crate::{Feature, Orientation, Policy, Process, Role, Shape, Units};
 
     fn part(features: Vec<Feature>) -> Part {
         Part {
             id: "block".into(),
             features,
             material: None,
+            manufacturing: vec![],
+            adopted: String::new(),
+        }
+    }
+
+    /// 検査の条件。Policyと、部品に持たせるFDMの製造案。
+    #[derive(Clone)]
+    struct Setup {
+        policy: Policy,
+        plan: ManufacturingPlan,
+    }
+
+    fn fdm(min_wall: f64, overhang: f64, bridge: f64, up: Direction) -> ManufacturingPlan {
+        ManufacturingPlan {
+            id: "fdm".into(),
+            material: None,
+            process: Process::Fdm {
+                min_wall_mm: min_wall,
+                overhang_angle_deg: overhang,
+                bridge_max_mm: bridge,
+            },
+            orientation: Orientation { up, turn_deg: 0 },
+            source: "test".into(),
         }
     }
 
@@ -1118,7 +1457,10 @@ mod tests {
         Shape::Box { min, max }
     }
 
-    fn model_with(part: Part, policy: Policy) -> Model {
+    fn model_with(mut part: Part, setup: Setup) -> Model {
+        part.adopted = setup.plan.id.clone();
+        part.manufacturing = vec![setup.plan];
+        let policy = setup.policy;
         Model {
             schema_version: crate::SCHEMA_VERSION,
             units: Units::Mm,
@@ -1134,18 +1476,21 @@ mod tests {
         }
     }
 
-    fn policy(min_wall: f64, min_neck: f64, pitch: f64) -> Policy {
-        Policy {
-            min_feature_mm: 0.001,
-            mesh_volume_tolerance: 0.01,
-            voxel_mm: pitch,
-            min_wall_mm: min_wall,
-            min_neck_mm: min_neck,
-            build_direction: Direction::PlusZ,
-            overhang_angle_deg: 45.0,
-            bridge_max_mm: 5.0,
-            required: vec![],
+    fn policy(min_wall: f64, min_neck: f64, pitch: f64) -> Setup {
+        Setup {
+            policy: Policy {
+                min_feature_mm: 0.001,
+                mesh_volume_tolerance: 0.01,
+                voxel_mm: pitch,
+                min_neck_mm: min_neck,
+                required: vec![],
+            },
+            plan: fdm(min_wall, 45.0, 5.0, Direction::PlusZ),
         }
+    }
+
+    fn stl(bytes: &[u8], target: &str, setup: &Setup) -> Result<Vec<Check>, String> {
+        evaluate_stl(bytes, target, &setup.policy, &setup.plan)
     }
 
     fn status(checks: &[Check], rule: Rule) -> Status {
@@ -1323,7 +1668,7 @@ mod tests {
         assert_eq!(status(&upright, Rule::SupportFree), Status::Fail);
 
         let mut sideways = policy(1.0, 1.0, 0.5);
-        sideways.build_direction = Direction::PlusX;
+        sideways.plan.orientation.up = Direction::PlusX;
         let laid = evaluate(&model_with(shelf, sideways)).unwrap();
         assert_eq!(status(&laid, Rule::SupportFree), Status::Pass);
     }
@@ -1337,8 +1682,7 @@ mod tests {
         assert_eq!(status(&sloped, Rule::SupportFree), Status::Pass);
 
         let mut narrow = policy(0.5, 0.5, 0.5);
-        narrow.overhang_angle_deg = 0.0;
-        narrow.bridge_max_mm = 0.0;
+        narrow.plan = fdm(0.5, 0.0, 0.0, Direction::PlusZ);
         let vertical = evaluate(&model_with(stepped, narrow)).unwrap();
         // 真下にしか支持を認めないと、同じ張り出しが未支持になる。
         assert_eq!(status(&vertical, Rule::SupportFree), Status::Fail);
@@ -1444,7 +1788,7 @@ mod tests {
         // 最後の2三角形は+x面。z方向から見て面積0のため、偶奇判定では検出できない。
         let mut side = box_triangles([0.; 3], [10.; 3], false);
         side.pop();
-        let error = evaluate_stl(&binary_stl(&side, b""), "a", &rules).unwrap_err();
+        let error = stl(&binary_stl(&side, b""), "a", &rules).unwrap_err();
         assert!(error.contains("not paired"), "{error}");
         // 上面の穴はwinding numberでも検出する。
         let mut top = box_triangles([0.; 3], [10.; 3], false);
@@ -1460,8 +1804,7 @@ mod tests {
         let mut flipped = box_triangles([0.; 3], [10.; 3], false);
         let last = flipped.len() - 1;
         flipped[last].swap(1, 2);
-        let error =
-            evaluate_stl(&binary_stl(&flipped, b""), "a", &policy(1.2, 1.2, 1.0)).unwrap_err();
+        let error = stl(&binary_stl(&flipped, b""), "a", &policy(1.2, 1.2, 1.0)).unwrap_err();
         assert!(error.contains("not consistently oriented"), "{error}");
     }
 
@@ -1483,18 +1826,18 @@ mod tests {
     fn stl_rules_detect_a_sealed_cavity_and_a_thin_plate() {
         let rules = policy(1.2, 1.2, 0.5);
         let solid = binary_stl(&box_triangles([0.; 3], [20.; 3], false), b"");
-        let checks = evaluate_stl(&solid, "block", &rules).unwrap();
+        let checks = stl(&solid, "block", &rules).unwrap();
         assert_eq!(status(&checks, Rule::ClosedCavity), Status::Pass);
         assert_eq!(status(&checks, Rule::FinalWallThickness), Status::Pass);
         assert!(checks.iter().all(|c| c.target == "block"));
 
         let mut hollow = box_triangles([0.; 3], [20.; 3], false);
         hollow.extend(box_triangles([5.; 3], [15.; 3], true));
-        let checks = evaluate_stl(&binary_stl(&hollow, b""), "hollow", &rules).unwrap();
+        let checks = stl(&binary_stl(&hollow, b""), "hollow", &rules).unwrap();
         assert_eq!(status(&checks, Rule::ClosedCavity), Status::Fail);
 
         let plate = binary_stl(&box_triangles([0.; 3], [20., 20., 0.8], false), b"");
-        let checks = evaluate_stl(&plate, "plate", &rules).unwrap();
+        let checks = stl(&plate, "plate", &rules).unwrap();
         assert_eq!(status(&checks, Rule::FinalWallThickness), Status::Fail);
     }
 
@@ -1511,8 +1854,8 @@ mod tests {
         }
         text.push_str("endsolid cube\n");
         let rules = policy(1.2, 1.2, 1.0);
-        let ascii = evaluate_stl(text.as_bytes(), "a", &rules).unwrap();
-        let binary = evaluate_stl(&binary_stl(&triangles, b"solid header"), "b", &rules).unwrap();
+        let ascii = stl(text.as_bytes(), "a", &rules).unwrap();
+        let binary = stl(&binary_stl(&triangles, b"solid header"), "b", &rules).unwrap();
         assert_eq!(ascii.len(), Rule::VOXEL.len());
         for (x, y) in ascii.iter().zip(binary.iter()) {
             assert_eq!(
@@ -1525,9 +1868,9 @@ mod tests {
     #[test]
     fn invalid_policy_is_rejected_for_stl() {
         let mut rules = policy(1.2, 1.2, 1.0);
-        rules.voxel_mm = 0.0;
+        rules.policy.voxel_mm = 0.0;
         let solid = binary_stl(&box_triangles([0.; 3], [10.; 3], false), b"");
-        assert!(evaluate_stl(&solid, "block", &rules).is_err());
+        assert!(stl(&solid, "block", &rules).is_err());
     }
 
     fn locations(checks: &[Check], rule: Rule) -> Vec<Location> {
@@ -1675,7 +2018,7 @@ mod tests {
                 coordinate: Some(1.0),
             },
         ];
-        let sections = sections_of_part(&model, "block", &planes).unwrap();
+        let sections = sections_of_part(&model, "block", None, &planes).unwrap();
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0].plane_coordinate, 5.0);
         // 中央の断面では空洞 (4 mm角、0.5 mm格子で9×9 cell) が現れ、床下の断面には無い。
@@ -1698,9 +2041,9 @@ mod tests {
             axis: Axis::Y,
             coordinate: Some(2.5),
         }];
-        let section = &sections_of_part(&model, "block", &planes).unwrap()[0];
+        let section = &sections_of_part(&model, "block", None, &planes).unwrap()[0];
         assert!(count_bits(section, SECTION_NECK) > 0);
-        assert!(sections_of_part(&model, "ghost", &planes).is_err());
+        assert!(sections_of_part(&model, "ghost", None, &planes).is_err());
     }
 
     #[test]
@@ -1711,9 +2054,146 @@ mod tests {
             axis: Axis::X,
             coordinate: None,
         }];
-        let sections =
-            sections_of_stl(&binary_stl(&hollow, b""), &policy(1.2, 1.2, 1.0), &planes).unwrap();
+        let setup = policy(1.2, 1.2, 1.0);
+        let sections = sections_of_stl(
+            &binary_stl(&hollow, b""),
+            &setup.policy,
+            &setup.plan,
+            &planes,
+        )
+        .unwrap();
         assert_eq!(count_bits(&sections[0], SECTION_VOID), 100);
+    }
+
+    fn resin(min_drain: f64, up: Direction) -> ManufacturingPlan {
+        ManufacturingPlan {
+            id: "resin".into(),
+            material: None,
+            process: Process::Resin {
+                min_wall_mm: 0.5,
+                overhang_angle_deg: 45.0,
+                bridge_max_mm: 5.0,
+                min_drain_mm: min_drain,
+            },
+            orientation: Orientation { up, turn_deg: 0 },
+            source: "test".into(),
+        }
+    }
+
+    fn with_plan(plan: ManufacturingPlan) -> Setup {
+        Setup {
+            plan,
+            ..policy(0.5, 0.5, 0.5)
+        }
+    }
+
+    /// 20 mm角の塊の中に10 mm角の空洞があり、上面から径`hole` mmの角穴で外へ通じる。
+    fn pocket_with_hole(hole: f64) -> Part {
+        let half = hole / 2.0;
+        part(vec![
+            add("block", box_shape([0.; 3], [20.; 3])),
+            cut("pocket", box_shape([5.; 3], [15.; 3])),
+            cut(
+                "hole",
+                box_shape([10. - half, 10. - half, 14.], [10. + half, 10. + half, 21.]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn resin_pocket_behind_a_narrow_hole_is_trapped() {
+        let narrow = evaluate(&model_with(
+            pocket_with_hole(1.0),
+            with_plan(resin(3.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        assert_eq!(status(&narrow, Rule::ResinDrain), Status::Fail);
+        // 外へ通じるため閉空洞ではない。
+        assert_eq!(status(&narrow, Rule::ClosedCavity), Status::Pass);
+        let location = locations(&narrow, Rule::ResinDrain)[0];
+        assert!(encloses(&location, [10., 10., 10.]), "{location:?}");
+
+        let wide = evaluate(&model_with(
+            pocket_with_hole(5.0),
+            with_plan(resin(3.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        assert_eq!(status(&wide, Rule::ResinDrain), Status::Pass);
+    }
+
+    /// 上面が開いた20 mm角、深さ10 mmの箱。壁と床は2 mm。
+    fn open_box() -> Part {
+        part(vec![
+            add("block", box_shape([0.; 3], [20., 20., 12.])),
+            cut("inside", box_shape([2., 2., 2.], [18., 18., 13.])),
+        ])
+    }
+
+    #[test]
+    fn open_box_printed_upright_is_a_suction_cup() {
+        let upright = evaluate(&model_with(
+            open_box(),
+            with_plan(resin(2.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        assert_eq!(status(&upright, Rule::ResinSuction), Status::Fail);
+        let location = locations(&upright, Rule::ResinSuction)[0];
+        assert!(encloses(&location, [10., 10., 6.]), "{location:?}");
+        // 横に置けば、各層の断面はU字で、開いた側から外周へ通じる。
+        let sideways = evaluate(&model_with(
+            open_box(),
+            with_plan(resin(2.0, Direction::PlusX)),
+        ))
+        .unwrap();
+        assert_eq!(status(&sideways, Rule::ResinSuction), Status::Pass);
+    }
+
+    #[test]
+    fn narrow_cups_are_ignored() {
+        // 幅1 mmの溝は、排出路の幅2 mmの球が収まらない。
+        let groove = part(vec![
+            add("block", box_shape([0.; 3], [20., 20., 6.])),
+            cut("groove", box_shape([2., 9.5, 3.], [18., 10.5, 7.])),
+        ]);
+        let checks =
+            evaluate(&model_with(groove, with_plan(resin(2.0, Direction::PlusZ)))).unwrap();
+        assert_eq!(status(&checks, Rule::ResinSuction), Status::Pass);
+    }
+
+    #[test]
+    fn every_plan_is_evaluated_and_marked() {
+        let mut block = open_box();
+        block.manufacturing = vec![
+            fdm(1.0, 45.0, 5.0, Direction::PlusZ),
+            resin(2.0, Direction::PlusZ),
+        ];
+        block.adopted = "fdm".into();
+        let mut model = model_with(open_box(), policy(1.0, 1.0, 0.5));
+        model.parts = vec![block];
+        let checks = evaluate(&model).unwrap();
+        let summary: Vec<(Rule, Option<&str>, bool)> = checks
+            .iter()
+            .map(|c| (c.rule, c.plan.as_deref(), c.adopted))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (Rule::NeckSection, None, true),
+                (Rule::ClosedCavity, None, true),
+                (Rule::FinalWallThickness, Some("fdm"), true),
+                (Rule::SupportFree, Some("fdm"), true),
+                (Rule::FinalWallThickness, Some("resin"), false),
+                (Rule::SupportFree, Some("resin"), false),
+                (Rule::ResinDrain, Some("resin"), false),
+                (Rule::ResinSuction, Some("resin"), false),
+            ]
+        );
+        // 採用していない製造案のfailは、出力の可否に用いない。
+        let report = crate::Report {
+            checks,
+            required: vec![],
+        };
+        assert!(report.export_allowed());
     }
 
     #[test]

@@ -11,7 +11,10 @@ from unittest.mock import patch
 import cadquery as cq
 
 from examples.board_tray import board_tray
-from typedsolid import Box, Clearance, Cylinder, Feature, Keepout, Model, Part, Policy, hole
+from typedsolid import (
+    Box, Clearance, Cylinder, Fdm, Feature, Keepout, ManufacturingPlan, Model, Orientation, Part, Policy, Resin,
+    hole,
+)
 from typedsolid.cadquery import build, export
 
 
@@ -95,11 +98,29 @@ class CadQueryTests(unittest.TestCase):
         shelf = Model((Part("shelf", (
             Feature("post", Box((0, 0, 0), (4, 4, 20))),
             Feature("deck", Box((4, 0, 14), (16, 4, 18))),
-        )),), policy=Policy(min_wall_mm=1.0, min_neck_mm=1.0))
+        )),), policy=Policy(min_neck_mm=1.0), default_manufacturing=ManufacturingPlan("fdm", Fdm(min_wall_mm=1.0), "test"))
         self.assertTrue(failures(build(shelf), "support_free"))
         # 寝かせて積むと同じ形状が支持される。
-        laid = replace(shelf, policy=replace(shelf.policy, build_direction="plus_x"))
+        plan = replace(shelf.default_manufacturing, orientation=Orientation("plus_x"))
+        laid = replace(shelf, default_manufacturing=plan)
         self.assertFalse(failures(build(laid), "support_free"))
+
+    def test_other_plans_are_reported_without_blocking_export(self):
+        """採用していない製造案のfailは、比較として載るが出力を止めない。"""
+        # 上面が開いた箱。FDMで上向きに積めば通り、UV樹脂で同じ向きに積むと吸盤になる。
+        box = Model((Part("box", (
+            Feature("block", Box((0, 0, 0), (20, 20, 12))),
+            Feature("inside", Box((2, 2, 2), (18, 18, 13)), operation="cut"),
+        ), manufacturing=(
+            ManufacturingPlan("fdm", Fdm(), "test"),
+            ManufacturingPlan("resin", Resin(0.8, 45.0, 5.0, 2.0), "test"),
+        ), adopted="fdm"),), policy=Policy(voxel_mm=0.5))
+        result = build(box)
+        self.assertTrue(result.export_allowed, result.report)
+        suction = [c for c in result.report["checks"] if c["rule"] == "resin_suction"]
+        self.assertEqual([(c["plan"], c["status"], c["adopted"]) for c in suction], [("resin", "fail", False)])
+        adopted = replace(box, parts=(replace(box.parts[0], adopted="resin"),))
+        self.assertFalse(build(adopted).export_allowed)
 
     def test_sealed_cavity_blocks_export(self):
         model = add_feature(block(), Feature("void", Box((3, 3, 3), (7, 7, 7)), operation="cut"))
@@ -113,7 +134,7 @@ class CadQueryTests(unittest.TestCase):
             Feature("left", Box((0, 0, 0), (5, 5, 5))),
             Feature("neck", Box((5, 2, 2), (7, 3, 3))),
             Feature("right", Box((7, 0, 0), (12, 5, 5))),
-        )),), policy=Policy(min_wall_mm=0.5))
+        )),), default_manufacturing=ManufacturingPlan("fdm", Fdm(min_wall_mm=0.5), "test"))
         result = build(dumbbell)
         self.assertFalse(failures(result, "single_solid"), result.report)
         self.assertTrue(failures(result, "neck_section"), result.report)

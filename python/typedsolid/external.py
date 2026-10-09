@@ -1,9 +1,9 @@
 """外部のSTL/STEPを読み、IRを介さずに最終形状のruleを評価する。
 
 既存の筐体と比較するための入口である。評価するのは`Rule::VOXEL`の4 rule
-(final_wall_thickness、neck_section、closed_cavity、support_free) だけで、
-IRの意味を要する検査 (keepout、掃引、分解、ネジ、snap fit、コネクタ開口) は
-行わない。座標の単位はmmとみなす。STEPはCadQueryで読み、STLへ三角形分割してから
+(final_wall_thickness、neck_section、closed_cavity、support_free) と、UV樹脂の製造案では
+resin_drain、resin_suctionだけで、IRの意味を要する検査 (keepout、掃引、分解、ネジ、
+snap fit、コネクタ開口) は行わない。製造案は1つで、既定はFDMである。座標の単位はmmとみなす。STEPはCadQueryで読み、STLへ三角形分割してから
 同じ経路で評価する。第三者のファイルはリポジトリに置かず、利用者が取得して渡す。
 """
 
@@ -17,7 +17,7 @@ from typing import get_args
 
 from . import _native
 from .figures import write_stl_figures
-from .model import Direction, Policy
+from .model import DEFAULT_PLAN, Direction, Fdm, ManufacturingPlan, Orientation, Policy, Resin
 from .viewer import MeshPart, stl_part, write_viewer
 
 __all__ = ["inspect_file", "main"]
@@ -48,50 +48,64 @@ def inspect_file(
     policy: Policy | None = None,
     target: str | None = None,
     figures: str | Path | None = None,
+    plan: ManufacturingPlan = DEFAULT_PLAN,
 ) -> list[dict]:
-    """ファイルを読み、4つの最終形状ruleの結果を返す。meshが閉じていなければ例外を送出する。
+    """ファイルを読み、最終形状のruleの結果を返す。meshが閉じていなければ例外を送出する。
 
+    肉厚、支持、UV樹脂のruleはplan (製造案) の製造法、特性、姿勢で判定する。
     figuresを与えると、概観と検出箇所の断面図と、3D viewer (viewer.html) をそのdirectoryへ書く。
     viewerは判定に使ったSTLの三角形をそのまま描き、間引かない。
     """
-    return _inspect(Path(path), policy or Policy(), target, figures)[0]
+    return _inspect(Path(path), policy or Policy(), plan, target, figures)[0]
 
 
 def _inspect(
-    path: Path, policy: Policy, target: str | None, figures: str | Path | None,
+    path: Path, policy: Policy, plan: ManufacturingPlan, target: str | None, figures: str | Path | None,
 ) -> tuple[list[dict], MeshPart | None]:
     """判定の結果と、viewerを書いた場合はその部品を返す。"""
     target = target or path.stem
     stl = _stl_bytes(path, policy.voxel_mm)
     policy_json = json.dumps(asdict(policy))
-    checks = json.loads(_native.evaluate_stl_voxels(stl, target, policy_json))
+    plan_json = json.dumps(_plan_dict(plan))
+    checks = json.loads(_native.evaluate_stl_voxels(stl, target, policy_json, plan_json))
     if figures is None:
         return checks, None
-    write_stl_figures(stl, policy_json, target, checks, figures)
+    write_stl_figures(stl, policy_json, plan_json, target, checks, figures)
     part = stl_part(target, stl)
     write_viewer([part], checks, Path(figures) / VIEWER_FILE, title=f"TypedSolid: {target} ({path.name})")
     return checks, part
 
 
+def _plan_dict(plan: ManufacturingPlan) -> dict:
+    """製造案のJSON。省略した材料は書かない。"""
+    return {key: value for key, value in asdict(plan).items() if value is not None}
+
+
 def main(argv: list[str] | None = None) -> int:
     defaults = Policy()
+    fdm = Fdm()
     parser = argparse.ArgumentParser(description="外部のSTL/STEPに最終形状のruleを適用する")
     parser.add_argument("path", type=Path, help="評価するSTL (binary又はASCII) 又はSTEP。単位はmm")
     parser.add_argument("--voxel-mm", type=float, default=defaults.voxel_mm)
-    parser.add_argument("--min-wall-mm", type=float, default=defaults.min_wall_mm)
     parser.add_argument("--min-neck-mm", type=float, default=defaults.min_neck_mm)
-    parser.add_argument("--build-direction", choices=get_args(Direction), default=defaults.build_direction)
-    parser.add_argument("--overhang-angle-deg", type=float, default=defaults.overhang_angle_deg)
-    parser.add_argument("--bridge-max-mm", type=float, default=defaults.bridge_max_mm)
+    parser.add_argument("--process", choices=("fdm", "resin"), default="fdm", help="製造法。resinは--min-drain-mmが必要")
+    parser.add_argument("--min-wall-mm", type=float, default=fdm.min_wall_mm)
+    parser.add_argument("--build-direction", choices=get_args(Direction), default="plus_z")
+    parser.add_argument("--overhang-angle-deg", type=float, default=fdm.overhang_angle_deg)
+    parser.add_argument("--bridge-max-mm", type=float, default=fdm.bridge_max_mm)
+    parser.add_argument("--min-drain-mm", type=float, help="UV樹脂の排出路に要求する最小幅")
     parser.add_argument("--json", action="store_true", help="結果をJSONで出力する")
     parser.add_argument("--figures", type=Path, help="概観と検出箇所の断面図と、3D viewerを書くdirectory")
     args = parser.parse_args(argv)
-    policy = replace(
-        defaults, voxel_mm=args.voxel_mm, min_wall_mm=args.min_wall_mm, min_neck_mm=args.min_neck_mm,
-        build_direction=args.build_direction, overhang_angle_deg=args.overhang_angle_deg,
-        bridge_max_mm=args.bridge_max_mm,
-    )
-    checks, part = _inspect(args.path, policy, None, args.figures)
+    policy = replace(defaults, voxel_mm=args.voxel_mm, min_neck_mm=args.min_neck_mm)
+    if args.process == "resin":
+        if args.min_drain_mm is None:
+            parser.error("--process resin requires --min-drain-mm")
+        process: Fdm | Resin = Resin(args.min_wall_mm, args.overhang_angle_deg, args.bridge_max_mm, args.min_drain_mm)
+    else:
+        process = Fdm(args.min_wall_mm, args.overhang_angle_deg, args.bridge_max_mm)
+    plan = ManufacturingPlan(args.process, process, "command line", Orientation(args.build_direction))
+    checks, part = _inspect(args.path, policy, plan, None, args.figures)
     if part is not None:
         # 標準出力は結果 (--jsonではJSON) だけとし、viewerの大きさは標準エラーに書く。
         viewer = args.figures / VIEWER_FILE

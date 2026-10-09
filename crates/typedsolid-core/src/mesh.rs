@@ -200,6 +200,8 @@ fn shell_count(triangles: &[Triangle]) -> usize {
 
 fn check(rule: Rule, target: &str, passed: bool, message: String) -> Check {
     Check {
+        plan: None,
+        adopted: true,
         locations: Vec::new(),
         rule,
         status: if passed { Status::Pass } else { Status::Fail },

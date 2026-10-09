@@ -2,13 +2,15 @@ from .catalog import Board, BoardConnector, MountingHole, Source, board, board_i
 from .connector import ConnectorOpening, connector_opening
 from .fastening import InsertSpec, ScrewFixing, ScrewSpec, screw_fixing
 from .model import (
-    Assembly, Box, Clearance, Connector, Cylinder, Fastener, Feature, Insert, Keepout, Material, Model, Move,
-    Part, PlugSource, Policy, Release, Screw, SelfTapping, SnapFit, Step, Sweep, boss, hole,
+    DEFAULT_PLAN, Assembly, Box, Clearance, Connector, Cylinder, Fastener, Fdm, Feature, Insert, Keepout,
+    ManufacturingPlan, Material, Model, Move, Orientation, Part, PlugSource, Policy, Release, Resin, Screw,
+    SelfTapping, SnapFit, Step, Sweep, boss, hole,
 )
 from .profile import Printer, Profile
 from .snapfit import SnapFitFixing, snap_fit
 
 __all__ = [
+    "DEFAULT_PLAN", "Fdm", "ManufacturingPlan", "Orientation", "Resin",
     "Assembly", "Board", "BoardConnector", "Box", "Clearance", "Connector", "ConnectorOpening", "Cylinder",
     "Fastener", "Feature", "Insert", "InsertSpec", "Keepout", "Material", "Model", "Move", "MountingHole",
     "Part", "PlugSource", "Policy", "Printer", "Profile", "Release", "Screw", "ScrewFixing", "ScrewSpec",

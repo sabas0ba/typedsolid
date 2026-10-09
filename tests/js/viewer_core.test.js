@@ -168,6 +168,22 @@ test("filter by status, rule and case-insensitive text", () => {
   assert.deepEqual(ids(core.filterChecks(CHECKS, { status: "all", q: "tray" })), [0, 1, 3]);
 });
 
+test("plan filter shows adopted plans by default", () => {
+  const planned = [
+    { index: 0, rule: "neck_section", target: "lid", status: "pass", message: "", locations: [] },
+    { index: 1, rule: "support_free", target: "lid", status: "pass", message: "", locations: [], plan: "fdm", adopted: true },
+    { index: 2, rule: "support_free", target: "lid", status: "fail", message: "", locations: [], plan: "resin", adopted: false },
+    { index: 3, rule: "resin_suction", target: "lid", status: "fail", message: "", locations: [], plan: "resin", adopted: false },
+  ];
+  const ids = (filter) => core.filterChecks(planned, { status: "all", ...filter }).map((c) => c.index);
+  assert.deepEqual(ids({}), [0, 1]);
+  assert.deepEqual(ids({ plan: "resin" }), [0, 2, 3]);
+  assert.deepEqual(ids({ plan: "*" }), [0, 1, 2, 3]);
+  const state = { ...core.parseState(""), plan: "resin" };
+  assert.equal(core.formatState(state), "#plan=resin");
+  assert.equal(core.parseState("#plan=resin").plan, "resin");
+});
+
 test("sorting is stable on the report order", () => {
   const ids = (checks) => checks.map((c) => c.index);
   assert.deepEqual(ids(core.sortChecks(CHECKS, "severity")), [1, 3, 2, 0]);
