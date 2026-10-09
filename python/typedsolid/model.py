@@ -17,7 +17,8 @@ Rule = Literal[
     "access_clearance", "part_interference", "mesh_manifold", "mesh_volume",
     "final_wall_thickness", "neck_section", "closed_cavity",
     "support_free", "disassembly_path", "disassembly_separation", "fastener_fit", "snap_fit",
-    "fastener_release", "connector_fit", "resin_drain", "resin_suction", "strength", "thermal",
+    "fastener_release", "connector_fit", "resin_drain", "resin_suction", "milling_reach", "milling_corner",
+    "mold_undercut", "mold_thick_wall", "mold_draft", "strength", "thermal",
 ]
 SourceKind = Literal["datasheet", "measured", "other"]
 
@@ -88,16 +89,43 @@ class Resin:
     kind: Literal["resin"] = "resin"
 
 
-Process = Fdm | Resin
-
-
 @dataclass(frozen=True)
 class Orientation:
-    """製造時の姿勢。upは製造機の+Z (積層方向) に向ける組立座標の方向、turn_degはそのあと
-    製造機の+Z周りに回す角度 (0、90、180、270)。"""
+    """製造時の姿勢。upは製造機の+Z (積層方向、工具を下ろす側、型を開く軸) に向ける組立座標の
+    方向、turn_degはそのあと製造機の+Z周りに回す角度 (0、90、180、270)。"""
 
     up: Direction = "plus_z"
     turn_deg: int = 0
+
+
+@dataclass(frozen=True)
+class Milling:
+    """3軸の切削。工具は平端の円柱とし、製造案の姿勢のupの側から下ろす。値は既定値を持たない。
+
+    tool_diameter_mmは工具の直径、tool_length_mmは素材の上面から工具の先端が届く深さである。
+    additional_setupsは製造案の姿勢に加える段取りで、段取りごとに工具を下ろす側を変える。
+    """
+
+    min_wall_mm: float
+    tool_diameter_mm: float
+    tool_length_mm: float
+    additional_setups: tuple[Orientation, ...] = ()
+    kind: Literal["milling"] = "milling"
+
+
+@dataclass(frozen=True)
+class Molding:
+    """2枚型の射出成形。型は製造案の姿勢のupの軸に沿って開く。値は既定値を持たない。
+
+    max_wall_mmは許す最大の肉厚で、厚肉部はひけと空洞の原因となる。抜き勾配は評価しない。
+    """
+
+    min_wall_mm: float
+    max_wall_mm: float
+    kind: Literal["molding"] = "molding"
+
+
+Process = Fdm | Resin | Milling | Molding
 
 
 @dataclass(frozen=True)
@@ -380,7 +408,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 10
+    schema_version: int = 11
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)

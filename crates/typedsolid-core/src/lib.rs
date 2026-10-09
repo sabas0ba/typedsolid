@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -738,29 +738,52 @@ pub enum Process {
         /// 未硬化樹脂を排出する通路に要求する最小幅。単位はmm。
         min_drain_mm: f64,
     },
+    /// 3軸の切削。工具は平端の円柱とし、製造案の`orientation.up`の側から`-up`へ下ろす。
+    Milling {
+        min_wall_mm: f64,
+        /// 工具の直径。内角に残る丸みの半径と、工具が入れる溝の幅を決める。単位はmm。
+        tool_diameter_mm: f64,
+        /// 素材の上面から工具の先端まで届く深さ。単位はmm。
+        tool_length_mm: f64,
+        /// `orientation`に加える段取り。段取りごとに工具を下ろす向きを変える。
+        #[serde(default)]
+        additional_setups: Vec<Orientation>,
+    },
+    /// 2枚型の射出成形。型は製造案の`orientation.up`の向きと逆向きに開く。
+    Molding {
+        min_wall_mm: f64,
+        /// 許す最大の肉厚。厚肉部はひけと空洞の原因となる。単位はmm。
+        max_wall_mm: f64,
+    },
 }
+
+/// 1つの切削案が持てる段取りの上限。軸平行の向きは6通りである。
+const MAX_SETUPS: usize = 6;
 
 impl Process {
     pub fn min_wall_mm(&self) -> f64 {
         match self {
-            Self::Fdm { min_wall_mm, .. } | Self::Resin { min_wall_mm, .. } => *min_wall_mm,
+            Self::Fdm { min_wall_mm, .. }
+            | Self::Resin { min_wall_mm, .. }
+            | Self::Milling { min_wall_mm, .. }
+            | Self::Molding { min_wall_mm, .. } => *min_wall_mm,
         }
     }
 
-    pub fn overhang_angle_deg(&self) -> f64 {
+    /// 支持なしで許す傾斜とbridgeの長さ。積層しない製造法ではNone。
+    pub fn layering(&self) -> Option<(f64, f64)> {
         match self {
             Self::Fdm {
-                overhang_angle_deg, ..
+                overhang_angle_deg,
+                bridge_max_mm,
+                ..
             }
             | Self::Resin {
-                overhang_angle_deg, ..
-            } => *overhang_angle_deg,
-        }
-    }
-
-    pub fn bridge_max_mm(&self) -> f64 {
-        match self {
-            Self::Fdm { bridge_max_mm, .. } | Self::Resin { bridge_max_mm, .. } => *bridge_max_mm,
+                overhang_angle_deg,
+                bridge_max_mm,
+                ..
+            } => Some((*overhang_angle_deg, *bridge_max_mm)),
+            Self::Milling { .. } | Self::Molding { .. } => None,
         }
     }
 
@@ -768,31 +791,62 @@ impl Process {
     pub fn min_drain_mm(&self) -> Option<f64> {
         match self {
             Self::Resin { min_drain_mm, .. } => Some(*min_drain_mm),
-            Self::Fdm { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// 製造法の名前。checkのmessageに使う。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Fdm { .. } => "fdm",
+            Self::Resin { .. } => "resin",
+            Self::Milling { .. } => "milling",
+            Self::Molding { .. } => "molding",
         }
     }
 
     fn validate(&self, owner: &str) -> Result<(), String> {
-        for (name, value) in [("min_wall_mm", self.min_wall_mm())]
-            .into_iter()
-            .chain(self.min_drain_mm().map(|v| ("min_drain_mm", v)))
-        {
+        let mut lengths = vec![("min_wall_mm", self.min_wall_mm())];
+        match self {
+            Self::Resin { min_drain_mm, .. } => lengths.push(("min_drain_mm", *min_drain_mm)),
+            Self::Milling {
+                tool_diameter_mm,
+                tool_length_mm,
+                ..
+            } => {
+                lengths.push(("tool_diameter_mm", *tool_diameter_mm));
+                lengths.push(("tool_length_mm", *tool_length_mm));
+            }
+            Self::Molding { max_wall_mm, .. } => lengths.push(("max_wall_mm", *max_wall_mm)),
+            Self::Fdm { .. } => {}
+        }
+        for (name, value) in lengths {
             if !value.is_finite() || !(0.01..=1000.0).contains(&value) {
                 return Err(format!(
                     "{owner}: {name} must be finite and in [0.01, 1000]"
                 ));
             }
         }
-        let overhang = self.overhang_angle_deg();
-        if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
-            return Err(format!(
-                "{owner}: overhang_angle_deg must be finite and in [0, 89]"
-            ));
+        if let Some((overhang, bridge)) = self.layering() {
+            if !overhang.is_finite() || !(0.0..=89.0).contains(&overhang) {
+                return Err(format!(
+                    "{owner}: overhang_angle_deg must be finite and in [0, 89]"
+                ));
+            }
+            if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
+                return Err(format!(
+                    "{owner}: bridge_max_mm must be finite and in [0, 1000]"
+                ));
+            }
         }
-        let bridge = self.bridge_max_mm();
-        if !bridge.is_finite() || !(0.0..=1000.0).contains(&bridge) {
+        if let Self::Molding {
+            min_wall_mm,
+            max_wall_mm,
+        } = self
+            && max_wall_mm <= min_wall_mm
+        {
             return Err(format!(
-                "{owner}: bridge_max_mm must be finite and in [0, 1000]"
+                "{owner}: max_wall_mm must be greater than min_wall_mm"
             ));
         }
         Ok(())
@@ -838,10 +892,45 @@ impl ManufacturingPlan {
                 "{owner}: source must be non-empty and at most 256 bytes"
             ));
         }
-        if ![0, 90, 180, 270].contains(&self.orientation.turn_deg) {
-            return Err(format!("{owner}: turn_deg must be 0, 90, 180 or 270"));
+        for orientation in self.setups() {
+            if ![0, 90, 180, 270].contains(&orientation.turn_deg) {
+                return Err(format!("{owner}: turn_deg must be 0, 90, 180 or 270"));
+            }
+        }
+        if let Process::Milling {
+            additional_setups, ..
+        } = &self.process
+        {
+            if additional_setups.len() >= MAX_SETUPS {
+                return Err(format!(
+                    "{owner}: at most {} additional setups",
+                    MAX_SETUPS - 1
+                ));
+            }
+            // 3軸の工具は軸対称であり、同じ向きの段取りは届く範囲を変えない。
+            let mut seen = Vec::new();
+            for orientation in self.setups() {
+                if seen.contains(&orientation.up) {
+                    return Err(format!(
+                        "{owner}: setups must face different directions; {} repeats",
+                        orientation.up
+                    ));
+                }
+                seen.push(orientation.up);
+            }
         }
         self.process.validate(&owner)
+    }
+
+    /// 段取りの姿勢。切削は`orientation`と`additional_setups`、他の製造法は`orientation`だけである。
+    pub fn setups(&self) -> impl Iterator<Item = &Orientation> {
+        let additional: &[Orientation] = match &self.process {
+            Process::Milling {
+                additional_setups, ..
+            } => additional_setups,
+            _ => &[],
+        };
+        std::iter::once(&self.orientation).chain(additional.iter())
     }
 }
 
@@ -1133,12 +1222,22 @@ pub enum Rule {
     ResinDrain,
     /// UV樹脂: 造形中に造形板の側だけが閉じた椀となり、槽の底との間で吸盤となる空洞。
     ResinSuction,
+    /// 切削: どの段取りからも細い工具が届かない空間 (undercut、届かない深さ)。
+    MillingReach,
+    /// 切削: 細い工具なら届くが、工具の径では削れない空間 (内角の丸み、細い溝)。
+    MillingCorner,
+    /// 射出成形: 型を開く向きのどちら側へも抜けない空間。
+    MoldUndercut,
+    /// 射出成形: 最大肉厚を超える厚肉部。
+    MoldThickWall,
+    /// 射出成形: 抜き勾配。軸平行のprimitiveは勾配を持たないため評価しない。
+    MoldDraft,
     Strength,
     Thermal,
 }
 
 impl Rule {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 27] = [
         Self::FeatureThickness,
         Self::ValidSolid,
         Self::SingleSolid,
@@ -1159,6 +1258,11 @@ impl Rule {
         Self::ConnectorFit,
         Self::ResinDrain,
         Self::ResinSuction,
+        Self::MillingReach,
+        Self::MillingCorner,
+        Self::MoldUndercut,
+        Self::MoldThickWall,
+        Self::MoldDraft,
         Self::Strength,
         Self::Thermal,
     ];
@@ -1464,6 +1568,27 @@ fn upgrade_v9(value: &mut Value) -> Result<(), String> {
         part.insert("manufacturing".into(), json!([plan.clone()]));
         part.insert("adopted".into(), json!("v9_policy"));
     }
+    root.insert("schema_version".into(), json!(10));
+    Ok(())
+}
+
+/// schema v10のJSONをv11へ変換する。v10は切削と射出成形の製造案を持たないため、
+/// そのまま受理する。v10の入力にこれらの製造法が現れた場合は拒否する。
+fn upgrade_v10(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    let plans = root
+        .get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("manufacturing").and_then(Value::as_array))
+        .flatten();
+    for plan in plans {
+        let kind = plan.pointer("/process/kind").and_then(Value::as_str);
+        if let Some(kind @ ("milling" | "molding")) = kind {
+            return Err(format!("schema_version 10 does not define process {kind}"));
+        }
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
@@ -1499,8 +1624,16 @@ impl Model {
         let mut value: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         // 版nのJSONはUPGRADES[n-1..]を順に通してSCHEMA_VERSIONへ昇格する。
         const UPGRADES: [Upgrade; SCHEMA_VERSION as usize - 1] = [
-            upgrade_v1, upgrade_v2, upgrade_v3, upgrade_v4, upgrade_v5, upgrade_v6, upgrade_v7,
-            upgrade_v8, upgrade_v9,
+            upgrade_v1,
+            upgrade_v2,
+            upgrade_v3,
+            upgrade_v4,
+            upgrade_v5,
+            upgrade_v6,
+            upgrade_v7,
+            upgrade_v8,
+            upgrade_v9,
+            upgrade_v10,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1585,6 +1718,12 @@ impl Model {
                         part.id,
                         voxel::MAX_GRID_CELLS
                     ));
+                }
+            }
+            if let Some(size) = voxel::grid_size(part, pitch) {
+                let size = size.map(|count| count as usize);
+                for plan in &part.manufacturing {
+                    voxel::check_milling_work(size, pitch, plan, &part.id)?;
                 }
             }
         }
@@ -2214,7 +2353,21 @@ mod tests {
     #[test]
     fn manufacturing_plans_are_validated() {
         type Edit = fn(&mut Model);
-        let cases: [(&str, Edit); 6] = [
+        fn milling(setups: &[Direction]) -> Process {
+            Process::Milling {
+                min_wall_mm: 1.0,
+                tool_diameter_mm: 3.0,
+                tool_length_mm: 20.0,
+                additional_setups: setups
+                    .iter()
+                    .map(|up| Orientation {
+                        up: *up,
+                        turn_deg: 0,
+                    })
+                    .collect(),
+            }
+        }
+        let cases: [(&str, Edit); 11] = [
             ("no plan", |m| m.parts[0].manufacturing.clear()),
             ("unknown adopted plan", |m| {
                 m.parts[0].adopted = "resin".into()
@@ -2236,12 +2389,65 @@ mod tests {
             ("unknown plan material", |m| {
                 m.parts[0].manufacturing[0].material = Some("abs".into())
             }),
+            ("setup repeats the first direction", |m| {
+                m.parts[0].manufacturing[0].process = milling(&[Direction::PlusZ])
+            }),
+            ("more setups than directions", |m| {
+                m.parts[0].manufacturing[0].process = milling(&[
+                    Direction::MinusX,
+                    Direction::PlusX,
+                    Direction::MinusY,
+                    Direction::PlusY,
+                    Direction::MinusZ,
+                    Direction::MinusZ,
+                ])
+            }),
+            ("setup turn not a right angle", |m| {
+                let mut process = milling(&[Direction::MinusZ]);
+                if let Process::Milling {
+                    additional_setups, ..
+                } = &mut process
+                {
+                    additional_setups[0].turn_deg = 30;
+                }
+                m.parts[0].manufacturing[0].process = process;
+            }),
+            ("zero tool", |m| {
+                m.parts[0].manufacturing[0].process = Process::Milling {
+                    min_wall_mm: 1.0,
+                    tool_diameter_mm: 0.0,
+                    tool_length_mm: 20.0,
+                    additional_setups: vec![],
+                }
+            }),
+            ("max wall below min wall", |m| {
+                m.parts[0].manufacturing[0].process = Process::Molding {
+                    min_wall_mm: 2.0,
+                    max_wall_mm: 1.5,
+                }
+            }),
         ];
+        let mut valid = model();
+        valid.parts[0].manufacturing[0].process = milling(&[Direction::MinusZ, Direction::PlusX]);
+        valid.validate().unwrap();
         for (name, mutate) in cases {
             let mut m = model();
             mutate(&mut m);
             assert!(m.validate().is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn schema_v10_has_no_milling_or_molding() {
+        let mut value = serde_json::to_value(two_parts()).unwrap();
+        value["schema_version"] = json!(10);
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        value["parts"][0]["manufacturing"][0]["process"] = json!({
+            "kind": "molding", "min_wall_mm": 1.0, "max_wall_mm": 3.0,
+        });
+        let error = Model::from_json(&value.to_string()).unwrap_err();
+        assert!(error.contains("does not define process molding"), "{error}");
     }
 
     #[test]
