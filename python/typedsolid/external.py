@@ -88,22 +88,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("path", type=Path, help="評価するSTL (binary又はASCII) 又はSTEP。単位はmm")
     parser.add_argument("--voxel-mm", type=float, default=defaults.voxel_mm)
     parser.add_argument("--min-neck-mm", type=float, default=defaults.min_neck_mm)
-    parser.add_argument("--process", choices=("fdm", "resin"), default="fdm", help="製造法。resinは--min-drain-mmが必要")
-    parser.add_argument("--min-wall-mm", type=float, default=fdm.min_wall_mm)
+    parser.add_argument(
+        "--process", choices=("fdm", "resin"), default="fdm",
+        help="製造法。resinは製造法の特性 (--min-wall-mmから--min-drain-mmまで) をすべて与える",
+    )
+    # 製造法の特性。fdmで省いた値はFdm()の既定値とする。resinは既定値を持たない。
+    parser.add_argument("--min-wall-mm", type=float, help=f"fdmの既定値は{fdm.min_wall_mm}")
     parser.add_argument("--build-direction", choices=get_args(Direction), default="plus_z")
-    parser.add_argument("--overhang-angle-deg", type=float, default=fdm.overhang_angle_deg)
-    parser.add_argument("--bridge-max-mm", type=float, default=fdm.bridge_max_mm)
+    parser.add_argument("--overhang-angle-deg", type=float, help=f"fdmの既定値は{fdm.overhang_angle_deg}")
+    parser.add_argument("--bridge-max-mm", type=float, help=f"fdmの既定値は{fdm.bridge_max_mm}")
     parser.add_argument("--min-drain-mm", type=float, help="UV樹脂の排出路に要求する最小幅")
     parser.add_argument("--json", action="store_true", help="結果をJSONで出力する")
     parser.add_argument("--figures", type=Path, help="概観と検出箇所の断面図と、3D viewerを書くdirectory")
     args = parser.parse_args(argv)
     policy = replace(defaults, voxel_mm=args.voxel_mm, min_neck_mm=args.min_neck_mm)
+    values = {
+        "min_wall_mm": args.min_wall_mm, "overhang_angle_deg": args.overhang_angle_deg,
+        "bridge_max_mm": args.bridge_max_mm,
+    }
     if args.process == "resin":
-        if args.min_drain_mm is None:
-            parser.error("--process resin requires --min-drain-mm")
-        process: Fdm | Resin = Resin(args.min_wall_mm, args.overhang_angle_deg, args.bridge_max_mm, args.min_drain_mm)
+        values["min_drain_mm"] = args.min_drain_mm
+        missing = [f"--{name.replace('_', '-')}" for name, value in values.items() if value is None]
+        if missing:
+            parser.error(f"--process resin requires {', '.join(missing)}")
+        process: Fdm | Resin = Resin(**values)
     else:
-        process = Fdm(args.min_wall_mm, args.overhang_angle_deg, args.bridge_max_mm)
+        if args.min_drain_mm is not None:
+            parser.error("--min-drain-mm applies only to --process resin")
+        process = Fdm(**{name: value for name, value in values.items() if value is not None})
     plan = ManufacturingPlan(args.process, process, "command line", Orientation(args.build_direction))
     checks, part = _inspect(args.path, policy, plan, None, args.figures)
     if part is not None:

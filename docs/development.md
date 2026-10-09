@@ -276,10 +276,11 @@ lid = Part("lid", features, manufacturing=(upside_down, upright, resin), adopted
 ```bash
 .venv/bin/python -m typedsolid.external path/to/case.stl
 .venv/bin/python -m typedsolid.external path/to/case.step --min-wall-mm 1.0 --build-direction plus_y --json
-.venv/bin/python -m typedsolid.external path/to/case.stl --process resin --min-drain-mm 3.0 --overhang-angle-deg 30
+.venv/bin/python -m typedsolid.external path/to/case.stl --process resin --min-wall-mm 1.2 \
+    --overhang-angle-deg 30 --bridge-max-mm 5 --min-drain-mm 3.0
 ```
 
-製造案は`--process` (`fdm`か`resin`)、`--min-wall-mm`、`--build-direction` (製造案の`up`)、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm` (`resin`で必須) から1件を作る。
+製造案は`--process` (`fdm`か`resin`)、`--min-wall-mm`、`--build-direction` (製造案の`up`)、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`から1件を作る。`fdm`で省いた特性は`Fdm()`の既定値とする。`resin`は既定値を持たず、`--min-wall-mm`、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`をすべて要する。
 
 すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy, plan=...)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
