@@ -8,6 +8,7 @@ URL fragmentに書き、同じURLで同じ表示を再現できる。
 typedsolid.cadqueryが持ち、外部のSTLは判定に使った三角形をそのまま描く。
 """
 
+from array import array
 from collections.abc import Sequence
 import base64
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ import html
 import json
 from pathlib import Path
 import re
-import struct
+import sys
 
 from . import _native
 
@@ -45,7 +46,11 @@ class MeshPart:
         return (len(self.indices) // 12) if self.indices is not None else len(self.positions) // 36
 
     def bounds(self) -> dict:
-        coordinates = struct.unpack(f"<{len(self.positions) // 4}f", self.positions)
+        """頂点の外接box。座標は4 byteのまま走査し、三角形の多いmeshでも全座標をPythonのfloatにしない。"""
+        coordinates = array("f")
+        coordinates.frombytes(self.positions)
+        if sys.byteorder == "big":
+            coordinates.byteswap()
         return {
             key: [round(pick(coordinates[axis::3]), BOUNDS_DIGITS) + 0.0 for axis in range(3)]
             for key, pick in (("min", min), ("max", max))
