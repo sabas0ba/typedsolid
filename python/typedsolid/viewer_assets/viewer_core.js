@@ -245,6 +245,22 @@
     return plane;
   }
 
+  // 断面の平面上で、boxの範囲をmarginだけ広げた四角形。2つの三角形の頂点を並べる。
+  // 切り口 (cap) はこの四角形のうち、部品の内部にある画素だけを塗る。
+  function clipQuad(clip, box, margin) {
+    const axis = AXES.indexOf(clip.axis);
+    const [u, v] = [0, 1, 2].filter((i) => i !== axis);
+    const corner = (a, b) => {
+      const point = [0, 0, 0];
+      point[axis] = clip.value;
+      point[u] = a ? box.max[u] + margin : box.min[u] - margin;
+      point[v] = b ? box.max[v] + margin : box.min[v] - margin;
+      return point;
+    };
+    const [p00, p10, p11, p01] = [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)];
+    return new Float32Array([...p00, ...p10, ...p11, ...p00, ...p11, ...p01]);
+  }
+
   // ---- 表示状態とURL fragment ----
 
   function parseNumber(text, fallback) {
@@ -425,6 +441,7 @@
     boxCentre,
     boxEdges,
     clipPlane,
+    clipQuad,
     decodeFloat32,
     decodeUint32,
     filterChecks,

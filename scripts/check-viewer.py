@@ -14,13 +14,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
 import sys
 import zlib
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 from examples.assembly_defects import ASSEMBLY_DEFECTS
 from examples.pi4_enclosure import pi4_enclosure_defects
 from typedsolid.cadquery import build, write_viewer_figure
@@ -121,15 +123,29 @@ def is_part(r: int, g: int, b: int) -> bool:
     return 60 < max(r, g, b) < 225 and max(r, g, b) - min(r, g, b) > 12 and not is_location(r, g, b)
 
 
-def is_cut(r: int, g: int, b: int) -> bool:
-    """断面の切り口から見える裏面の灰色 (viewer.jsのCUT_COLOUR)。"""
-    return abs(r - 89) <= 6 and abs(g - 94) <= 6 and abs(b - 102) <= 6
+def _viewer_constants() -> tuple[list[tuple[float, float, float]], float]:
+    """viewer.jsの部品色と切り口の斜線の比。描画と検査で値を重複して持たない。"""
+    source = (ROOT / "python" / "typedsolid" / "viewer_assets" / "viewer.js").read_text(encoding="utf-8")
+    palette = re.search(r"const PART_COLOURS = \[(.*?)\];", source, re.S).group(1)
+    colours = [tuple(float(v) for v in triple) for triple in re.findall(r"\[([\d.]+), ([\d.]+), ([\d.]+)\]", palette)]
+    stripe = float(re.search(r"const CAP_STRIPE = ([\d.]+);", source).group(1))
+    return colours, stripe
+
+
+PART_COLOURS, CAP_STRIPE = _viewer_constants()
+# 切り口の斜線の色。部品色に比を掛けたもので、陰影を付けた表面の色より暗い。
+CAP_COLOURS = tuple(tuple(round(c * CAP_STRIPE * 255) for c in colour) for colour in PART_COLOURS)
+
+
+def is_cap(r: int, g: int, b: int) -> bool:
+    """断面の切り口の斜線。いずれかの部品色の斜線の色に一致する。"""
+    return any(abs(r - cr) <= 3 and abs(g - cg) <= 3 and abs(b - cb) <= 3 for cr, cg, cb in CAP_COLOURS)
 
 
 def fractions(path: Path) -> dict[str, float]:
     """描画領域の画素のうち、各分類に入る割合。速さのため2画素おきに数える。"""
     width, height, size, pixels = read_png(path)
-    counts = {"location": 0, "part": 0, "cut": 0}
+    counts = {"location": 0, "part": 0, "cap": 0}
     total = 0
     for y in range(0, height, 2):
         for x in range(0, min(width, CANVAS_WIDTH), 2):
@@ -138,7 +154,7 @@ def fractions(path: Path) -> dict[str, float]:
             total += 1
             counts["location"] += is_location(r, g, b)
             counts["part"] += is_part(r, g, b)
-            counts["cut"] += is_cut(r, g, b)
+            counts["cap"] += is_cap(r, g, b)
     return {key: value / total for key, value in counts.items()}
 
 
@@ -164,7 +180,7 @@ def scenes(viewer: Viewer) -> list[Scene]:
         Scene("selected", f"#check={failing}&ghost={parts}", lambda f, _: _require(f, part=0.02, location=MIN_LINE_FRACTION)),
         # 注視では検出箇所を寄せて半透明の赤で塗る。線だけの状態より赤が十分に多い。
         Scene("focus", f"#check={failing}&loc=0", lambda f, seen: _require(f, location=3 * seen["selected"]["location"])),
-        Scene("section", f"#clip=z:{top / 2:.3f}&view=35,60,1", lambda f, _: _require(f, part=0.05, cut=0.001)),
+        Scene("section", f"#clip=z:{top / 2:.3f}&view=35,60,1", lambda f, _: _require(f, part=0.05, cap=0.002)),
     ]
 
 

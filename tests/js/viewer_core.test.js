@@ -100,6 +100,15 @@ test("clip plane keeps the side at or below the value unless flipped", () => {
   assert.ok(keep(core.clipPlane(null), [1e6, -1e6, 1e6]));
 });
 
+test("clip quad lies on the section plane and covers the box", () => {
+  const quad = core.clipQuad({ axis: "y", value: 4, flip: false }, { min: [0, 0, 0], max: [10, 8, 6] }, 1);
+  assert.equal(quad.length, 18);
+  for (let i = 0; i < 18; i += 3) {
+    assert.equal(quad[i + 1], 4);
+    assert.ok([-1, 11].includes(quad[i]) && [-1, 7].includes(quad[i + 2]));
+  }
+});
+
 test("state round-trips through the URL fragment", () => {
   const hash = "#check=3&loc=1&clip=y%3A12.5%3Aflip&hidden=lid&ghost=tray%2Cboard&status=all&rule=snap_fit&q=hook&sort=rule&view=10%2C-20%2C2";
   const state = core.parseState(hash);
