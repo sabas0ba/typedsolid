@@ -2,7 +2,7 @@
 
 基板の外形、取付穴、コネクタの辺上の位置は部品catalogの値 (公式の機械図) を使う。
 catalogが持たない値、すなわち基板の高さ、PCBの厚み、コネクタの高さ、プラグの断面、
-ネジの寸法、印刷機がbridgeで渡せる長さ、光造形の特性は、この作例が決めた説明用の値であり、
+ネジの寸法、印刷機がbridgeで渡せる長さ、光造形・切削・射出成形の特性は、この作例が決めた説明用の値であり、
 製品の仕様ではない。
 
 蓋は四隅の柱へネジで締め、下面のlipを底の壁の内側へ差し込む。基板は底の4本のbossへ
@@ -10,8 +10,11 @@ catalogが持たない値、すなわち基板の高さ、PCBの厚み、コネ�
 
 製造案は部品ごとに持つ。蓋は裏返してFDMで造形する案を採用し、上面を造形板に置く案を
 比較のために持つ。後者はlipの上の天板が支えを持たず、support_freeに落ちる。底はFDMの案を
-採用し、光造形の案を比較のために持つ。光造形の案は開いた箱を上向きに造形するため、
-resin_suctionに落ちる。採用しない案のcheckは出力の可否に用いない。
+採用し、光造形、切削、射出成形の案を比較のために持つ。光造形の案は開いた箱を上向きに
+造形するため、resin_suctionに落ちる。切削の案は上面と開口のある2面から工具を下ろし、
+どこへも届くが、ネジ柱と壁の間の内角と細い下穴を工具の径で削れずmilling_cornerに落ちる。射出成形の
+案は壁の開口が型の開く向きに抜けずmold_undercutに、壁の角と一体になった四隅のネジ柱が
+厚くmold_thick_wallに落ち、抜き勾配は評価しない。採用しない案のcheckは出力の可否に用いない。
 
 snap fitは持たない。蓋から垂らす梁は、軸平行の造形姿勢ではsnap_fitの積層方向の検査と
 support_freeを同時に満たさないため、任意の回転を扱えるようになるまで保留する。
@@ -20,8 +23,8 @@ support_freeを同時に満たさないため、任意の回転を扱えるよ�
 from dataclasses import replace
 
 from typedsolid import (
-    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Model, Move, Orientation, Part, PlugSource, Policy,
-    Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole, screw_fixing,
+    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Milling, Model, Molding, Move, Orientation, Part,
+    PlugSource, Policy, Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole, screw_fixing,
 )
 
 PI4 = board("raspberry_pi_4_model_b")
@@ -59,6 +62,20 @@ LID_UPRIGHT = ManufacturingPlan("fdm_upright", PRINTER, PRINTER_SOURCE)
 RESIN = ManufacturingPlan(
     "resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.0, bridge_max_mm=15.0, min_drain_mm=3.0),
     "example values for the typedsolid example, not a printer specification",
+)
+# 比較用の切削と射出成形。値は作例が決めた説明用の値であり、特定の工具や成形条件の値ではない。
+# 切削は上面と、コネクタ開口のある2面から工具を下ろす。
+MILLING = ManufacturingPlan(
+    "milling",
+    Milling(
+        min_wall_mm=1.2, tool_diameter_mm=3.0, tool_length_mm=30.0,
+        additional_setups=(Orientation("minus_y"), Orientation("plus_x")),
+    ),
+    "example values for the typedsolid example, not a tool specification",
+)
+MOLDING = ManufacturingPlan(
+    "molding", Molding(min_wall_mm=1.2, max_wall_mm=3.0),
+    "example values for the typedsolid example, not a molding specification",
 )
 SOURCE = PlugSource("other", "example value for the typedsolid example, not a connector specification")
 # 説明用のネジ寸法。特定の製品の値ではない。
@@ -182,7 +199,7 @@ def model(
         opening_features.append(feature)
     base = Part("base", shell() + tuple(opening_features) + tuple(
         feature for fixing in lid_fixings + board_fixings for feature in fixing.base_features
-    ) + base_extra, manufacturing=(PLAN, RESIN), adopted=PLAN.id)
+    ) + base_extra, manufacturing=(PLAN, RESIN, MILLING, MOLDING), adopted=PLAN.id)
     lid = Part("lid", (
         Feature("panel", Box((0, 0, HEIGHT_MM), (LENGTH_MM, WIDTH_MM, HEIGHT_MM + LID_MM)), "base"),
     ) + lid_lip() + tuple(feature for fixing in lid_fixings for feature in fixing.clamp_features) + lid_vents(*vents),
@@ -213,7 +230,7 @@ def pi4_enclosure() -> Model:
 
 def pi4_enclosure_defects() -> Model:
     """5種類の欠陥を同時に入れた筐体。2部品にまたがり、6つのruleの7つのcheckが落ちる。
-    採用しない製造案では、正常版と同じcheckに加えて両部品の薄肉が落ちる。
+    採用しない製造案では、正常版と同じcheckに加えて各案の薄肉が落ちる。
 
     - 蓋の通気スリットの間隔を詰め、桟を1 mmにする (蓋のfinal_wall_thickness)。
     - 床の上面を基板の下で削り、残りを0.8 mmにする (底のfinal_wall_thickness)。
@@ -241,6 +258,9 @@ def pi4_enclosure_defects() -> Model:
 # checkは(rule, target, plan)で表す。testとviewerの撮影が同じ一覧を使う。
 ALTERNATIVES = {
     ("resin_suction", "base", "resin"),
+    ("milling_corner", "base", "milling"),
+    ("mold_undercut", "base", "molding"),
+    ("mold_thick_wall", "base", "molding"),
     ("support_free", "lid", "fdm_upright"),
 }
 PI4_CASES = (
@@ -255,6 +275,8 @@ PI4_CASES = (
         ("connector_fit", "ethernet"),
     }, ALTERNATIVES | {
         ("final_wall_thickness", "base", "resin"),
+        ("final_wall_thickness", "base", "milling"),
+        ("final_wall_thickness", "base", "molding"),
         ("final_wall_thickness", "lid", "fdm_upright"),
     }),
 )

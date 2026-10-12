@@ -251,7 +251,7 @@ power = connector_opening(
 
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
-肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向) に向ける方向である。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
+肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向、切削で工具を下ろす側、射出成形で型を開く軸) に向ける方向である。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
 
 ```python
 from typedsolid import Fdm, ManufacturingPlan, Orientation, Part, Resin
@@ -265,24 +265,52 @@ resin = ManufacturingPlan("resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.
 lid = Part("lid", features, manufacturing=(upside_down, upright, resin), adopted="fdm_upside_down")
 ```
 
-製造案を複数持つ部品では`adopted`が必須である。出力の可否は採用した案で決まり、他の案のcheckは`plan`と`adopted: false`を持つ比較用の結果としてreport、図、viewerに現れる。`Resin`は光造形の案で、`min_drain_mm`で未硬化樹脂の排出路の幅を指定し、`resin_drain`と`resin_suction`が加わる。切削と射出成形はまだ扱わない。各ruleの定義は [設計](design.md#製造案) を参照する。
+切削と射出成形の案も同じ部品に並べられる。値は既定値を持たず、工具や成形条件の資料から与える。
+
+```python
+from typedsolid import ManufacturingPlan, Milling, Molding, Orientation
+
+# 直径3 mm、上面から30 mmまで届く工具を、上面と-y、+xの面から下ろす。
+milling = ManufacturingPlan("milling", Milling(min_wall_mm=1.2, tool_diameter_mm=3.0, tool_length_mm=30.0,
+                                               additional_setups=(Orientation("minus_y"), Orientation("plus_x"))),
+                            "使用する工具の寸法")
+# 型をz軸に沿って開き、肉厚を1.2〜3 mmとする。
+molding = ManufacturingPlan("molding", Molding(min_wall_mm=1.2, max_wall_mm=3.0), "成形業者の設計指針")
+```
+
+製造案を複数持つ部品では`adopted`が必須である。出力の可否は採用した案で決まり、他の案のcheckは`plan`と`adopted: false`を持つ比較用の結果としてreport、図、viewerに現れる。製造法ごとに加わるruleは次のとおりである。各ruleの定義は [設計](design.md#製造案) を参照する。
+
+- `Resin` (光造形): `min_drain_mm`で未硬化樹脂の排出路の幅を指定し、`resin_drain`と`resin_suction`が加わる。
+- `Milling` (3軸の切削): 工具が届かない空間の`milling_reach`と、工具の径で削り残す内角や細い溝の`milling_corner`が加わる。縦の内角は半径`tool_diameter_mm / 2`に格子1つ分を加えた丸みを持たせると削り残さない。治具での固定は扱わない。
+- `Molding` (射出成形): 型を開く軸に抜けない`mold_undercut`と、`max_wall_mm`を超える厚肉の`mold_thick_wall`が加わる。抜き勾配の`mold_draft`は常にnot_evaluatedである。
+- 切削と射出成形の案では、積層しないため`support_free`を「対象外」と明示したpassとして報告する。
 
 旧版 (schema 9以前) のJSONは、`policy`の肉厚と姿勢の値を持つFDMの案`v9_policy`へ昇格して読める。
 
 ## 外部形状の検査
 
-既存の筐体など、IRで記述していないSTL (binary又はASCII) とSTEPにも、最終形状の4 rule (肉厚、断面、閉空洞、支持) を適用できる。`--process resin`では光造形の2 rule (排出路、吸盤) も加わる。単位はmmとみなす。閉じていないmeshは評価せず拒否する。
+既存の筐体など、IRで記述していないSTL (binary又はASCII) とSTEPにも、最終形状の4 rule (肉厚、断面、閉空洞、支持) を適用できる。`--process`で光造形、切削、射出成形を選ぶと、その製造法のruleも加わる。単位はmmとみなす。閉じていないmeshは評価せず拒否する。
 
 ```bash
 .venv/bin/python -m typedsolid.external path/to/case.stl
 .venv/bin/python -m typedsolid.external path/to/case.step --min-wall-mm 1.0 --build-direction plus_y --json
 .venv/bin/python -m typedsolid.external path/to/case.stl --process resin --min-wall-mm 1.2 \
     --overhang-angle-deg 30 --bridge-max-mm 5 --min-drain-mm 3.0
+.venv/bin/python -m typedsolid.external path/to/case.stl --process milling --min-wall-mm 1.2 \
+    --tool-diameter-mm 3 --tool-length-mm 30 --setup minus_y --setup plus_x
+.venv/bin/python -m typedsolid.external path/to/case.stl --process molding --min-wall-mm 1.2 --max-wall-mm 3
 ```
 
-製造案は`--process` (`fdm`か`resin`)、`--min-wall-mm`、`--build-direction` (製造案の`up`)、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`から1件を作る。`fdm`で省いた特性は`Fdm()`の既定値とする。`resin`は既定値を持たず、`--min-wall-mm`、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`をすべて要する。
+製造案は`--process`と`--build-direction` (製造案の`up`) と、製造法の特性のoptionから1件を作る。他の製造法のoptionを与えると拒否する。
 
-すべてpassなら終了コード0、failがあれば1を返す。Pythonからは`typedsolid.external.inspect_file(path, policy, plan=...)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
+| `--process` | 特性のoption |
+| --- | --- |
+| `fdm` | `--min-wall-mm`、`--overhang-angle-deg`、`--bridge-max-mm`。省くと`Fdm()`の既定値 |
+| `resin` | `--min-wall-mm`、`--overhang-angle-deg`、`--bridge-max-mm`、`--min-drain-mm`。すべて必須 |
+| `milling` | `--min-wall-mm`、`--tool-diameter-mm`、`--tool-length-mm`は必須。`--setup`で段取りの向きを加える |
+| `molding` | `--min-wall-mm`、`--max-wall-mm`。すべて必須 |
+
+すべてpassなら終了コード0、failがあれば1、failは無いがnot_evaluated (射出成形の抜き勾配) があれば3を返す。Pythonからは`typedsolid.external.inspect_file(path, policy, plan=...)`で同じ結果を得る。第三者のファイルはリポジトリに置かず、`.work/`など管理外の場所に取得する。比較の手順と結果は [既存ケースとの比較](comparison.md) を参照する。
 
 `--figures DIR`を与えると、概観と検出箇所の断面図と、3D viewer (`viewer.html`) をDIRへ書く。viewerは判定に使ったSTLの三角形をそのまま描く。三角形数とfileの大きさは標準エラーに出る。
 

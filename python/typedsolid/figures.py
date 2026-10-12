@@ -16,8 +16,8 @@ __all__ = ["Figure", "plan", "render", "write_model_figures", "write_stl_figures
 
 # 断面の符号のbit。Rust coreのSECTION_*と同じ値。
 SOLID, THIN, NECK, UNSUPPORTED, VOID = 1, 2, 4, 8, 16
-# ruleごとに強調するbit、色、凡例に書く色名と意味。connector_fitは格子のbitを持たず、
-# 検出箇所の枠だけを描く。
+# ruleごとに強調するbit、色、凡例に書く色名と意味。connector_fitと製造法ごとのrule
+# (UV樹脂、切削、射出成形) は格子のbitを持たず、検出箇所の枠だけを描く。
 HIGHLIGHT = {
     "final_wall_thickness": (THIN, "#d62728", "red: thinner than min_wall_mm"),
     "neck_section": (NECK, "#9467bd", "purple: connection below min_neck_mm"),
@@ -26,6 +26,10 @@ HIGHLIGHT = {
     "connector_fit": (0, "#d62728", ""),
     "resin_drain": (0, "#d62728", ""),
     "resin_suction": (0, "#d62728", ""),
+    "milling_reach": (0, "#d62728", ""),
+    "milling_corner": (0, "#d62728", ""),
+    "mold_undercut": (0, "#d62728", ""),
+    "mold_thick_wall": (0, "#d62728", ""),
 }
 SOLID_COLOUR = "#c9ced6"
 # 1つのcheckについて描く検出箇所の数。locationsは大きい順に並ぶ。

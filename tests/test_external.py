@@ -20,7 +20,7 @@ import cadquery as cq
 
 from tests.test_enclosure_fixtures import FIXTURES, POLICY, baseline, thin_wall
 from typedsolid.cadquery import build
-from typedsolid.external import inspect_file, main
+from typedsolid.external import EXIT_NOT_EVALUATED, inspect_file, main
 
 VOXEL_RULES = frozenset({"final_wall_thickness", "neck_section", "closed_cavity", "support_free"})
 
@@ -146,6 +146,33 @@ class ExternalShapeTests(unittest.TestCase):
             main(resin)
         rules = [check["rule"] for check in json.loads(stdout.getvalue())]
         self.assertEqual(rules[-2:], ["resin_drain", "resin_suction"])
+
+    def test_cli_milling_and_molding(self):
+        """切削と射出成形も特性をすべて要し、他の製造法のoptionを拒否する。"""
+        path = self.export("baseline", ".stl")
+        for argv in (
+            ["--process", "milling", "--min-wall-mm", "1.2", "--tool-diameter-mm", "3"],
+            ["--process", "molding", "--min-wall-mm", "1.2", "--max-wall-mm", "3", "--overhang-angle-deg", "30"],
+            ["--min-wall-mm", "1.2", "--setup", "minus_z"],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main([str(path), *argv])
+        milling = [
+            str(path), "--min-neck-mm", "2.0", "--json", "--process", "milling", "--min-wall-mm", "1.2",
+            "--tool-diameter-mm", "3", "--tool-length-mm", "30", "--setup", "minus_z",
+        ]
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            main(milling)
+        checks = json.loads(stdout.getvalue())
+        self.assertEqual([c["rule"] for c in checks][-2:], ["milling_reach", "milling_corner"])
+        self.assertIn("plus_z, minus_z", checks[-2]["message"])
+        molding = [
+            str(path), "--min-neck-mm", "2.0", "--process", "molding", "--min-wall-mm", "1.2", "--max-wall-mm", "30",
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = main(molding)
+        # 抜き勾配は評価しないため、failが無くても0を返さない。
+        self.assertEqual(code, EXIT_NOT_EVALUATED)
 
 
 if __name__ == "__main__":
