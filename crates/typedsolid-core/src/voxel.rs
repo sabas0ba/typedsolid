@@ -733,41 +733,68 @@ impl Grid {
             }
         }
 
-        // 未支持の区間は、同じ層で両端を支持された材料に挟まれていれば渡せる。
-        let limit = (bridge_max_mm / self.pitch).floor() as usize;
+        // 未支持のcellは、同じ層で両端を支持された材料に挟まれ、両端の間が`bridge_max_mm`以内
+        // なら渡せる。傾けた格子では渡す向きが格子の軸に沿わないため、層内の16方向を調べる。
+        // 未支持のcellから両側へ1 cellずつ進み、未支持の材料が途切れた先が支持された材料で
+        // あるかを見る。端で終わる区間は片持ちであり、bridgeにならない。
+        const BRIDGE_DIRECTIONS: usize = 16;
+        let limit = (bridge_max_mm / self.pitch).floor();
+        let directions: Vec<(f64, f64)> = (0..BRIDGE_DIRECTIONS)
+            .map(|k| {
+                let angle = std::f64::consts::PI * k as f64 / BRIDGE_DIRECTIONS as f64;
+                (angle.cos(), angle.sin())
+            })
+            .collect();
+        let open = |index: usize| self.occupied[index] && !supported[index];
         let mut bridged = vec![false; self.occupied.len()];
-        for layer in 0..layers {
-            for (axis, (length, other)) in [(extent[0], extent[1]), (extent[1], extent[0])]
-                .into_iter()
-                .enumerate()
-            {
-                for fixed in 0..other {
-                    let at = |k: usize| {
-                        if axis == 0 {
-                            frame.cell(self, layer, k, fixed)
-                        } else {
-                            frame.cell(self, layer, fixed, k)
-                        }
-                    };
-                    let mut start: Option<usize> = None;
-                    for k in 0..length {
-                        let index = at(k);
-                        let open = self.occupied[index] && !supported[index];
-                        if open {
-                            start.get_or_insert(k);
-                            continue;
-                        }
-                        if let Some(from) = start.take() {
-                            let anchored_before = from > 0 && supported[at(from - 1)];
-                            let anchored_after = supported[index];
-                            if anchored_before && anchored_after && k - from <= limit {
-                                for j in from..k {
-                                    bridged[at(j)] = true;
-                                }
-                            }
-                        }
+        for layer in first_layer..layers {
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let index = frame.cell(self, layer, a, b);
+                    if !open(index) {
+                        continue;
                     }
-                    // 端で終わる区間は片持ちであり、bridgeにならない。
+                    // 向きに沿って進み、未支持の材料を抜けた先の支持された材料を探す。格子化した
+                    // 板の縁は段になるため、進む線の両脇1 cellも見て、線が縁をかすめて板の外へ
+                    // 出ただけの場合は進み続ける。
+                    let cell_at = |pa: f64, pb: f64| {
+                        (pa >= 0.0 && pb >= 0.0 && pa < extent[0] as f64 && pb < extent[1] as f64)
+                            .then(|| frame.cell(self, layer, pa as usize, pb as usize))
+                    };
+                    let anchor = |da: f64, db: f64| -> Option<f64> {
+                        let mut step = 1.0f64;
+                        while step <= limit + 1.0 {
+                            let (ca, cb) = (a as f64 + da * step, b as f64 + db * step);
+                            let here = cell_at(ca.round(), cb.round())?;
+                            if open(here) {
+                                step += 1.0;
+                                continue;
+                            }
+                            if supported[here] {
+                                return Some(step);
+                            }
+                            let sides = [1.0, -1.0].map(|side| {
+                                cell_at((ca - db * side).round(), (cb + da * side).round())
+                            });
+                            if sides.iter().flatten().any(|side| open(*side)) {
+                                step += 1.0;
+                                continue;
+                            }
+                            return sides
+                                .iter()
+                                .flatten()
+                                .any(|side| supported[*side])
+                                .then_some(step);
+                        }
+                        None
+                    };
+                    bridged[index] = directions.iter().any(|(da, db)| {
+                        match (anchor(*da, *db), anchor(-*da, -*db)) {
+                            // 両端の支持の間にある未支持のcellの長さ。
+                            (Some(ahead), Some(behind)) => ahead + behind - 1.0 <= limit,
+                            _ => false,
+                        }
+                    });
                 }
             }
         }
@@ -2492,6 +2519,38 @@ mod tests {
         ]);
         let checks = evaluate(&model_with(bridged, policy(1.0, 1.0, 0.5))).unwrap();
         assert_eq!(status(&checks, Rule::SupportFree), Status::Pass);
+    }
+
+    /// 2本の柱と、その上に渡した板を、z軸周りに30°回したmesh。柱の間はgap mmである。
+    fn turned_bridge(gap: f64) -> Vec<u8> {
+        let (s, c) = 30f64.to_radians().sin_cos();
+        let right = 4.0 + gap;
+        let triangles: Vec<[[f64; 3]; 3]> = [
+            box_triangles([0., 0., 0.], [4., 4., 6.], false),
+            box_triangles([right, 0., 0.], [right + 4., 4., 6.], false),
+            box_triangles([0., 0., 6.], [right + 4., 4., 8.], false),
+        ]
+        .concat()
+        .into_iter()
+        .map(|triangle| triangle.map(|[x, y, z]| [c * x - s * y, s * x + c * y, z]))
+        .collect();
+        binary_stl(&triangles, b"bridge")
+    }
+
+    #[test]
+    fn bridges_across_the_grid_axes_are_found() {
+        // 板は格子の軸から30°回っている。4 mmの隙間は5 mmのbridgeで渡せ、12 mmは渡せない。
+        // 重なった柱と板はmeshの上で和として扱う。
+        let setup = policy(1.0, 1.0, 0.5);
+        let short = stl(&turned_bridge(4.0), "bridge", &setup).unwrap();
+        let message = &short
+            .iter()
+            .find(|c| c.rule == Rule::SupportFree)
+            .unwrap()
+            .message;
+        assert_eq!(status(&short, Rule::SupportFree), Status::Pass, "{message}");
+        let wide = stl(&turned_bridge(12.0), "bridge", &setup).unwrap();
+        assert_eq!(status(&wide, Rule::SupportFree), Status::Fail);
     }
 
     #[test]
