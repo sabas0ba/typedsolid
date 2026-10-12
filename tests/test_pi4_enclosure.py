@@ -16,13 +16,23 @@ class Pi4EnclosureTests(unittest.TestCase):
                 self.assertEqual(
                     {(c["rule"], c["target"], c["plan"]) for c in failing if not c.get("adopted", True)}, alternatives,
                 )
-                # failしたcheckは、いずれも検出箇所を持つ。
-                self.assertTrue(all(c.get("locations") for c in failing), failing)
+                # failしたcheckは、寸法だけで決まるsnap fitの積層方向を除き、検出箇所を持つ。
+                located = [c for c in failing if not c["target"].endswith("/layer")]
+                self.assertTrue(all(c.get("locations") for c in located), located)
+
+    def test_tilted_lid_passes_the_snap_fit_layer_check(self):
+        """傾けた蓋の製造案は、梁を積層方向から離し、支持なしで積める。"""
+        checks = build(pi4_enclosure()).report["checks"]
+        tilted = [c for c in checks if c.get("plan") == "fdm_tilted"]
+        self.assertEqual({c["rule"] for c in tilted}, {"final_wall_thickness", "support_free", "snap_fit"})
+        self.assertTrue(all(c["status"] == "pass" for c in tilted), tilted)
+        layer = next(c for c in tilted if c["target"] == "clip_0/layer")
+        self.assertIn("50.0°", layer["message"])
 
     def test_normal_case_exercises_every_assembly_rule(self):
         """正常版は部品間の検査をすべて実際に評価する。対象のない合格 (model) で通っていない。"""
         checks = build(pi4_enclosure()).report["checks"]
-        for rule in ("fastener_fit", "fastener_release", "connector_fit", "access_clearance",
+        for rule in ("fastener_fit", "fastener_release", "connector_fit", "access_clearance", "snap_fit",
                      "keepout_clearance", "part_interference", "disassembly_path", "disassembly_separation"):
             with self.subTest(rule=rule):
                 targets = {c["target"] for c in checks if c["rule"] == rule}

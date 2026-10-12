@@ -36,6 +36,8 @@ sha256sum .work/external/parts_holder.stl       # 上表の値と照合する
 
 ## 結果
 
+以下はIR v11まで (肉厚を軸方向の連続長、支持を1層の傾きで判定していた版) で得た結果である。IR v12で肉厚と支持の判定方法を変えた後は再測定していない。
+
 | 対象 | final_wall_thickness | neck_section | closed_cavity | support_free |
 | --- | --- | --- | --- | --- |
 | Tang Nano 9K 部品holder | pass | pass | pass | pass |

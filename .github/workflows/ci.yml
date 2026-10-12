@@ -46,7 +46,8 @@ jobs:
           export CARGO_HOME="$PWD/.work/cargo"
           export PYO3_PYTHON="$PWD/.venv/bin/python"
           export VIRTUAL_ENV="$PWD/.venv"
-          maturin develop --locked
+          # voxelの判定はdebug buildでは数十倍遅く、jobの時間を超えるためreleaseで作る。
+          maturin develop --release --locked
           python scripts/render-figures.py --output .work/figures-ci --defects-only --summary "$GITHUB_STEP_SUMMARY"
           diff -r docs/assets/figures .work/figures-ci
 
@@ -74,7 +75,8 @@ jobs:
           mkdir -p "$TMPDIR"
           cargo clippy --workspace --all-targets --locked -- -D warnings
           cargo test -p typedsolid-core --locked
-          maturin develop --locked
+          # voxelの判定はdebug buildでは数十倍遅く、jobの時間を超えるためreleaseで作る。
+          maturin develop --release --locked
           python -m unittest discover -s tests -v
           python examples/board_tray.py --output .work/board-tray
       # 部品間の欠陥fixtureの投影図を再生成し、docsの図と一致することを確かめる。

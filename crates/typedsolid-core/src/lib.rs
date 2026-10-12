@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -91,6 +91,13 @@ impl Direction {
 
     pub fn is_positive(self) -> bool {
         matches!(self, Self::PlusX | Self::PlusY | Self::PlusZ)
+    }
+
+    /// 単位ベクトル。
+    pub fn vector(self) -> [f64; 3] {
+        let mut vector = [0.0; 3];
+        vector[self.axis().index()] = if self.is_positive() { 1.0 } else { -1.0 };
+        vector
     }
 }
 
@@ -759,6 +766,9 @@ pub enum Process {
 
 /// 1つの切削案が持てる段取りの上限。軸平行の向きは6通りである。
 const MAX_SETUPS: usize = 6;
+/// snap fitの梁の長さ方向と積層方向の間に要求する角度。これより積層方向に近い梁は、
+/// 根元の曲げ応力が層間を引き離す向きに主に掛かる。
+const SNAP_LAYER_MIN_ANGLE_DEG: f64 = 45.0;
 
 impl Process {
     pub fn min_wall_mm(&self) -> f64 {
@@ -853,17 +863,102 @@ impl Process {
     }
 }
 
-/// 製造時の姿勢。組立状態の座標から製造機の座標への回転を、軸平行の24通りで表す。
+/// 製造時の姿勢。組立状態の座標から製造機の座標への回転を表す。
 ///
-/// `up`は製造機の+Z (積層方向、型を開く方向など) に向ける組立座標の方向、`turn_deg`は
-/// そのあと製造機の+Z周りに回す角度 (0、90、180、270) である。FDMとUV樹脂の検査は
-/// `up`だけを使う。
+/// `up`は製造機の+Z (積層方向、工具を下ろす側、型を開く軸) に向ける組立座標の方向、
+/// `turn_deg`はそのあと製造機の+Z周りに回す角度 (0以上360未満)、`tilt_deg`はさらに
+/// 製造機のX軸周りに傾ける角度 (0〜90) である。`tilt_deg`が0なら製造機の+Zは`up`と一致し、
+/// `turn_deg`は検査の結果を変えない。傾けた姿勢では、部品を製造機の座標で格子化し直す。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Orientation {
     pub up: Direction,
     #[serde(default)]
-    pub turn_deg: u32,
+    pub turn_deg: f64,
+    #[serde(default)]
+    pub tilt_deg: f64,
+}
+
+/// 3×3の回転行列。行優先で、`m[i][j]`はi行j列である。
+pub type Matrix3 = [[f64; 3]; 3];
+
+fn multiply(a: &Matrix3, b: &Matrix3) -> Matrix3 {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
+}
+
+/// 行列とベクトルの積。
+pub fn apply(m: &Matrix3, v: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| (0..3).map(|k| m[i][k] * v[k]).sum())
+}
+
+/// 転置。回転行列では逆行列である。
+pub fn transpose(m: &Matrix3) -> Matrix3 {
+    std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
+}
+
+impl Orientation {
+    /// `up`だけの姿勢。
+    pub fn facing(up: Direction) -> Self {
+        Self {
+            up,
+            turn_deg: 0.0,
+            tilt_deg: 0.0,
+        }
+    }
+
+    /// 傾けた姿勢か。傾けた姿勢では製造機の+Zが組立座標の軸と一致しない。
+    pub fn is_tilted(&self) -> bool {
+        self.tilt_deg != 0.0
+    }
+
+    /// 組立座標から製造機の座標への回転。`up`を+Zへ向け、+Z周りに`turn_deg`、X軸周りに
+    /// `tilt_deg`回す。
+    pub fn rotation(&self) -> Matrix3 {
+        // upを+Zへ移す、行列式1の軸の置換。
+        let to_up: Matrix3 = match self.up {
+            Direction::PlusZ => [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            Direction::MinusZ => [[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]],
+            Direction::PlusX => [[0., 0., -1.], [0., 1., 0.], [1., 0., 0.]],
+            Direction::MinusX => [[0., 0., 1.], [0., 1., 0.], [-1., 0., 0.]],
+            Direction::PlusY => [[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]],
+            Direction::MinusY => [[1., 0., 0.], [0., 0., 1.], [0., -1., 0.]],
+        };
+        let (st, ct) = self.turn_deg.to_radians().sin_cos();
+        let turn: Matrix3 = [[ct, -st, 0.], [st, ct, 0.], [0., 0., 1.]];
+        let (sa, ca) = self.tilt_deg.to_radians().sin_cos();
+        let tilt: Matrix3 = [[1., 0., 0.], [0., ca, -sa], [0., sa, ca]];
+        multiply(&tilt, &multiply(&turn, &to_up))
+    }
+
+    /// 製造機の+Zに向く組立座標の単位ベクトル。積層方向、工具を下ろす側、型を開く軸である。
+    pub fn build_vector(&self) -> [f64; 3] {
+        self.rotation()[2]
+    }
+
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        if !self.turn_deg.is_finite() || !(0.0..360.0).contains(&self.turn_deg) {
+            return Err(format!("{owner}: turn_deg must be finite and in [0, 360)"));
+        }
+        if !self.tilt_deg.is_finite() || !(0.0..=90.0).contains(&self.tilt_deg) {
+            return Err(format!("{owner}: tilt_deg must be finite and in [0, 90]"));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Orientation {
+    /// checkのmessageに書く姿勢。傾けない姿勢は`up`だけを書く。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_tilted() {
+            write!(
+                formatter,
+                "{} turned {}° and tilted {}°",
+                self.up, self.turn_deg, self.tilt_deg
+            )
+        } else {
+            write!(formatter, "{}", self.up)
+        }
+    }
 }
 
 /// 1つの製造案。製造法と特性、材料、姿勢の組である。
@@ -893,14 +988,18 @@ impl ManufacturingPlan {
             ));
         }
         for orientation in self.setups() {
-            if ![0, 90, 180, 270].contains(&orientation.turn_deg) {
-                return Err(format!("{owner}: turn_deg must be 0, 90, 180 or 270"));
-            }
+            orientation.validate(&owner)?;
         }
         if let Process::Milling {
             additional_setups, ..
         } = &self.process
         {
+            // 斜めの段取り (3+2軸) は扱わない。段取りごとの格子の削り残しを合成する必要がある。
+            if self.setups().any(Orientation::is_tilted) {
+                return Err(format!(
+                    "{owner}: milling setups cannot be tilted; tilt_deg must be 0"
+                ));
+            }
             if additional_setups.len() >= MAX_SETUPS {
                 return Err(format!(
                     "{owner}: at most {} additional setups",
@@ -1589,6 +1688,34 @@ fn upgrade_v10(value: &mut Value) -> Result<(), String> {
             return Err(format!("schema_version 10 does not define process {kind}"));
         }
     }
+    root.insert("schema_version".into(), json!(11));
+    Ok(())
+}
+
+/// schema v11のJSONをv12へ変換する。v11の姿勢は傾きを持たず、`turn_deg`は直角に限られた
+/// ため、そのまま受理する。v11の入力に`tilt_deg`が現れた場合は拒否する。
+fn upgrade_v11(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    let mut orientations = Vec::new();
+    for plan in root
+        .get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("manufacturing").and_then(Value::as_array))
+        .flatten()
+    {
+        orientations.extend(plan.get("orientation"));
+        orientations.extend(
+            plan.pointer("/process/additional_setups")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        );
+    }
+    if orientations.iter().any(|o| o.get("tilt_deg").is_some()) {
+        return Err("schema_version 11 does not define tilt_deg".into());
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
@@ -1634,6 +1761,7 @@ impl Model {
             upgrade_v8,
             upgrade_v9,
             upgrade_v10,
+            upgrade_v11,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1724,6 +1852,24 @@ impl Model {
                 let size = size.map(|count| count as usize);
                 for plan in &part.manufacturing {
                     voxel::check_milling_work(size, pitch, plan, &part.id)?;
+                }
+            }
+            // 傾けた姿勢では、製造機の座標で格子化し直す。回した外接boxは大きくなる。
+            for plan in part
+                .manufacturing
+                .iter()
+                .filter(|p| p.orientation.is_tilted())
+            {
+                match voxel::rotated_grid_cells(part, pitch, &plan.orientation.rotation()) {
+                    Some(cells) if cells <= voxel::MAX_GRID_CELLS => {}
+                    _ => {
+                        return Err(format!(
+                            "{}: manufacturing plan {} exceeds the voxel grid limit of {} cells when tilted at voxel_mm={pitch}",
+                            part.id,
+                            plan.id,
+                            voxel::MAX_GRID_CELLS
+                        ));
+                    }
                 }
             }
         }
@@ -2181,29 +2327,54 @@ impl Model {
                     geometry.thickness_mm, snap.deflection_mm, geometry.arm_mm
                 ),
             });
-            // 梁の層の向きは、梁を持つ部品の採用した製造案の姿勢で決まる。
-            let plan = part
-                .adopted_plan()
-                .ok_or("validated part lost its adopted plan")?;
-            let build_direction = plan.orientation.up;
-            let build = build_direction.axis();
-            let along = snap.length_direction.axis();
-            checks.push(Check {
-                plan: None,
-                adopted: true,
-                locations: Vec::new(),
-                rule: Rule::SnapFit,
-                status: if along == build {
-                    Status::Fail
-                } else {
-                    Status::Pass
-                },
-                target: format!("{}/layer", snap.id),
-                message: format!(
-                    "beam length along {}; build direction {} (plan {} of {})",
-                    snap.length_direction, build_direction, plan.id, part.id
-                ),
-            });
+            // 梁の層の向きは、梁を持つ部品の製造案の姿勢で決まる。製造案ごとに判定し、
+            // 採用していない案の結果は出力の可否に用いない。
+            for plan in &part.manufacturing {
+                let adopted = plan.id == part.adopted;
+                if plan.process.layering().is_none() {
+                    // 積層しない製造法には層間の強度の差が無い。
+                    checks.push(Check {
+                        plan: Some(plan.id.clone()),
+                        adopted,
+                        locations: Vec::new(),
+                        rule: Rule::SnapFit,
+                        status: Status::Pass,
+                        target: format!("{}/layer", snap.id),
+                        message: format!(
+                            "not applicable to {} (plan {} of {}): the part is not built in layers",
+                            plan.process.name(),
+                            plan.id,
+                            part.id
+                        ),
+                    });
+                    continue;
+                }
+                // 梁が層の面より積層方向に近い (積層方向との角が45°未満) とfailとする。
+                let build = plan.orientation.build_vector();
+                let along = snap.length_direction.vector();
+                let cosine = (0..3)
+                    .map(|i| build[i] * along[i])
+                    .sum::<f64>()
+                    .abs()
+                    .min(1.0);
+                let angle = cosine.acos().to_degrees();
+                checks.push(Check {
+                    plan: Some(plan.id.clone()),
+                    adopted,
+                    locations: Vec::new(),
+                    rule: Rule::SnapFit,
+                    status: if angle < SNAP_LAYER_MIN_ANGLE_DEG - 1e-9 {
+                        Status::Fail
+                    } else {
+                        Status::Pass
+                    },
+                    target: format!("{}/layer", snap.id),
+                    message: format!(
+                        "beam length along {} is {angle:.1}° from the build direction (plan {} of {}, {}); at least {SNAP_LAYER_MIN_ANGLE_DEG}° is required",
+                        snap.length_direction, plan.id, part.id, plan.orientation
+                    ),
+                });
+            }
         }
         Ok(checks)
     }
@@ -2287,7 +2458,7 @@ mod tests {
                 overhang_angle_deg: 45.0,
                 bridge_max_mm: 5.0,
             },
-            orientation: Orientation { up, turn_deg: 0 },
+            orientation: Orientation::facing(up),
             source: "test".into(),
         }
     }
@@ -2358,16 +2529,10 @@ mod tests {
                 min_wall_mm: 1.0,
                 tool_diameter_mm: 3.0,
                 tool_length_mm: 20.0,
-                additional_setups: setups
-                    .iter()
-                    .map(|up| Orientation {
-                        up: *up,
-                        turn_deg: 0,
-                    })
-                    .collect(),
+                additional_setups: setups.iter().map(|up| Orientation::facing(*up)).collect(),
             }
         }
-        let cases: [(&str, Edit); 11] = [
+        let cases: [(&str, Edit); 12] = [
             ("no plan", |m| m.parts[0].manufacturing.clear()),
             ("unknown adopted plan", |m| {
                 m.parts[0].adopted = "resin".into()
@@ -2376,8 +2541,11 @@ mod tests {
                 let plan = m.parts[0].manufacturing[0].clone();
                 m.parts[0].manufacturing.push(plan);
             }),
-            ("turn not a right angle", |m| {
-                m.parts[0].manufacturing[0].orientation.turn_deg = 45
+            ("turn out of range", |m| {
+                m.parts[0].manufacturing[0].orientation.turn_deg = 360.0
+            }),
+            ("tilt out of range", |m| {
+                m.parts[0].manufacturing[0].orientation.tilt_deg = 91.0
             }),
             ("negative wall", |m| {
                 m.parts[0].manufacturing[0].process = Process::Fdm {
@@ -2402,13 +2570,13 @@ mod tests {
                     Direction::MinusZ,
                 ])
             }),
-            ("setup turn not a right angle", |m| {
+            ("tilted milling setup", |m| {
                 let mut process = milling(&[Direction::MinusZ]);
                 if let Process::Milling {
                     additional_setups, ..
                 } = &mut process
                 {
-                    additional_setups[0].turn_deg = 30;
+                    additional_setups[0].tilt_deg = 30.0;
                 }
                 m.parts[0].manufacturing[0].process = process;
             }),
@@ -2441,6 +2609,7 @@ mod tests {
     fn schema_v10_has_no_milling_or_molding() {
         let mut value = serde_json::to_value(two_parts()).unwrap();
         value["schema_version"] = json!(10);
+        without_tilt(&mut value);
         let model = Model::from_json(&value.to_string()).unwrap();
         assert_eq!(model.schema_version, SCHEMA_VERSION);
         value["parts"][0]["manufacturing"][0]["process"] = json!({
@@ -2448,6 +2617,57 @@ mod tests {
         });
         let error = Model::from_json(&value.to_string()).unwrap_err();
         assert!(error.contains("does not define process molding"), "{error}");
+    }
+
+    /// v11以前の姿勢は`tilt_deg`を持たない。
+    fn without_tilt(value: &mut Value) {
+        for part in value["parts"].as_array_mut().unwrap() {
+            for plan in part["manufacturing"].as_array_mut().unwrap() {
+                plan["orientation"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("tilt_deg");
+            }
+        }
+    }
+
+    #[test]
+    fn schema_v11_has_no_tilt() {
+        let mut value = serde_json::to_value(two_parts()).unwrap();
+        value["schema_version"] = json!(11);
+        without_tilt(&mut value);
+        let model = Model::from_json(&value.to_string()).unwrap();
+        assert_eq!(model.schema_version, SCHEMA_VERSION);
+        value["parts"][0]["manufacturing"][0]["orientation"]["tilt_deg"] = json!(30.0);
+        let error = Model::from_json(&value.to_string()).unwrap_err();
+        assert!(error.contains("does not define tilt_deg"), "{error}");
+    }
+
+    #[test]
+    fn orientation_rotates_up_to_the_machine_z() {
+        for up in Direction::ALL {
+            let orientation = Orientation::facing(up);
+            let build = orientation.build_vector();
+            assert_eq!(build, up.vector(), "{up}");
+            // 行列式は1である (鏡映を含まない)。
+            let m = orientation.rotation();
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            assert!((det - 1.0).abs() < 1e-12, "{up}: {det}");
+        }
+        // +Zから、+Z周りに90°回してからX軸周りに30°傾ける。積層方向は組立座標の
+        // (sin30°, 0, cos30°) となる。
+        let tilted = Orientation {
+            up: Direction::PlusZ,
+            turn_deg: 90.0,
+            tilt_deg: 30.0,
+        };
+        let build = tilted.build_vector();
+        let expected = [0.5, 0.0, 3f64.sqrt() / 2.0];
+        for axis in 0..3 {
+            assert!((build[axis] - expected[axis]).abs() < 1e-12, "{build:?}");
+        }
     }
 
     #[test]
@@ -2493,6 +2713,11 @@ mod tests {
         // 他の部品の製造案は関係しない。
         m.parts[0].manufacturing[0].orientation.up = Direction::PlusY;
         m.parts[1].manufacturing[0].orientation.up = Direction::MinusZ;
+        assert_eq!(layer(&m), Status::Fail);
+        // 傾けた姿勢では、積層方向との角が45°以上なら通る。
+        m.parts[1].manufacturing[0].orientation.tilt_deg = 50.0;
+        assert_eq!(layer(&m), Status::Pass);
+        m.parts[1].manufacturing[0].orientation.tilt_deg = 30.0;
         assert_eq!(layer(&m), Status::Fail);
     }
 

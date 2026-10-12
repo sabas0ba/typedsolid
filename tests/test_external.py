@@ -147,6 +147,14 @@ class ExternalShapeTests(unittest.TestCase):
         rules = [check["rule"] for check in json.loads(stdout.getvalue())]
         self.assertEqual(rules[-2:], ["resin_drain", "resin_suction"])
 
+    def test_cli_tilted_orientation(self):
+        """傾けた姿勢では製造機の座標で格子化し直し、messageに姿勢を書く。"""
+        path = self.export("baseline", ".stl")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            main([str(path), "--min-neck-mm", "2.0", "--json", "--turn-deg", "90", "--tilt-deg", "30"])
+        support = next(c for c in json.loads(stdout.getvalue()) if c["rule"] == "support_free")
+        self.assertIn("plus_z turned 90° and tilted 30°", support["message"])
+
     def test_cli_milling_and_molding(self):
         """切削と射出成形も特性をすべて要し、他の製造法のoptionを拒否する。"""
         path = self.export("baseline", ".stl")

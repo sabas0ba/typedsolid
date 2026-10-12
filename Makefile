@@ -14,9 +14,10 @@ rust-check:
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 	cargo test -p typedsolid-core --locked
 
+# voxelの判定は格子全体を何度も走査するため、debug buildでは検査が数十倍遅くなる。
 python-build:
 	mkdir -p .work/tmp
-	maturin develop --locked --uv
+	maturin develop --release --locked --uv
 
 python-test: python-build
 	python -m unittest discover -s tests -v

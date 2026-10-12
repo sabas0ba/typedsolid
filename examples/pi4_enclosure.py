@@ -2,29 +2,33 @@
 
 基板の外形、取付穴、コネクタの辺上の位置は部品catalogの値 (公式の機械図) を使う。
 catalogが持たない値、すなわち基板の高さ、PCBの厚み、コネクタの高さ、プラグの断面、
-ネジの寸法、印刷機がbridgeで渡せる長さ、光造形・切削・射出成形の特性は、この作例が決めた説明用の値であり、
-製品の仕様ではない。
+ネジの寸法、印刷機の特性、材料の許容ひずみ、光造形・切削・射出成形の特性は、この作例が
+決めた説明用の値であり、製品の仕様ではない。
 
-蓋は四隅の柱へネジで締め、下面のlipを底の壁の内側へ差し込む。基板は底の4本のbossへ
-ネジで締め、蓋を外してから外す。
+蓋は四隅の柱へネジで締め、下面のlipを底の壁の内側へ差し込む。さらに背面の2本のsnap fitが
+蓋から垂れ、フックが底の背面の窓に掛かる。基板は底の4本のbossへネジで締め、蓋を外してから
+外す。
 
-製造案は部品ごとに持つ。蓋は裏返してFDMで造形する案を採用し、上面を造形板に置く案を
-比較のために持つ。後者はlipの上の天板が支えを持たず、support_freeに落ちる。底はFDMの案を
+製造案は部品ごとに持つ。蓋は裏返して前面の上の辺を造形板に寄せ、50°傾けてFDMで造形する案を
+採用する。snap fitの梁は積層方向から50°離れ、snap_fitの積層方向の検査を通る。比較のため、
+裏返しただけの案と、上面を造形板に置く案を持つ。前者は梁が積層方向に沿いsnap_fitの
+積層方向の検査に落ち、後者はさらにlipの上の天板が支えを持たずsupport_freeに落ちる。底はFDMの案を
 採用し、光造形、切削、射出成形の案を比較のために持つ。光造形の案は開いた箱を上向きに
 造形するため、resin_suctionに落ちる。切削の案は上面と開口のある2面から工具を下ろし、
 どこへも届くが、ネジ柱と壁の間の内角と細い下穴を工具の径で削れずmilling_cornerに落ちる。射出成形の
 案は壁の開口が型の開く向きに抜けずmold_undercutに、壁の角と一体になった四隅のネジ柱が
 厚くmold_thick_wallに落ち、抜き勾配は評価しない。採用しない案のcheckは出力の可否に用いない。
 
-snap fitは持たない。蓋から垂らす梁は、軸平行の造形姿勢ではsnap_fitの積層方向の検査と
-support_freeを同時に満たさないため、任意の回転を扱えるようになるまで保留する。
+傾けた姿勢では、蓋の縦の面が積層方向に対して50°張り出す。作例の印刷機は55°までの
+張り出しを支持なしで積めるものとする。
 """
 
 from dataclasses import replace
 
 from typedsolid import (
-    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Milling, Model, Molding, Move, Orientation, Part,
-    PlugSource, Policy, Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole, screw_fixing,
+    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Material, Milling, Model, Molding, Move, Orientation,
+    Part, PlugSource, Policy, Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole,
+    screw_fixing, snap_fit,
 )
 
 PI4 = board("raspberry_pi_4_model_b")
@@ -51,25 +55,36 @@ POST_CENTERS = {
     "back_left": (4.25, WIDTH_MM - 4.25), "back_right": (LENGTH_MM - 4.25, WIDTH_MM - 4.25),
 }
 POLICY = Policy(voxel_mm=0.5)
-# 例とする印刷機は15 mmまでのbridgeを渡せるものとする。コネクタ開口の上縁はbridgeになる。
-PRINTER = Fdm(bridge_max_mm=15.0)
-PRINTER_SOURCE = "example printer assumed to bridge 15 mm"
+# 例とする印刷機は15 mmまでのbridgeを渡せ、鉛直から55°までの張り出しを支持なしで積めるものと
+# する。コネクタ開口の上縁はbridgeになる。
+PRINTER = Fdm(overhang_angle_deg=55.0, bridge_max_mm=15.0)
+PRINTER_SOURCE = "example printer assumed to bridge 15 mm and print 55 degree overhangs"
 PLAN = ManufacturingPlan("fdm", PRINTER, PRINTER_SOURCE)
-# 蓋は上面を造形板に置き、lipを上へ積む。
+# 蓋は裏返し、前面の上の辺を造形板に寄せて50°傾ける。積層方向は組立座標で後方の下へ向く。
+# 前方へ傾けるとフックの外側の上の稜線が最初に積む位置となり、宙に浮く。
+LID_TILTED = ManufacturingPlan(
+    "fdm_tilted", PRINTER, PRINTER_SOURCE, orientation=Orientation("minus_z", turn_deg=180.0, tilt_deg=50.0),
+)
+# 比較用。裏返しただけの案と、上面を造形板に置く案。
 LID_UPSIDE_DOWN = ManufacturingPlan("fdm_upside_down", PRINTER, PRINTER_SOURCE, orientation=Orientation("minus_z"))
 LID_UPRIGHT = ManufacturingPlan("fdm_upright", PRINTER, PRINTER_SOURCE)
+# snap fitの梁を持つ蓋の材料。許容ひずみは説明用の値であり、特定の樹脂の値ではない。
+LID_MATERIAL = Material(
+    "pla_example", "example PLA", "example value for the typedsolid example, not a material specification",
+    allowable_strain=0.02,
+)
 # 比較用の光造形。値は作例が決めた説明用の値であり、特定の機種と樹脂の値ではない。
 RESIN = ManufacturingPlan(
     "resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.0, bridge_max_mm=15.0, min_drain_mm=3.0),
     "example values for the typedsolid example, not a printer specification",
 )
 # 比較用の切削と射出成形。値は作例が決めた説明用の値であり、特定の工具や成形条件の値ではない。
-# 切削は上面と、コネクタ開口のある2面から工具を下ろす。
+# 切削は上面と、コネクタ開口とsnap fitの窓のある3面から工具を下ろす。
 MILLING = ManufacturingPlan(
     "milling",
     Milling(
         min_wall_mm=1.2, tool_diameter_mm=3.0, tool_length_mm=30.0,
-        additional_setups=(Orientation("minus_y"), Orientation("plus_x")),
+        additional_setups=(Orientation("minus_y"), Orientation("plus_x"), Orientation("plus_y")),
     ),
     "example values for the typedsolid example, not a tool specification",
 )
@@ -101,6 +116,17 @@ LIP_MM = 2.0
 LIP_HEIGHT_MM = 3.0
 # 柱の外周 (中心4.25 mm、半径3 mm) から0.75 mm離す。
 LIP_END_MM = 8.0
+# 背面のsnap fit。梁は背面のlipの位置で蓋の下面から垂れ、先端のフックが底の背面の窓に掛かる。
+# 梁の厚みは最小肉厚に格子1つ分を加えた値以上とする。外すときは梁を内側 (-y) へたわませる。
+SNAP_CENTERS_X = (30.0, LENGTH_MM - 30.0)
+SNAP_WIDTH_MM = 8.0
+SNAP_THICKNESS_MM = 2.0
+SNAP_LENGTH_MM = 18.0
+SNAP_HOOK_MM = 1.5
+SNAP_HOOK_LENGTH_MM = 2.0
+# 梁とlip、フックと窓の隙間。
+SNAP_GAP_MM = 1.0
+WINDOW_CLEARANCE_MM = 0.5
 
 
 def shell() -> tuple[Feature, ...]:
@@ -156,13 +182,53 @@ def board_screws():
     ]
 
 
+def snap_fits():
+    """背面の2本のsnap fit。梁は背面のlipと同じ面に並び、lipはその位置で途切れる。"""
+    beam_y = WIDTH_MM - WALL_MM - LIP_GAP_MM - SNAP_THICKNESS_MM / 2.0
+    return [
+        snap_fit(
+            f"clip_{index}", part="lid", mate="base", step=OPEN_LID.id, root=(x, beam_y, HEIGHT_MM),
+            length_direction="minus_z", deflection="minus_y", length_mm=SNAP_LENGTH_MM,
+            thickness_mm=SNAP_THICKNESS_MM, width_mm=SNAP_WIDTH_MM, hook_mm=SNAP_HOOK_MM,
+            hook_length_mm=SNAP_HOOK_LENGTH_MM,
+        )
+        for index, x in enumerate(SNAP_CENTERS_X)
+    ]
+
+
+def snap_windows() -> tuple[Feature, ...]:
+    """底の背面の、フックが掛かる窓。フックの周りに隙間を取る。"""
+    tip = HEIGHT_MM - SNAP_LENGTH_MM
+    return tuple(
+        Feature(
+            f"clip_{index}_window",
+            Box(
+                (x - SNAP_WIDTH_MM / 2.0 - WINDOW_CLEARANCE_MM, WIDTH_MM - WALL_MM - 1.0, tip - WINDOW_CLEARANCE_MM),
+                (x + SNAP_WIDTH_MM / 2.0 + WINDOW_CLEARANCE_MM, WIDTH_MM + 1.0,
+                 tip + SNAP_HOOK_LENGTH_MM + WINDOW_CLEARANCE_MM),
+            ),
+            operation="cut",
+        )
+        for index, x in enumerate(SNAP_CENTERS_X)
+    )
+
+
 def lid_lip() -> tuple[Feature, ...]:
-    """蓋の下面から垂らす4本のlip。底の壁の内側に沿い、蓋の水平方向の位置を決める。"""
+    """蓋の下面から垂らすlip。底の壁の内側に沿い、蓋の水平方向の位置を決める。背面のlipは
+    snap fitの梁の位置で区切る。"""
     inner = WALL_MM + LIP_GAP_MM
     z = (HEIGHT_MM - LIP_HEIGHT_MM, HEIGHT_MM)
-    return (
+    back = (WIDTH_MM - inner - LIP_MM, WIDTH_MM - inner)
+    edges = [LIP_END_MM]
+    for x in SNAP_CENTERS_X:
+        edges += [x - SNAP_WIDTH_MM / 2.0 - SNAP_GAP_MM, x + SNAP_WIDTH_MM / 2.0 + SNAP_GAP_MM]
+    edges.append(LENGTH_MM - LIP_END_MM)
+    back_segments = tuple(
+        Feature(f"lip_back_{index}", Box((edges[2 * index], back[0], z[0]), (edges[2 * index + 1], back[1], z[1])), "wall")
+        for index in range(len(edges) // 2)
+    )
+    return back_segments + (
         Feature("lip_front", Box((LIP_END_MM, inner, z[0]), (LENGTH_MM - LIP_END_MM, inner + LIP_MM, z[1])), "wall"),
-        Feature("lip_back", Box((LIP_END_MM, WIDTH_MM - inner - LIP_MM, z[0]), (LENGTH_MM - LIP_END_MM, WIDTH_MM - inner, z[1])), "wall"),
         Feature("lip_left", Box((inner, LIP_END_MM, z[0]), (inner + LIP_MM, WIDTH_MM - LIP_END_MM, z[1])), "wall"),
         Feature("lip_right", Box((LENGTH_MM - inner - LIP_MM, LIP_END_MM, z[0]), (LENGTH_MM - inner, WIDTH_MM - LIP_END_MM, z[1])), "wall"),
     )
@@ -189,6 +255,7 @@ def model(
     connector_parts = openings()
     lid_fixings = lid_screws(post_diameters or {})
     board_fixings = board_screws()
+    clips = snap_fits()
     opening_features = []
     for opening in connector_parts:
         feature = opening.feature
@@ -199,11 +266,13 @@ def model(
         opening_features.append(feature)
     base = Part("base", shell() + tuple(opening_features) + tuple(
         feature for fixing in lid_fixings + board_fixings for feature in fixing.base_features
-    ) + base_extra, manufacturing=(PLAN, RESIN, MILLING, MOLDING), adopted=PLAN.id)
+    ) + snap_windows() + base_extra, manufacturing=(PLAN, RESIN, MILLING, MOLDING), adopted=PLAN.id)
     lid = Part("lid", (
         Feature("panel", Box((0, 0, HEIGHT_MM), (LENGTH_MM, WIDTH_MM, HEIGHT_MM + LID_MM)), "base"),
-    ) + lid_lip() + tuple(feature for fixing in lid_fixings for feature in fixing.clamp_features) + lid_vents(*vents),
-        manufacturing=(LID_UPSIDE_DOWN, LID_UPRIGHT), adopted=LID_UPSIDE_DOWN.id)
+    ) + lid_lip() + tuple(feature for clip in clips for feature in clip.features) + tuple(
+        feature for fixing in lid_fixings for feature in fixing.clamp_features
+    ) + lid_vents(*vents), material=LID_MATERIAL.id,
+        manufacturing=(LID_TILTED, LID_UPSIDE_DOWN, LID_UPRIGHT), adopted=LID_TILTED.id)
     # 基板は底のbossの上面に接するため、下面のclearanceだけを0とする。
     keepout = PI4.keepout(
         "pi4", ORIGIN, BOARD_HEIGHT_MM, Clearance(default=0.5, minus_z=0.0), attached_to="base",
@@ -219,6 +288,8 @@ def model(
             fixing.sweep for fixing in lid_fixings + board_fixings
         ),
         fasteners=tuple(fixing.fastener for fixing in lid_fixings + board_fixings),
+        materials=(LID_MATERIAL,),
+        snap_fits=tuple(clip.snap for clip in clips),
         connectors=tuple(o.connector for o in connector_parts),
     )
 
@@ -261,6 +332,12 @@ ALTERNATIVES = {
     ("milling_corner", "base", "milling"),
     ("mold_undercut", "base", "molding"),
     ("mold_thick_wall", "base", "molding"),
+    # 裏返しただけでは、梁が積層方向に沿い、フックの下面が宙に浮く。
+    ("snap_fit", "clip_0/layer", "fdm_upside_down"),
+    ("snap_fit", "clip_1/layer", "fdm_upside_down"),
+    ("support_free", "lid", "fdm_upside_down"),
+    ("snap_fit", "clip_0/layer", "fdm_upright"),
+    ("snap_fit", "clip_1/layer", "fdm_upright"),
     ("support_free", "lid", "fdm_upright"),
 }
 PI4_CASES = (
@@ -277,6 +354,7 @@ PI4_CASES = (
         ("final_wall_thickness", "base", "resin"),
         ("final_wall_thickness", "base", "milling"),
         ("final_wall_thickness", "base", "molding"),
+        ("final_wall_thickness", "lid", "fdm_upside_down"),
         ("final_wall_thickness", "lid", "fdm_upright"),
     }),
 )

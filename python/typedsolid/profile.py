@@ -38,13 +38,15 @@ class Profile:
         base = Policy(min_feature_mm=self.min_feature_mm, min_neck_mm=self.min_neck_mm)
         return replace(base, **overrides)
 
-    def plan(self, id: str = "fdm", up: Direction | None = None, turn_deg: int = 0) -> ManufacturingPlan:
+    def plan(
+        self, id: str = "fdm", up: Direction | None = None, turn_deg: float = 0.0, tilt_deg: float = 0.0,
+    ) -> ManufacturingPlan:
         """profileの印刷機と材料によるFDMの製造案。upを省くとprofileの積層方向とする。"""
         return ManufacturingPlan(
             id,
             Fdm(self.min_wall_mm, self.overhang_angle_deg, self.bridge_max_mm),
             f"profile: printer {self.printer.name}, material {self.material.name}",
-            Orientation(up or self.build_direction, turn_deg),
+            Orientation(up or self.build_direction, turn_deg, tilt_deg),
             self.material.id,
         )
 
