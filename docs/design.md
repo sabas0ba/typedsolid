@@ -35,7 +35,7 @@
 
 JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価しない。今後の性能測定で問題になるまで、独自の複雑なFFIオブジェクト共有を導入しない。
 
-部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreの検証を通る。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
+部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreで検証される。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
 ## IR v12
 
@@ -57,7 +57,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `Policy`は`min_feature_mm`、`mesh_volume_tolerance`、`required`のほか、最終形状の検査に`voxel_mm`と`min_neck_mm`を持つ。いずれも製造法に依らない値である。肉厚、積層方向、overhang、bridgeは製造法に依るため、製造案が持つ。primitiveの寸法と最終形状の肉厚は別の概念であり、要求値も分けて指定する。
 - `assembly`は分解手順を持つ。IRに記述した部品位置を組立完了の状態とし、`steps`を順に実行して分解する。各stepは`parts`を一体として、軸平行の直線区間を連ねた`path`に沿って動かし、以降の状態から除く。組立順序は分解の逆とする。どのstepにも現れない部品は最後まで残る。
 - 区間の`distance_mm`は正の数値か`"exit"`とする。`"exit"`は残っている部品のAABBの外へ2 mmの余裕をもって出る距離を表し、最後の区間に限る。
-- `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0は硬い干渉だけを見る。
+- `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0では、形状同士が共通体積を持つ干渉だけを検出する。
 - `Fastener`はネジ1本の固定を表し、`clamp`の部品を`base`の部品へ締める。`direction`は締め込む向き (頭から先端へ)、`center`は軸に垂直な面上の座標、`seat_mm`は頭の座面、`joint_mm`はclampとbaseの境目の軸方向の座標である。`screw`は長さ (座面から先端)、ねじ部の外径、頭の外径を、`through_mm`はclampの貫通穴の径を持つ。`anchor`は`self_tapping` (`pilot_mm`: 下穴径) か`insert` (`hole_mm`: 圧入前の下穴径、`length_mm`: インサート長。境目と面一に埋める) である。要求値として`min_engagement_mm`と`min_boss_wall_mm`を持つ。
 - ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
 - `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`、製造案、はめ合い隙間を作る入力に留める。
@@ -76,7 +76,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - v4→v5: v4はネジ固定を持たないため、空の`fasteners`を補う。v4の入力に`fasteners`が現れた場合は拒否する。
 - v5→v6: v5は材料とsnap fitを持たないため、空の`materials`と`snap_fits`を補う。部品の`material`は省略可能であり、v5の部品はそのまま読める。v5の入力にこれらが現れた場合は拒否する。
 - v6→v7: v6のkeepoutは取付先を持たないため、外部に固定されたものとしてそのまま受理する。v7からkeepoutは分解の障害物となるため、同じモデルでも`disassembly_path`の判定が厳しくなる場合がある。v6の入力に`attached_to`が現れた場合は拒否する。
-- v7→v8: v7のネジは外す状態と締めるkeepoutを持たないため、外さないネジとしてそのまま受理する。v8で必須になる`fastener_release`は、ネジで留めた部品を引き離す分解stepがあると落ちる。v7の入力に`release`か`clamp_keepouts`が現れた場合は拒否する。
+- v7→v8: v7のネジは外す状態と締めるkeepoutを持たないため、外さないネジとしてそのまま受理する。v8で必須になる`fastener_release`は、ネジで留めた部品を引き離す分解stepがあると不合格となる。v7の入力に`release`か`clamp_keepouts`が現れた場合は拒否する。
 - v8→v9: v8はコネクタ開口を持たないため、空の`connectors`を補う。v8の入力に`connectors`が現れた場合は拒否する。
 - v9→v10: `policy`の`min_wall_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を取り除き、その値 (省略されていればv9の既定値1.2、`plus_z`、45、5.0) を持つFDMの製造案`v9_policy`を各部品へ加えて採用する。v9は部品ごとの姿勢を持たないため、全部品が同じ案となる。v9の入力に`manufacturing`か`adopted`が現れた場合は拒否する。
 - v10→v11: v10は切削と射出成形の製造案を持たないため、そのまま受理する。v10の入力に`kind`が`milling`か`molding`の製造案が現れた場合は拒否する。
@@ -171,7 +171,7 @@ OCCTで判定するruleの検出箇所は、判定に使ったBooleanの結果 (
 | 柱が基板の確保領域に入る (`post_in_keepout`) | ![post in keepout](assets/projections/post_in_keepout/keepout_clearance--pcb_tray.svg) |
 | 引き抜く板を壁が塞ぐ (`sliding_lid`) | ![sliding lid](assets/projections/sliding_lid/disassembly_path--slide_out_inner_lid_0_tray.svg) |
 
-fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`が落ちるruleと検出箇所の座標を照合する。図は`scripts/render-projections.py --output docs/assets/projections`で再生成する。CIのintegration jobが再生成してdocsの図と比べる。
+fixtureは`examples/assembly_defects.py`が持ち、`tests/test_projection.py`が不合格となるruleと検出箇所の座標を照合する。図は`scripts/render-projections.py --output docs/assets/projections`で再生成する。CIのintegration jobが再生成してdocsの図と比べる。
 
 **出力の拒否と図**: `export`は検査で出力を拒否した場合も出力先を作らない。代わりに、reportと図だけを隣の`<出力先>.rejected/`に書き、例外にその場所を注記する。STL/STEPは書かない。`<出力先>.rejected/`が既にある場合は置き換えず、その旨を注記する。`export(..., figures=False)`で図を省ける。
 
@@ -200,17 +200,17 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 
 **Raspberry Pi 4の筐体**: `examples/pi4_enclosure.py`は、部品catalogのRaspberry Pi 4 Model Bの外形、取付穴、コネクタ位置から作る底と蓋の2部品の筐体である。蓋を四隅の柱へ4本のネジで、基板を底の4本のbossへネジで締め、底の壁に6個のコネクタ開口と、プラグを抜く掃引を持つ。蓋には通気スリットを開け、下面に底の壁の内側へ差し込むlipを持つ。さらに背面の2本のsnap fitが蓋から垂れ、先端のフックが底の背面の窓に掛かる。基板の高さ、PCBの厚み、コネクタの高さとプラグの断面、ネジの寸法、印刷機の特性 (bridge 15 mm、張り出し55°)、材料の許容ひずみ、光造形・切削・射出成形の特性は作例が決めた説明用の値である。
 
-製造案は部品ごとに持つ。蓋は裏返し、前面の上の辺を造形板に寄せて50°傾けたFDMの案 (`fdm_tilted`、`up = minus_z`、`turn_deg = 180`、`tilt_deg = 50`) を採用する。snap fitの梁は積層方向から50°離れ`layer`を通り、蓋の縦の面は鉛直から50°張り出して印刷機の55°に収まる。前方へ傾けると、フックの外側の上の稜線が最初に積む位置となり宙に浮くため、後方へ傾ける。比較のため、裏返しただけの案 (`fdm_upside_down`) と上向きの案 (`fdm_upright`) を持つ。前者は梁が積層方向に沿って`layer`に落ち、フックの下面も支えを持たず`support_free`に落ちる。後者はさらにlipの上の天板が支えを持たない。底はFDMの案 (`fdm`) を採用し、比較のため光造形 (`resin`)、切削 (`milling`)、射出成形 (`molding`) の案を持つ。
+製造案は部品ごとに持つ。蓋は裏返し、前面の上の辺を造形板に寄せて50°傾けたFDMの案 (`fdm_tilted`、`up = minus_z`、`turn_deg = 180`、`tilt_deg = 50`) を採用する。snap fitの梁は積層方向から50°離れ`layer`に合格し、蓋の縦の面は鉛直から50°張り出して印刷機の55°に収まる。前方へ傾けると、フックの外側の上の稜線が最初に積む位置となり宙に浮くため、後方へ傾ける。比較のため、裏返しただけの案 (`fdm_upside_down`) と上向きの案 (`fdm_upright`) を持つ。前者は梁が積層方向に沿って`layer`で不合格となり、フックの下面も支えを持たず`support_free`で不合格となる。後者はさらにlipの上の天板が支えを持たない。底はFDMの案 (`fdm`) を採用し、比較のため光造形 (`resin`)、切削 (`milling`)、射出成形 (`molding`) の案を持つ。
 
-- 光造形: 開いた箱を上向きに造形すると、内側が造形中に槽の底との間で閉じるため、`resin_suction`に落ちる。
-- 切削: 上面と、コネクタ開口とsnap fitの窓のある`minus_y`、`plus_x`、`plus_y`の3面から直径3 mmの工具を下ろす。どこへも届き`milling_reach`は通るが、ネジ柱と壁の間の内角とφ2.1 mmの下穴を工具の径で削れず`milling_corner`に落ちる。
-- 射出成形: 型を`z`軸に沿って開く。壁の6つの開口とsnap fitの2つの窓が`mold_undercut`に、壁の角と一体になった四隅のネジ柱が`mold_thick_wall` (最大肉厚3 mm) に落ちる。抜き勾配はnot_evaluatedである。
+- 光造形: 開いた箱を上向きに造形すると、内側が造形中に槽の底との間で閉じるため、`resin_suction`で不合格となる。
+- 切削: 上面と、コネクタ開口とsnap fitの窓のある`minus_y`、`plus_x`、`plus_y`の3面から直径3 mmの工具を下ろす。どこへも届き`milling_reach`には合格するが、ネジ柱と壁の間の内角とφ2.1 mmの下穴を工具の径で削れず`milling_corner`で不合格となる。
+- 射出成形: 型を`z`軸に沿って開く。壁の6つの開口とsnap fitの2つの窓が`mold_undercut`で、壁の角と一体になった四隅のネジ柱が`mold_thick_wall` (最大肉厚3 mm) で不合格となる。抜き勾配はnot_evaluatedである。
 
-正常版 (`pi4_enclosure`) は採用した案ですべてのruleを通り、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、採用した案では2部品にまたがって6 ruleの7 checkが落ちる。`tests/test_pi4_enclosure.py`が採用した案と採用していない案のそれぞれで落ちる集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+正常版 (`pi4_enclosure`) は採用した案ですべてのruleに合格し、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、採用した案では2部品にまたがって6 ruleの7 checkが不合格となる。`tests/test_pi4_enclosure.py`が採用した案と採用していない案のそれぞれで不合格となる検査項目の集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
 
 ## 着脱の検査
 
-分解stepごとに、動かす部品の最終形状を区間ごとに掃引し、残っている部品との共通体積を求める。判定はOCCTのBooleanで行う。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。
+分解stepごとに、動かす部品の最終形状を区間ごとに掃引し、残っている部品との共通体積を求める。判定はOCCTのBooleanで行う。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと要件を満たす設計も不合格となるためである。
 
 | rule | 内容 |
 | --- | --- |
@@ -221,7 +221,7 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 
 `disassembly_separation`はAABBの分離では判定しない。L字の土台の切り欠きから横へ抜く場合のように、外れた部品がAABBの内側に残る形があるためである。
 
-**はめ合い隙間**は距離ではなく体積で判定する。最短距離では、蓋が壁の上に載る接触も距離0となり、正しい設計まで落ちる。動かす部品を移動方向に垂直な2軸にだけ`fit_clearance_mm`広げてから掃引し、共通体積を見る。移動方向の手前にある載置面の接触は体積0のまま残り、横ですれ違う面の隙間不足だけが検出される。広げる形は辺長2·clearanceの正方形とのMinkowski和で、円とのMinkowski和より保守的である。
+**はめ合い隙間**は距離ではなく体積で判定する。最短距離では、蓋が壁の上に載る接触も距離0となり、要件を満たす設計も不合格となる。動かす部品を移動方向に垂直な2軸にだけ`fit_clearance_mm`広げてから掃引し、共通体積を見る。移動方向の手前にある載置面の接触は体積0のまま残り、横ですれ違う面の隙間不足だけが検出される。広げる形は辺長2·clearanceの正方形とのMinkowski和で、円とのMinkowski和より保守的である。
 
 隙間の要求は移動方向に平行な面すべてに掛かる。スライドする蓋が載っている面を滑る場合、その面も隙間を要求される。載置面を滑る区間を持つstepでは、そのstepの`fit_clearance_mm`を0とする。
 
@@ -313,7 +313,7 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 
 backend例外、無効形状、空形状をfailとして保持する。依存を固定し、版更新時は孤立・切断・空形状・干渉・アクセス・STEP再読込の回帰テストを行う。STLのバイト一致ではなく、寸法・体積・接続性と検査結果を比較する。
 
-カーネルのhard crashやhangはPython例外処理では隔離できない。`export`はbackendを子processで実行し、親がtimeoutで打ち切る。子は`python -m typedsolid._worker_entry`として新しいinterpreterで起動し、targetをmodule名と関数名で受け取る。OCCTが内部に持つthreadの状態を複製するforkは使わない。multiprocessingのspawnも使わない。spawnは子の起動時に呼び出し元の`__main__`を読み込み直すため、`if __name__ == "__main__"`の無いscriptでは子が同じscriptを再実行し、標準入力から実行した場合は読み込み自体に失敗する。親子の通信は専用のpipeで行い、標準出力は使わない。POSIXに限る。子の例外は同じ型で親へ戻し、結果を返さずに終了した子は`WorkerCrashed`とする。出力先のstagingは親が作成・破棄するため、打ち切られても残骸を残さない。`build`は形状を呼び出し側へ返すため同一processで動き、打ち切りの対象外である。
+カーネルのhard crashやhangはPython例外処理では隔離できない。`export`はbackendを子processで実行し、親がtimeoutで打ち切る。子は`python -m typedsolid._worker_entry`として新しいinterpreterで起動し、targetをmodule名と関数名で受け取る。OCCTが内部に持つthreadの状態を複製するforkは使わない。multiprocessingのspawnも使わない。spawnは子の起動時に呼び出し元の`__main__`を読み込み直すため、`if __name__ == "__main__"`の無いscriptでは子が同じscriptを再実行し、標準入力から実行した場合は読み込み自体に失敗する。親子の通信は専用のpipeで行い、標準出力は使わない。POSIXに限る。子の例外は同じ型で親へ戻し、結果を返さずに終了した子は`WorkerCrashed`とする。出力先のstagingは親が作成・破棄するため、打ち切られても一時出力が残らない。`build`は形状を呼び出し側へ返すため同一processで動き、打ち切りの対象外である。
 
 部品単位の生成結果 (binary BREPとvoxel評価) は、指定した場合に限りcacheへ保存する。keyは部品のIR、voxel評価ではpolicyも含め、backendのsource、native module、CAD kernelの版から作るため、実装が変わると古い結果は参照されない。cacheから読んだ形状も新たに作った形状と同じ検査を通り、判定には関与しない。
 
@@ -333,7 +333,7 @@ backend例外、無効形状、空形状をfailとして保持する。依存を
 
 **積層方向**は、梁の長さ方向と積層方向の間の角が45°未満の場合をfailとする。梁が層の面より積層方向に近いと、根元の曲げ応力が主に層間を引き離す向きに掛かり、強度が一般に層内より低い層間の強度で決まるためである。軸平行の姿勢では、平行ならfail、直交ならpassとなる。`layer`のcheckは製造案ごとに`plan`を持ち、採用していない案の結果は出力の可否に用いない。
 
-**外れる経路**は分解の検査が見る。外すstepでは、フックを`deflection_mm`だけたわむ向きへ平行に動かし、梁を同じ量だけ掃引した包絡を加えた部品で`disassembly_path`と`disassembly_separation`を評価する。曲がった梁はこの包絡に含まれ、経路に沿って掃引されるため、途中の障害物との干渉も検出する。根元は実際には動かないため保守側である。同じstepで同じ部品の複数のsnap fitを外す場合は、すべてのフックをたわませる。stepの後に部品が残る場合、フックは元の位置へ戻る。
+**取り外し経路**は分解の検査で評価する。外すstepでは、フックを`deflection_mm`だけたわむ向きへ平行に動かし、梁を同じ量だけ掃引した包絡を加えた部品で`disassembly_path`と`disassembly_separation`を評価する。曲がった梁はこの包絡に含まれ、経路に沿って掃引されるため、途中の障害物との干渉も検出する。根元は実際には動かないため保守側である。同じstepで同じ部品の複数のsnap fitを外す場合は、すべてのフックをたわませる。stepの後に部品が残る場合、フックは元の位置へ戻る。
 
 分解stepに`fit_clearance_mm`を要求すると、たわんだフックと爪の横方向の隙間もその値を要求される。フックの張り出しと同じ`deflection_mm`では隙間が0となるため、張り出しにclearanceを加えた値を与えるか、そのstepの`fit_clearance_mm`を0とする。
 
@@ -347,7 +347,7 @@ Python APIの`snap_fit`は、根元の面の中心、寸法、向きから梁と
 - 開口の断面が、掃引の断面を各辺`clearance_mm`だけ広げた範囲を内包しない。
 - プラグの後端が、開口の内側の面より奥から動き始めて外側の面の外まで抜けない。
 
-開口の縁と壁以外の部品との干渉は、同じ掃引を使う`access_clearance`が見る。`connector_fit`は、helperで作った開口や掃引を手で書き換えたときの寸法の不整合と、抜く向きの誤りを検出する。
+開口の縁と壁以外の部品との干渉は、同じ掃引を使う`access_clearance`で評価する。`connector_fit`は、helperで作った開口や掃引を手で書き換えたときの寸法の不整合と、抜く向きの誤りを検出する。
 
 プラグ外形の寸法は組み込まない。USB・HDMI等の規格書は、利用許諾が実装の評価目的に限られる、機密扱いである、有償で転載に許可を要する、のいずれかに当たり、公開するcatalogへの転記と両立しないためである。利用者は、使うプラグやケーブルの部品datasheetの値か実測値を、`source`に根拠を記して与える。
 
