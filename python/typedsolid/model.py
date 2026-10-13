@@ -161,16 +161,32 @@ class Part:
 
 
 @dataclass(frozen=True)
+class Elastic:
+    """等方性の弾性定数。youngs_modulus_mpaはヤング率 (MPa)、poisson_ratioはポアソン比。"""
+
+    youngs_modulus_mpa: float
+    poisson_ratio: float
+
+
+@dataclass(frozen=True)
 class Material:
     """材料。値は利用者が与え、sourceに出典 (データシートの版、試験記録など) を書く。
 
     allowable_strainは曲げの許容ひずみ (無次元) で、snap fitを持つ部品の材料では必須。
+    elasticとallowable_stress_mpa (von Mises相当応力と比べる許容応力、MPa) は強度の解析で
+    必須。interlayer_allowable_stress_mpaは積層方向の引張と比べる層間の許容応力 (MPa) で、
+    積層する製造法の部品の強度の解析で必須。thermal_conductivity_w_per_mkは熱伝導率
+    (W/(m·K)) で、熱の解析で必須。
     """
 
     id: str
     name: str
     source: str
     allowable_strain: float | None = None
+    elastic: Elastic | None = None
+    allowable_stress_mpa: float | None = None
+    interlayer_allowable_stress_mpa: float | None = None
+    thermal_conductivity_w_per_mk: float | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +378,121 @@ class Connector:
 
 
 @dataclass(frozen=True)
+class Surface:
+    """部品の表面すべて。"""
+
+    kind: Literal["surface"] = "surface"
+
+
+@dataclass(frozen=True)
+class AtFastener:
+    """ネジ固定の荷重を受ける面。baseの部品では下穴の壁、clampの部品では頭の座面。"""
+
+    id: str
+    kind: Literal["fastener"] = "fastener"
+
+
+@dataclass(frozen=True)
+class AtKeepout:
+    """keepoutの箱 (clearanceを含めない) に接する表面。基板の発熱などに使う。"""
+
+    id: str
+    kind: Literal["keepout"] = "keepout"
+
+
+@dataclass(frozen=True)
+class AtConnector:
+    """コネクタ開口の縁の表面。プラグの挿抜の力などに使う。"""
+
+    id: str
+    kind: Literal["connector"] = "connector"
+
+
+# 荷重、拘束、発熱、放熱を掛ける部品表面の領域。Boxは軸平行のbox内の表面を表す。
+# 解析の格子の露出した面のうち、面の中心が領域に入るものを選ぶ。
+Region = Surface | Box | AtFastener | AtKeepout | AtConnector
+
+
+@dataclass(frozen=True)
+class Force:
+    """領域へ掛ける合計の力 (N)。領域の表面へ一様に分布させる。"""
+
+    region: Region
+    newtons: Vec3
+
+
+@dataclass(frozen=True)
+class StructuralCase:
+    """部品1つの線形弾性の荷重ケース。supportsの表面の変位を0に拘束する。
+
+    許容応力をsafety_factor (1以上) で割った値と比べる。max_deflection_mmを与えると
+    最大の変位 (mm) も判定する。voxel_mmは解析の格子間隔で、省略するとPolicy.voxel_mmを使う。
+    格子間隔の2倍と4倍でも解いて収束を確かめるため、4倍の格子で消える細い形状を含む部品は
+    評価できない。拘束と荷重の領域から8·voxel_mm以内の応力は判定せず、`<id>/boundary_stress`
+    として未評価で残す。
+    """
+
+    id: str
+    part: str
+    supports: tuple[Region, ...]
+    forces: tuple[Force, ...]
+    safety_factor: float
+    max_deflection_mm: float | None = None
+    voxel_mm: float | None = None
+
+
+@dataclass(frozen=True)
+class HeatInput:
+    """領域へ入る熱量 (W)。領域の表面へ一様に分布させる。"""
+
+    region: Region
+    watts: float
+
+
+@dataclass(frozen=True)
+class FixedTemperature:
+    """領域の温度 (°C) を固定する。"""
+
+    region: Region
+    celsius: float
+
+
+@dataclass(frozen=True)
+class Convection:
+    """領域の表面から周囲の空気への対流。h_w_per_m2kは熱伝達係数 (W/(m²·K))、ambient_cは
+    周囲温度 (°C)。1つの面は、先に書いた対流にだけ属する。"""
+
+    region: Region
+    h_w_per_m2k: float
+    ambient_c: float
+
+
+@dataclass(frozen=True)
+class ThermalCase:
+    """部品1つの定常熱伝導のケース。部品のどこもmax_temperature_c (°C) を超えないことを判定する。
+
+    筐体内の空気は、利用者が与える周囲温度として扱う。熱の出口として、対流か固定温度が1つ以上
+    必要である。接触熱抵抗と放射は扱わない。voxel_mmはStructuralCaseと同じ意味である。
+    """
+
+    id: str
+    part: str
+    max_temperature_c: float
+    heat_inputs: tuple[HeatInput, ...] = ()
+    fixed_temperatures: tuple[FixedTemperature, ...] = ()
+    convection: tuple[Convection, ...] = ()
+    voxel_mm: float | None = None
+
+
+@dataclass(frozen=True)
+class Analyses:
+    """強度と熱の解析ケース。宣言しない種類のruleは未評価として残る。"""
+
+    structural: tuple[StructuralCase, ...] = ()
+    thermal: tuple[ThermalCase, ...] = ()
+
+
+@dataclass(frozen=True)
 class Policy:
     min_feature_mm: float = 1.2
     # tessellationの弦誤差を吸収する、出力STLとsolidの体積差の相対許容量。
@@ -382,7 +513,7 @@ class Policy:
 
 def _without_unset(value: Any) -> Any:
     """未指定の値をJSONから除く。対象は面別clearance、stepのfit_clearance_mm、Sweepの省略可能な値、
-    部品のmaterial、材料のallowable_strain、keepoutのattached_toである。
+    部品のmaterial、材料の省略可能な定数、keepoutのattached_to、解析ケースのmax_deflection_mmとvoxel_mmである。
 
     asdictはtupleをtupleのまま返すため、listと同じに扱わないと入れ子を降りられない。
     """
@@ -410,7 +541,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 12
+    schema_version: int = 13
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
@@ -421,6 +552,7 @@ class Model:
     connectors: tuple[Connector, ...] = ()
     # 製造案を持たない部品に補う製造案。
     default_manufacturing: ManufacturingPlan = DEFAULT_PLAN
+    analyses: Analyses = field(default_factory=Analyses)
 
     def to_json(self) -> str:
         data = _expand_access(_without_unset(asdict(self)))

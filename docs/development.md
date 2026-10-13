@@ -111,7 +111,34 @@ print(model.preflight())
 export(model, ".work/plate")
 ```
 
-全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。応力・熱を必須にする場合は`Policy.required`に該当ルールを追加するが、現在は未実装なのでexportが拒否される。
+全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。応力・熱は`Model.analyses`に解析ケースを宣言すると判定する。宣言しない種類は未評価で残り、`Policy.required`に加えるとexportが拒否される。
+
+解析ケースは部品ごとに宣言し、材料に定数を与える。領域は`Box`、`Surface`、`AtFastener`、`AtKeepout`、`AtConnector`で指定する。格子間隔は`voxel_mm`で与え、省略すると`Policy.voxel_mm`を使う。2倍と4倍の格子でも解いて収束を確かめるため、4倍の格子で消える細い壁を含む部品は評価できない。手法と制約は [設計](design.md#解析) を参照する。
+
+```python
+from typedsolid import (
+    Analyses, Box, Convection, Elastic, FixedTemperature, Force, HeatInput, Material, StructuralCase, Surface,
+    ThermalCase,
+)
+
+material = Material(
+    "pla", "example PLA", "datasheet rev. and test record",
+    elastic=Elastic(youngs_modulus_mpa=3500.0, poisson_ratio=0.35),
+    allowable_stress_mpa=40.0, interlayer_allowable_stress_mpa=15.0, thermal_conductivity_w_per_mk=0.13,
+)
+analyses = Analyses(
+    structural=(StructuralCase(
+        "bracket_load", "bracket", supports=(Box((-1, -1, -1), (0.1, 31, 11)),),
+        forces=(Force(Box((59.9, -1, -1), (61, 31, 11)), (0.0, 0.0, -20.0)),),
+        safety_factor=2.0, max_deflection_mm=0.5,
+    ),),
+    thermal=(ThermalCase(
+        "regulator", "bracket", max_temperature_c=60.0,
+        heat_inputs=(HeatInput(Box((20, -1, 9.9), (30, 31, 11)), 0.5),),
+        convection=(Convection(Surface(), 10.0, 30.0),),
+    ),),
+)
+```
 
 分解手順は`Assembly`に書く。記述した位置を組立完了の状態とし、stepを上から順に実行する。
 

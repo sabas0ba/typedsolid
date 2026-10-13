@@ -80,6 +80,8 @@ VOXEL_RULES = (
     "final_wall_thickness", "neck_section", "closed_cavity", "support_free", "resin_drain", "resin_suction",
     "milling_reach", "milling_corner", "mold_undercut", "mold_thick_wall", "mold_draft",
 )
+# 解析ケースの線形弾性と定常熱伝導。IRから直接rasterizeして解く。IRのcaseの種類との対応。
+ANALYSIS_RULES = {"strength": "structural", "thermal": "thermal"}
 AXES = "xyz"
 # 各軸の負側・正側の面名。indexは軸番号に対応する。
 NEGATIVE_FACES = ("minus_x", "minus_y", "minus_z")
@@ -712,13 +714,13 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
             checks += json.loads(content)
             continue
         progress(f"part {part['id']}: voxel evaluation")
-        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定、snap fit、コネクタ開口は
-        # 他の部品や掃引を参照するため除く。
+        # 単部品のモデルとして評価する。掃引、分解step、ネジ固定、snap fit、コネクタ開口、
+        # 解析ケースは他の部品やkeepoutを参照するため除く。
         single = json.dumps(
             {
                 **data, "parts": [part], "keepouts": [], "sweeps": [],
                 "assembly": {"fit_clearance_mm": 0.0, "steps": []}, "fasteners": [], "snap_fits": [],
-                "connectors": [],
+                "connectors": [], "analyses": {"structural": [], "thermal": []},
             },
             allow_nan=False,
         )
@@ -726,6 +728,44 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
         if cache is not None:
             cache.put(key, json.dumps(result).encode())
         checks += result
+    return checks
+
+
+def _analysis_checks(data: dict, cache: Cache | None, progress: Progress) -> list[dict]:
+    """解析ケースごとに解く。ケースを宣言していない種類は、未評価のcheckを1つ残す。
+
+    結果は参照する部品、材料、ネジ固定、keepout、コネクタ開口、Policyとケースから決まる。
+    """
+    analyses = data.get("analyses", {})
+    checks: list[dict] = []
+    for rule, kind in ANALYSIS_RULES.items():
+        cases = analyses.get(kind, [])
+        if not cases:
+            checks.append({
+                "rule": rule, "target": "model", "status": "not_evaluated",
+                "message": f"not evaluated: no {kind} analysis case is declared",
+            })
+            continue
+        for case in cases:
+            part = next(p for p in data["parts"] if p["id"] == case["part"])
+            payload = {
+                "kind": kind, "case": case, "part": part, "materials": data["materials"],
+                "fasteners": data["fasteners"], "keepouts": data["keepouts"],
+                "connectors": data["connectors"], "policy": data["policy"],
+            }
+            key = "" if cache is None else cache.key("analysis", payload)
+            content = None if cache is None else cache.get(key)
+            if content is not None:
+                progress(f"{kind} case {case['id']}: analysis reused")
+                checks += json.loads(content)
+                continue
+            progress(f"{kind} case {case['id']}: analysis of part {part['id']}")
+            other = "thermal" if kind == "structural" else "structural"
+            single = json.dumps({**data, "analyses": {kind: [case], other: []}}, allow_nan=False)
+            result = json.loads(_native.evaluate_analyses(single))
+            if cache is not None:
+                cache.put(key, json.dumps(result).encode())
+            checks += result
     return checks
 
 
@@ -798,6 +838,13 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
     except Exception as error:
         voxel_checks = [_check(rule, "model", False, f"{type(error).__name__}: {error}") for rule in VOXEL_RULES]
     checks[:] = [c for c in checks if c["rule"] not in VOXEL_RULES] + voxel_checks
+    try:
+        analysis_checks = _analysis_checks(data, cache, progress)
+    except Exception as error:
+        analysis_checks = [
+            _check(rule, "model", False, f"{type(error).__name__}: {error}") for rule in ANALYSIS_RULES
+        ]
+    checks[:] = [c for c in checks if c["rule"] not in ANALYSIS_RULES] + analysis_checks
     return Build(shapes, report, model_json)
 
 

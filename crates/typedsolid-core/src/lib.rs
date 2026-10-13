@@ -1,14 +1,20 @@
 //! CADカーネルから独立した意味モデルとpreflight検証。
 
+pub mod analysis;
 pub mod mesh;
+mod multigrid;
 pub mod voxel;
+
+pub use analysis::{
+    Analyses, Convection, FixedTemperature, Force, HeatInput, Region, StructuralCase, ThermalCase,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -691,7 +697,7 @@ impl Fastener {
 }
 
 /// 材料。値は利用者が与え、sourceに出典を書く。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Material {
     pub id: String,
@@ -700,6 +706,29 @@ pub struct Material {
     /// 曲げの許容ひずみ (無次元)。snap fitを持つ部品の材料では必須。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowable_strain: Option<f64>,
+    /// 等方性の弾性定数。強度の解析では必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elastic: Option<Elastic>,
+    /// 層内の許容応力 (von Mises相当応力と比べる)。強度の解析では必須。単位はMPa。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowable_stress_mpa: Option<f64>,
+    /// 層間の許容応力 (積層方向の垂直応力の引張と比べる)。積層する製造法の部品の強度の
+    /// 解析では必須。単位はMPa。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interlayer_allowable_stress_mpa: Option<f64>,
+    /// 熱伝導率。熱の解析では必須。単位はW/(m·K)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal_conductivity_w_per_mk: Option<f64>,
+}
+
+/// 等方性の弾性定数。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Elastic {
+    /// ヤング率。単位はMPa。
+    pub youngs_modulus_mpa: f64,
+    /// ポアソン比。
+    pub poisson_ratio: f64,
 }
 
 impl Material {
@@ -719,6 +748,42 @@ impl Material {
                 "material {}: allowable_strain must be in (0, 1)",
                 self.id
             ));
+        }
+        if let Some(elastic) = &self.elastic {
+            if !elastic.youngs_modulus_mpa.is_finite()
+                || !(1e-3..=1e7).contains(&elastic.youngs_modulus_mpa)
+            {
+                return Err(format!(
+                    "material {}: youngs_modulus_mpa must be in [0.001, 1e7]",
+                    self.id
+                ));
+            }
+            if !elastic.poisson_ratio.is_finite() || !(0.0..0.5).contains(&elastic.poisson_ratio) {
+                return Err(format!(
+                    "material {}: poisson_ratio must be in [0, 0.5)",
+                    self.id
+                ));
+            }
+        }
+        for (name, value) in [
+            ("allowable_stress_mpa", self.allowable_stress_mpa),
+            (
+                "interlayer_allowable_stress_mpa",
+                self.interlayer_allowable_stress_mpa,
+            ),
+            (
+                "thermal_conductivity_w_per_mk",
+                self.thermal_conductivity_w_per_mk,
+            ),
+        ] {
+            if let Some(value) = value
+                && (!value.is_finite() || value <= 0.0 || value > 1e6)
+            {
+                return Err(format!(
+                    "material {}: {name} must be positive and at most 1e6",
+                    self.id
+                ));
+            }
         }
         Ok(())
     }
@@ -1456,10 +1521,13 @@ pub struct Model {
     pub snap_fits: Vec<SnapFit>,
     #[serde(default)]
     pub connectors: Vec<Connector>,
+    /// 強度と熱の解析ケース。
+    #[serde(default, skip_serializing_if = "Analyses::is_empty")]
+    pub analyses: Analyses,
     pub policy: Policy,
 }
 
-fn identifier(id: &str) -> bool {
+pub(crate) fn identifier(id: &str) -> bool {
     let reserved = [
         "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
         "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
@@ -1716,6 +1784,29 @@ fn upgrade_v11(value: &mut Value) -> Result<(), String> {
     if orientations.iter().any(|o| o.get("tilt_deg").is_some()) {
         return Err("schema_version 11 does not define tilt_deg".into());
     }
+    root.insert("schema_version".into(), json!(12));
+    Ok(())
+}
+
+/// schema v12のJSONをv13へ変換する。v12は解析ケースと材料定数を持たないため、そのまま
+/// 受理する。v12の入力にこれらが現れた場合は拒否する。
+fn upgrade_v12(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    if root.contains_key("analyses") {
+        return Err("schema_version 12 does not define analyses".into());
+    }
+    const KEYS: [&str; 4] = [
+        "elastic",
+        "allowable_stress_mpa",
+        "interlayer_allowable_stress_mpa",
+        "thermal_conductivity_w_per_mk",
+    ];
+    let materials = root.get("materials").and_then(Value::as_array);
+    for material in materials.into_iter().flatten() {
+        if let Some(key) = KEYS.iter().find(|key| material.get(**key).is_some()) {
+            return Err(format!("schema_version 12 does not define material {key}"));
+        }
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
@@ -1762,6 +1853,7 @@ impl Model {
             upgrade_v9,
             upgrade_v10,
             upgrade_v11,
+            upgrade_v12,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -1966,6 +2058,7 @@ impl Model {
             }
             connector.validate(&parts, &self.sweeps)?;
         }
+        self.analyses.validate(self)?;
         Ok(())
     }
 
@@ -2744,6 +2837,7 @@ mod tests {
             materials: vec![],
             snap_fits: vec![],
             connectors: vec![],
+            analyses: Analyses::default(),
             policy: Policy {
                 min_feature_mm: 1.2,
                 mesh_volume_tolerance: 0.01,
@@ -3626,6 +3720,7 @@ mod tests {
             name: "test PLA".into(),
             source: "test fixture".into(),
             allowable_strain: Some(0.04),
+            ..Material::default()
         }];
         let lid = &mut m.parts[1];
         lid.material = Some("pla".into());
