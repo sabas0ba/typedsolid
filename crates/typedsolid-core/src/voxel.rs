@@ -4,8 +4,8 @@
 //! 得る。厚さ・接続部・空洞はいずれも同じoccupancyから導く。
 
 use crate::{
-    Axis, Check, Direction, Location, MAX_LOCATIONS, ManufacturingPlan, Model, Operation, Part,
-    Policy, Process, Rule, Status, mesh,
+    Axis, Check, Direction, Location, MAX_LOCATIONS, ManufacturingPlan, Matrix3, Model, Operation,
+    Orientation, Part, Policy, Process, Rule, Status, apply, mesh, transpose,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,43 @@ const PADDING_CELLS: u64 = 1;
 /// rasterizeに必要な各軸のcell数。座標が有限であることは呼び出し前に検証されている。
 pub fn grid_size(part: &Part, pitch: f64) -> Option<[u64; 3]> {
     let (low, high) = part.bounds()?;
+    size_of(low, high, pitch)
+}
+
+/// 部品を`rotation`で製造機の座標へ移したときの外接box。部品の外接boxの8頂点から求める。
+pub fn rotated_bounds(part: &Part, rotation: &Matrix3) -> Option<([f64; 3], [f64; 3])> {
+    let (low, high) = part.bounds()?;
+    Some(rotated_box(low, high, rotation))
+}
+
+/// boxの8頂点を回したものの外接box。
+fn rotated_box(low: [f64; 3], high: [f64; 3], rotation: &Matrix3) -> ([f64; 3], [f64; 3]) {
+    let mut out = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for corner in 0..8 {
+        let point = std::array::from_fn(|axis| {
+            if corner & (1 << axis) == 0 {
+                low[axis]
+            } else {
+                high[axis]
+            }
+        });
+        for (axis, value) in apply(rotation, point).into_iter().enumerate() {
+            out.0[axis] = out.0[axis].min(value);
+            out.1[axis] = out.1[axis].max(value);
+        }
+    }
+    out
+}
+
+/// 傾けた姿勢でrasterizeに必要なcell数。
+pub fn rotated_grid_cells(part: &Part, pitch: f64, rotation: &Matrix3) -> Option<u64> {
+    let (low, high) = rotated_bounds(part, rotation)?;
+    size_of(low, high, pitch)?
+        .into_iter()
+        .try_fold(1u64, |cells, count| cells.checked_mul(count))
+}
+
+fn size_of(low: [f64; 3], high: [f64; 3], pitch: f64) -> Option<[u64; 3]> {
     let mut size = [0u64; 3];
     for axis in 0..3 {
         let span = high[axis] - low[axis];
@@ -48,6 +85,9 @@ pub struct Grid {
     origin: [f64; 3],
     pitch: f64,
     occupied: Vec<bool>,
+    /// 傾けた姿勢の格子では、組立座標から格子の座標 (製造機の座標) への回転。
+    /// 組立座標の格子ではNone。
+    rotation: Option<Matrix3>,
 }
 
 impl Grid {
@@ -57,6 +97,26 @@ impl Grid {
 
     fn centre(&self, axis: usize, cell: usize) -> f64 {
         self.origin[axis] + cell as f64 * self.pitch
+    }
+
+    /// cellの中心の座標 (格子の座標)。
+    fn centre_of(&self, index: usize) -> [f64; 3] {
+        let [nx, ny, _] = self.size;
+        let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
+        std::array::from_fn(|axis| self.centre(axis, cell[axis]))
+    }
+
+    /// 格子の座標で`point`に最も近いcell。格子の外ならNone。
+    fn cell_at(&self, point: [f64; 3]) -> Option<usize> {
+        let mut cell = [0usize; 3];
+        for axis in 0..3 {
+            let k = ((point[axis] - self.origin[axis]) / self.pitch).round();
+            if !(0.0..self.size[axis] as f64).contains(&k) {
+                return None;
+            }
+            cell[axis] = k as usize;
+        }
+        Some(self.index(cell[0], cell[1], cell[2]))
     }
 
     /// 座標範囲に重なるcellのindex範囲。範囲外は切り詰める。
@@ -104,28 +164,65 @@ impl Grid {
             origin,
             pitch,
             occupied: vec![false; cells as usize],
+            rotation: None,
         };
-        // featureのAABB内だけを走査する。全cellを毎回見ると無関係な領域まで数える。
+        grid.fill(part, None);
+        Ok(grid)
+    }
+
+    /// 部品を`rotation`で製造機の座標へ移し、その座標の軸に沿った格子にする。傾けた姿勢の
+    /// 製造案の検査に使う。cellの中心を組立座標へ戻して内外を判定する。
+    pub fn rasterize_in(part: &Part, pitch: f64, rotation: &Matrix3) -> Result<Self, String> {
+        let (low, high) = rotated_bounds(part, rotation)
+            .ok_or_else(|| format!("{} has no additive geometry", part.id))?;
+        let size =
+            size_of(low, high, pitch).ok_or_else(|| format!("{} cannot be rasterized", part.id))?;
+        let cells = size
+            .into_iter()
+            .try_fold(1u64, |cells, count| cells.checked_mul(count))
+            .filter(|cells| *cells <= MAX_GRID_CELLS)
+            .ok_or_else(|| format!("{} exceeds the voxel grid limit when tilted", part.id))?;
+        let mut grid = Self {
+            size: size.map(|count| count as usize),
+            origin: std::array::from_fn(|axis| low[axis] - PADDING_CELLS as f64 * pitch),
+            pitch,
+            occupied: vec![false; cells as usize],
+            rotation: Some(*rotation),
+        };
+        grid.fill(part, Some(rotation));
+        Ok(grid)
+    }
+
+    /// 「すべてのAddの和から、すべてのCutを引く」をcell単位で構成する。
+    /// featureのAABB (傾けた格子では、その8頂点を回した外接box) 内だけを走査する。
+    fn fill(&mut self, part: &Part, rotation: Option<&Matrix3>) {
+        let back = rotation.map(transpose);
         for (operation, fill) in [(Operation::Add, true), (Operation::Cut, false)] {
             for feature in part.features.iter().filter(|f| f.operation == operation) {
-                let (shape_low, shape_high) = feature.shape.aabb();
+                let (mut shape_low, mut shape_high) = feature.shape.aabb();
+                if let Some(rotation) = rotation {
+                    (shape_low, shape_high) = rotated_box(shape_low, shape_high, rotation);
+                }
                 let ranges: Vec<(usize, usize)> = (0..3)
-                    .map(|axis| grid.cell_range(axis, shape_low[axis], shape_high[axis]))
+                    .map(|axis| self.cell_range(axis, shape_low[axis], shape_high[axis]))
                     .collect();
                 for z in ranges[2].0..=ranges[2].1 {
                     for y in ranges[1].0..=ranges[1].1 {
                         for x in ranges[0].0..=ranges[0].1 {
-                            let point = [grid.centre(0, x), grid.centre(1, y), grid.centre(2, z)];
+                            let mut point =
+                                [self.centre(0, x), self.centre(1, y), self.centre(2, z)];
+                            if let Some(back) = &back {
+                                point = apply(back, point);
+                            }
                             if feature.shape.contains(point) {
-                                let index = grid.index(x, y, z);
-                                grid.occupied[index] = fill;
+                                let index = self.index(x, y, z);
+                                self.occupied[index] = fill;
                             }
                         }
                     }
                 }
             }
         }
-        Ok(grid)
     }
 
     /// 閉じた三角形meshの内部をcell単位で求める。
@@ -174,6 +271,7 @@ impl Grid {
             origin,
             pitch,
             occupied: vec![false; cells as usize],
+            rotation: None,
         };
         let [nx, ny, _] = size;
         // 交点のzとwinding numberの増分。
@@ -319,47 +417,133 @@ impl Grid {
             .collect()
     }
 
-    /// 各solid cellを通る軸方向の連続長のうち最小のもの。単位はcell。
+    /// 表面の法線方向に材料を横切る長さが`required` cellに満たない材料cell。
     ///
-    /// 扱うprimitiveは軸平行のboxとcylinderに限るため、壁は必ずいずれかの軸に沿って
-    /// 厚さを持つ。球のopeningで測ると角や稜線が必ず除去され、十分に厚い立体まで
-    /// 薄肉と判定されるため採らない。
-    fn axial_runs(&self) -> Vec<usize> {
-        let mut runs = vec![usize::MAX; self.occupied.len()];
-        let [nx, ny, nz] = self.size;
-        for (axis, (length, outer, inner)) in [(nx, ny, nz), (ny, nx, nz), (nz, nx, ny)]
+    /// 符号付き距離場 (材料の内側で空cellまでの距離、外側で材料までの距離の負値) の勾配を
+    /// 3×3×3のSobel差分で求め、表面cellでの内向きの法線とする。表面cellの中心から法線の
+    /// 向きへ1/4 cellずつ進み、空cellに入るまでの長さに表面までの半cellを加えた値を、
+    /// その表面での肉厚とする。肉厚が足りない場合は、通ったcellを薄肉とする。
+    /// 凸の稜線では法線が対角を向くため長く測れ、稜線を薄肉と誤らない。傾いた壁と
+    /// 円柱の外周も壁の法線の向きで測る。勾配が定まらない孤立したcellは薄肉とする。
+    fn thin_chords(&self, required: f64) -> Vec<bool> {
+        let count = self.occupied.len();
+        let empty: Vec<bool> = self.occupied.iter().map(|cell| !cell).collect();
+        let mut field: Vec<f32> = self
+            .distance_squared(&empty)
             .into_iter()
-            .enumerate()
-        {
-            for a in 0..outer {
-                for b in 0..inner {
-                    let at = |k: usize| match axis {
-                        0 => self.index(k, a, b),
-                        1 => self.index(a, k, b),
-                        _ => self.index(a, b, k),
+            .map(|squared| squared.sqrt() as f32)
+            .collect();
+        drop(empty);
+        for (value, (solid, squared)) in field.iter_mut().zip(
+            self.occupied
+                .iter()
+                .zip(self.distance_squared(&self.occupied)),
+        ) {
+            if !*solid {
+                *value = -(squared.sqrt() as f32);
+            }
+        }
+        let [nx, ny, nz] = self.size;
+        // 格子化した表面の段差で法線が乱れないよう、距離場を5 cellの二項係数で平滑化する。
+        const SMOOTH: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
+        let mut buffer = vec![0.0f32; count];
+        for axis in 0..3 {
+            let stride = [1, nx, nx * ny][axis];
+            let length = self.size[axis];
+            for (index, slot) in buffer.iter_mut().enumerate() {
+                let position = (index / stride) % length;
+                let mut sum = 0.0f32;
+                let mut weight = 0.0f32;
+                for (k, w) in SMOOTH.iter().enumerate() {
+                    let Some(at) = (position + k).checked_sub(2).filter(|v| *v < length) else {
+                        continue;
                     };
-                    let mut start: Option<usize> = None;
-                    for k in 0..length {
-                        if self.occupied[at(k)] {
-                            start.get_or_insert(k);
-                        } else if let Some(from) = start.take() {
-                            for j in from..k {
-                                let index = at(j);
-                                runs[index] = runs[index].min(k - from);
-                            }
-                        }
+                    sum += w * field[index - position * stride + at * stride];
+                    weight += w;
+                }
+                *slot = sum / weight;
+            }
+            std::mem::swap(&mut field, &mut buffer);
+        }
+        drop(buffer);
+        let mut thin = vec![false; count];
+        let mut visited = Vec::new();
+        const STEP: f64 = 0.25;
+        for z in 1..nz.saturating_sub(1) {
+            for y in 1..ny.saturating_sub(1) {
+                for x in 1..nx.saturating_sub(1) {
+                    let index = self.index(x, y, z);
+                    if !self.occupied[index] {
+                        continue;
                     }
-                    // paddingにより末尾は空である。到達した場合も同じ扱いにする。
-                    if let Some(from) = start {
-                        for j in from..length {
-                            let index = at(j);
-                            runs[index] = runs[index].min(length - from);
+                    let on_surface = NEIGHBOURS.iter().any(|(dx, dy, dz)| {
+                        let neighbour = self.index(
+                            (x as i64 + *dx as i64) as usize,
+                            (y as i64 + *dy as i64) as usize,
+                            (z as i64 + *dz as i64) as usize,
+                        );
+                        !self.occupied[neighbour]
+                    });
+                    if !on_surface {
+                        continue;
+                    }
+                    let at = |dx: i64, dy: i64, dz: i64| {
+                        f64::from(
+                            field[self.index(
+                                (x as i64 + dx) as usize,
+                                (y as i64 + dy) as usize,
+                                (z as i64 + dz) as usize,
+                            )],
+                        )
+                    };
+                    let gradient = [
+                        at(1, 0, 0) - at(-1, 0, 0),
+                        at(0, 1, 0) - at(0, -1, 0),
+                        at(0, 0, 1) - at(0, 0, -1),
+                    ];
+                    let length = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                    if length < 1e-9 {
+                        thin[index] = true;
+                        continue;
+                    }
+                    let normal = gradient.map(|g| g / length);
+                    visited.clear();
+                    let mut travelled = 0.0f64;
+                    let crossed = loop {
+                        let point = [
+                            x as f64 + normal[0] * travelled,
+                            y as f64 + normal[1] * travelled,
+                            z as f64 + normal[2] * travelled,
+                        ];
+                        let cell = point.map(|c| c.round());
+                        if cell
+                            .iter()
+                            .zip(self.size)
+                            .any(|(c, n)| *c < 0.0 || *c >= n as f64)
+                        {
+                            break travelled;
+                        }
+                        let here = self.index(cell[0] as usize, cell[1] as usize, cell[2] as usize);
+                        if !self.occupied[here] {
+                            break travelled;
+                        }
+                        if visited.last() != Some(&here) {
+                            visited.push(here);
+                        }
+                        if travelled + 0.5 >= required {
+                            break f64::INFINITY;
+                        }
+                        travelled += STEP;
+                    };
+                    if crossed + 0.5 < required {
+                        for cell in &visited {
+                            thin[*cell] = true;
                         }
                     }
                 }
             }
         }
-        runs
+        thin
     }
 
     /// 外周から到達できない空cell。padding により外周は必ず空である。
@@ -447,92 +631,170 @@ struct Support {
 }
 
 impl Grid {
-    /// 層ごとに直下の材料を探し、支持の有無を求める。
+    /// 層ごとに下の層の材料を探し、支持の有無を求める。
     ///
     /// 直下が支持されているかは問わない。支持の要否は層ごとに独立して評価し、
     /// 1箇所のoverhangがその上の全体を未支持にすることを避ける。
+    ///
+    /// 傾いた面の位置は層ごとに格子へ丸められ、1層あたりのずれは最大で1 cell揺らぐ。
+    /// 1層だけで傾きを測ると、許容角より緩い面でも2 cellずれた層が未支持となるため、
+    /// 最大`SUPPORT_LAYERS`層下までの傾きも見る。m層下の材料が水平距離m·tan(角度)以内に
+    /// あり、途中のj層下 (j < m) にも水平距離j·tan(角度) + 1 cell以内に材料があれば支持
+    /// されているとする。途中の層の条件は、片持ちの棚の下に離れて立つ壁を支持と誤らない
+    /// ためである。水平な棚では、壁から2 cellまでを支持とみなす。
     fn support(
         &self,
         direction: Direction,
         overhang_angle_deg: f64,
         bridge_max_mm: f64,
     ) -> Support {
+        const SUPPORT_LAYERS: usize = 8;
         let frame = Layered::new(direction);
         let layers = self.size[frame.up];
         let extent = [self.size[frame.plane[0]], self.size[frame.plane[1]]];
         // 傾斜角tanが、1層あたりに許す水平方向のずれになる。tan(45°)は浮動小数点で
         // 1をわずかに下回るため、切り捨てではなく許容を持たせて比較する。
-        let radius = overhang_angle_deg.to_radians().tan();
-        let limit = radius * radius + 1e-9;
-        let reach = radius.ceil() as isize;
-        let offsets: Vec<(isize, isize)> = (-reach..=reach)
-            .flat_map(|da| (-reach..=reach).map(move |db| (da, db)))
-            .filter(|(da, db)| ((da * da + db * db) as f64) <= limit)
-            .collect();
+        let slope = overhang_angle_deg.to_radians().tan();
+        let plane = extent[0] * extent[1];
+        // 各層の、層内で最も近い材料までの距離の2乗。
+        let mut near = vec![0.0f32; layers * plane];
+        let longest = extent[0].max(extent[1]);
+        let mut line = vec![0.0f64; longest];
+        let mut result = vec![0.0f64; longest];
+        let mut vertices = vec![0usize; longest];
+        let mut breaks = vec![0.0f64; longest + 1];
+        let mut field = vec![0.0f64; plane];
+        let mut first_layer = None;
+        for layer in 0..layers {
+            let mut any = false;
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let solid = self.occupied[frame.cell(self, layer, a, b)];
+                    any |= solid;
+                    field[a * extent[1] + b] = if solid { 0.0 } else { f64::INFINITY };
+                }
+            }
+            if any && first_layer.is_none() {
+                first_layer = Some(layer);
+            }
+            for a in 0..extent[0] {
+                line[..extent[1]].copy_from_slice(&field[a * extent[1]..(a + 1) * extent[1]]);
+                transform(
+                    &line[..extent[1]],
+                    &mut result[..extent[1]],
+                    &mut vertices,
+                    &mut breaks,
+                );
+                field[a * extent[1]..(a + 1) * extent[1]].copy_from_slice(&result[..extent[1]]);
+            }
+            for b in 0..extent[1] {
+                for (a, slot) in line[..extent[0]].iter_mut().enumerate() {
+                    *slot = field[a * extent[1] + b];
+                }
+                transform(
+                    &line[..extent[0]],
+                    &mut result[..extent[0]],
+                    &mut vertices,
+                    &mut breaks,
+                );
+                for (a, value) in result[..extent[0]].iter().enumerate() {
+                    near[layer * plane + a * extent[1] + b] = *value as f32;
+                }
+            }
+        }
 
         let mut supported = vec![false; self.occupied.len()];
         // gridは外周にpaddingを持つため、最初の層は空である。材料が最初に現れる層が
         // build plateに接する。
-        let mut material_below = false;
-        for layer in 0..layers {
-            let mut material_here = false;
+        let Some(first_layer) = first_layer else {
+            return Support {
+                supported,
+                bridged: vec![false; self.occupied.len()],
+            };
+        };
+        let within = |layer: usize, column: usize, reach: f64| {
+            f64::from(near[layer * plane + column]) <= reach * reach + 1e-9
+        };
+        for layer in first_layer..layers {
             for a in 0..extent[0] {
                 for b in 0..extent[1] {
                     let index = frame.cell(self, layer, a, b);
                     if !self.occupied[index] {
                         continue;
                     }
-                    material_here = true;
-                    supported[index] = !material_below
-                        || offsets.iter().any(|(da, db)| {
-                            let (Some(na), Some(nb)) = (
-                                checked_step(a, *da as i32, extent[0]),
-                                checked_step(b, *db as i32, extent[1]),
-                            ) else {
-                                return false;
-                            };
-                            self.occupied[frame.cell(self, layer - 1, na, nb)]
+                    let column = a * extent[1] + b;
+                    let depth = (layer - first_layer).min(SUPPORT_LAYERS);
+                    supported[index] = depth == 0
+                        || (1..=depth).any(|m| {
+                            within(layer - m, column, m as f64 * slope)
+                                && (1..m).all(|j| within(layer - j, column, j as f64 * slope + 1.0))
                         });
                 }
             }
-            material_below |= material_here;
         }
 
-        // 未支持の区間は、同じ層で両端を支持された材料に挟まれていれば渡せる。
-        let limit = (bridge_max_mm / self.pitch).floor() as usize;
+        // 未支持のcellは、同じ層で両端を支持された材料に挟まれ、両端の間が`bridge_max_mm`以内
+        // なら渡せる。傾けた格子では渡す向きが格子の軸に沿わないため、層内の16方向を調べる。
+        // 未支持のcellから両側へ1 cellずつ進み、未支持の材料が途切れた先が支持された材料で
+        // あるかを見る。端で終わる区間は片持ちであり、bridgeにならない。
+        const BRIDGE_DIRECTIONS: usize = 16;
+        let limit = (bridge_max_mm / self.pitch).floor();
+        let directions: Vec<(f64, f64)> = (0..BRIDGE_DIRECTIONS)
+            .map(|k| {
+                let angle = std::f64::consts::PI * k as f64 / BRIDGE_DIRECTIONS as f64;
+                (angle.cos(), angle.sin())
+            })
+            .collect();
+        let open = |index: usize| self.occupied[index] && !supported[index];
         let mut bridged = vec![false; self.occupied.len()];
-        for layer in 0..layers {
-            for (axis, (length, other)) in [(extent[0], extent[1]), (extent[1], extent[0])]
-                .into_iter()
-                .enumerate()
-            {
-                for fixed in 0..other {
-                    let at = |k: usize| {
-                        if axis == 0 {
-                            frame.cell(self, layer, k, fixed)
-                        } else {
-                            frame.cell(self, layer, fixed, k)
-                        }
-                    };
-                    let mut start: Option<usize> = None;
-                    for k in 0..length {
-                        let index = at(k);
-                        let open = self.occupied[index] && !supported[index];
-                        if open {
-                            start.get_or_insert(k);
-                            continue;
-                        }
-                        if let Some(from) = start.take() {
-                            let anchored_before = from > 0 && supported[at(from - 1)];
-                            let anchored_after = supported[index];
-                            if anchored_before && anchored_after && k - from <= limit {
-                                for j in from..k {
-                                    bridged[at(j)] = true;
-                                }
-                            }
-                        }
+        for layer in first_layer..layers {
+            for a in 0..extent[0] {
+                for b in 0..extent[1] {
+                    let index = frame.cell(self, layer, a, b);
+                    if !open(index) {
+                        continue;
                     }
-                    // 端で終わる区間は片持ちであり、bridgeにならない。
+                    // 向きに沿って進み、未支持の材料を抜けた先の支持された材料を探す。格子化した
+                    // 板の縁は段になるため、進む線の両脇1 cellも見て、線が縁をかすめて板の外へ
+                    // 出ただけの場合は進み続ける。
+                    let cell_at = |pa: f64, pb: f64| {
+                        (pa >= 0.0 && pb >= 0.0 && pa < extent[0] as f64 && pb < extent[1] as f64)
+                            .then(|| frame.cell(self, layer, pa as usize, pb as usize))
+                    };
+                    let anchor = |da: f64, db: f64| -> Option<f64> {
+                        let mut step = 1.0f64;
+                        while step <= limit + 1.0 {
+                            let (ca, cb) = (a as f64 + da * step, b as f64 + db * step);
+                            let here = cell_at(ca.round(), cb.round())?;
+                            if open(here) {
+                                step += 1.0;
+                                continue;
+                            }
+                            if supported[here] {
+                                return Some(step);
+                            }
+                            let sides = [1.0, -1.0].map(|side| {
+                                cell_at((ca - db * side).round(), (cb + da * side).round())
+                            });
+                            if sides.iter().flatten().any(|side| open(*side)) {
+                                step += 1.0;
+                                continue;
+                            }
+                            return sides
+                                .iter()
+                                .flatten()
+                                .any(|side| supported[*side])
+                                .then_some(step);
+                        }
+                        None
+                    };
+                    bridged[index] = directions.iter().any(|(da, db)| {
+                        match (anchor(*da, *db), anchor(-*da, -*db)) {
+                            // 両端の支持の間にある未支持のcellの長さ。
+                            (Some(ahead), Some(behind)) => ahead + behind - 1.0 <= limit,
+                            _ => false,
+                        }
+                    });
                 }
             }
         }
@@ -548,6 +810,22 @@ const NEIGHBOURS: [(i32, i32, i32); 6] = [
     (0, 0, -1),
     (0, 0, 1),
 ];
+
+/// 面、辺、頂点で接する26個の隣接cell。
+const NEIGHBOURS_26: [(i32, i32, i32); 26] = {
+    let mut out = [(0, 0, 0); 26];
+    let mut n = 0;
+    let mut i: i32 = 0;
+    while i < 27 {
+        let offset = (i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1);
+        if i != 13 {
+            out[n] = offset;
+            n += 1;
+        }
+        i += 1;
+    }
+    out
+};
 
 /// xy平面での(v - u)×(p - u)。uからvへの辺の左にpがあれば正。
 fn cross(u: [f64; 3], v: [f64; 3], p: [f64; 2]) -> f64 {
@@ -672,7 +950,16 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
             .iter()
             .map(|plan| (plan, plan.id == part.adopted))
             .collect();
-        checks.extend(evaluate_grid(&grid, &part.id, &model.policy, &plans));
+        let tilted = |orientation: &Orientation| {
+            Grid::rasterize_in(part, model.policy.voxel_mm, &orientation.rotation())
+        };
+        checks.extend(evaluate_grid(
+            &grid,
+            &part.id,
+            &model.policy,
+            &plans,
+            &tilted,
+        )?);
     }
     Ok(checks)
 }
@@ -687,13 +974,31 @@ pub fn evaluate_stl(
     plan: &ManufacturingPlan,
 ) -> Result<Vec<Check>, String> {
     plan.validate()?;
-    let grid = stl_grid(bytes, policy)?;
+    let triangles = stl_triangles(bytes, policy)?;
+    let grid = Grid::from_triangles(&triangles, policy.voxel_mm)?;
     check_milling_work(grid.size, policy.voxel_mm, plan, target)?;
-    Ok(evaluate_grid(&grid, target, policy, &[(plan, true)]))
+    let tilted = |orientation: &Orientation| tilted_mesh_grid(&triangles, policy, orientation);
+    evaluate_grid(&grid, target, policy, &[(plan, true)], &tilted)
 }
 
-/// STLを読み、閉じていることを確かめてから格子にする。
-fn stl_grid(bytes: &[u8], policy: &Policy) -> Result<Grid, String> {
+/// meshを`orientation`で製造機の座標へ移し、その座標の軸に沿った格子にする。
+fn tilted_mesh_grid(
+    triangles: &[[[f64; 3]; 3]],
+    policy: &Policy,
+    orientation: &Orientation,
+) -> Result<Grid, String> {
+    let rotation = orientation.rotation();
+    let moved: Vec<[[f64; 3]; 3]> = triangles
+        .iter()
+        .map(|triangle| triangle.map(|vertex| apply(&rotation, vertex)))
+        .collect();
+    let mut grid = Grid::from_triangles(&moved, policy.voxel_mm)?;
+    grid.rotation = Some(rotation);
+    Ok(grid)
+}
+
+/// STLを読み、閉じていることを確かめてから三角形を返す。
+fn stl_triangles(bytes: &[u8], policy: &Policy) -> Result<Vec<[[f64; 3]; 3]>, String> {
     policy.validate()?;
     let parsed = mesh::parse_stl(bytes)?;
     // +z方向のwinding numberは、z方向から見て面積0の面の穴や裏返りを検出できない。
@@ -703,8 +1008,7 @@ fn stl_grid(bytes: &[u8], policy: &Policy) -> Result<Grid, String> {
             "mesh is not closed or not consistently oriented: {unpaired} edge(s) are not paired with an opposite-direction edge"
         ));
     }
-    let triangles: Vec<[[f64; 3]; 3]> = parsed.iter().map(mesh::Triangle::vertices).collect();
-    Grid::from_triangles(&triangles, policy.voxel_mm)
+    Ok(parsed.iter().map(mesh::Triangle::vertices).collect())
 }
 
 /// 断面を描く平面。`axis`に垂直で、座標`coordinate`を通る。単位はmm。
@@ -743,6 +1047,29 @@ const MAX_SECTIONS: usize = 256;
 impl Grid {
     /// 解析結果を断面ごとに切り出す。平面の座標は最も近いcell中心へ丸める。
     pub fn sections(&self, analysis: &Analysis, planes: &[Plane]) -> Result<Vec<Section>, String> {
+        self.sections_with(planes, &|index| {
+            [
+                (self.occupied[index], SECTION_SOLID),
+                (analysis.manufacture.thin[index], SECTION_THIN),
+                (analysis.structure.neck[index], SECTION_NECK),
+                (
+                    marked(&analysis.manufacture.unsupported, index),
+                    SECTION_UNSUPPORTED,
+                ),
+                (analysis.structure.void[index], SECTION_VOID),
+            ]
+            .into_iter()
+            .filter(|(set, _)| *set)
+            .fold(0u8, |acc, (_, bit)| acc | bit)
+        })
+    }
+
+    /// 断面ごとに、各cellのbitを`bits`で求める。
+    fn sections_with(
+        &self,
+        planes: &[Plane],
+        bits: &dyn Fn(usize) -> u8,
+    ) -> Result<Vec<Section>, String> {
         if planes.len() > MAX_SECTIONS {
             return Err(format!("at most {MAX_SECTIONS} sections are supported"));
         }
@@ -771,20 +1098,7 @@ impl Grid {
                                 cell[first] = i;
                                 cell[second] = j;
                                 let index = self.index(cell[0], cell[1], cell[2]);
-                                let bits = [
-                                    (self.occupied[index], SECTION_SOLID),
-                                    (analysis.manufacture.thin[index], SECTION_THIN),
-                                    (analysis.structure.neck[index], SECTION_NECK),
-                                    (
-                                        marked(&analysis.manufacture.unsupported, index),
-                                        SECTION_UNSUPPORTED,
-                                    ),
-                                    (analysis.structure.void[index], SECTION_VOID),
-                                ]
-                                .into_iter()
-                                .filter(|(set, _)| *set)
-                                .fold(0u8, |acc, (_, bit)| acc | bit);
-                                DIGITS[bits as usize]
+                                DIGITS[bits(index) as usize]
                             })
                             .collect();
                         String::from_utf8(bytes).expect("digits are ASCII")
@@ -822,7 +1136,10 @@ pub fn sections_of_part(
         .find(|plan| plan.id == wanted)
         .ok_or_else(|| format!("part {part_id} has no manufacturing plan {wanted}"))?;
     let grid = Grid::rasterize(part, model.policy.voxel_mm)?;
-    grid.sections(&grid.analyse(&model.policy, &Limits::of(plan)), planes)
+    let tilted = |orientation: &Orientation| {
+        Grid::rasterize_in(part, model.policy.voxel_mm, &orientation.rotation())
+    };
+    planned_sections(&grid, &model.policy, plan, planes, &tilted)
 }
 
 /// 外部のSTLを格子にし、指定した製造案で判定した断面を返す。
@@ -833,29 +1150,83 @@ pub fn sections_of_stl(
     planes: &[Plane],
 ) -> Result<Vec<Section>, String> {
     plan.validate()?;
-    let grid = stl_grid(bytes, policy)?;
+    let triangles = stl_triangles(bytes, policy)?;
+    let grid = Grid::from_triangles(&triangles, policy.voxel_mm)?;
     check_milling_work(grid.size, policy.voxel_mm, plan, "mesh")?;
-    grid.sections(&grid.analyse(policy, &Limits::of(plan)), planes)
+    let tilted = |orientation: &Orientation| tilted_mesh_grid(&triangles, policy, orientation);
+    planned_sections(&grid, policy, plan, planes, &tilted)
+}
+
+/// 製造案で判定した断面。断面は組立座標の格子で切る。傾けた姿勢の製造案では、肉厚と
+/// 支持のbitを製造機の座標の格子から最も近いcellで写す。
+fn planned_sections(
+    grid: &Grid,
+    policy: &Policy,
+    plan: &ManufacturingPlan,
+    planes: &[Plane],
+    tilted: &dyn Fn(&Orientation) -> Result<Grid, String>,
+) -> Result<Vec<Section>, String> {
+    let limits = Limits::of(plan);
+    if !plan.orientation.is_tilted() {
+        return grid.sections(&grid.analyse(policy, &limits), planes);
+    }
+    let structure = grid.structure(policy);
+    let machine = tilted(&plan.orientation)?;
+    let made = machine.manufacture(&limits, &machine.enclosed_void_mask());
+    let rotation = plan.orientation.rotation();
+    grid.sections_with(planes, &|index| {
+        let mut bits = [
+            (grid.occupied[index], SECTION_SOLID),
+            (structure.neck[index], SECTION_NECK),
+            (structure.void[index], SECTION_VOID),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .fold(0u8, |acc, (_, bit)| acc | bit);
+        if grid.occupied[index]
+            && let Some(cell) = machine.cell_at(apply(&rotation, grid.centre_of(index)))
+        {
+            if made.thin[cell] {
+                bits |= SECTION_THIN;
+            }
+            if marked(&made.unsupported, cell) {
+                bits |= SECTION_UNSUPPORTED;
+            }
+        }
+        bits
+    })
 }
 
 /// 製造案から決まる判定の値。IRの部品と外部形状で共有する。
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub min_wall_mm: f64,
-    /// 製造案の`orientation.up`。積層方向、工具を下ろす側、型を開く軸の基準である。
+    /// 判定に使う格子の座標での積層方向、工具を下ろす側、型を開く軸。傾けた姿勢では
+    /// 製造機の座標の格子で判定するため`plus_z`となる。
     pub up: Direction,
     pub process: Process,
     /// 段取りごとの`up`。切削以外は`up`だけである。
     pub setups: Vec<Direction>,
+    /// 製造案の姿勢。messageに書く。
+    pub orientation: Orientation,
 }
 
 impl Limits {
     pub fn of(plan: &ManufacturingPlan) -> Self {
+        let tilted = plan.orientation.is_tilted();
+        let axis = |orientation: &Orientation| {
+            if tilted {
+                Direction::PlusZ
+            } else {
+                orientation.up
+            }
+        };
         Self {
             min_wall_mm: plan.process.min_wall_mm(),
-            up: plan.orientation.up,
+            up: axis(&plan.orientation),
             process: plan.process.clone(),
-            setups: plan.setups().map(|orientation| orientation.up).collect(),
+            setups: plan.setups().map(axis).collect(),
+            orientation: plan.orientation.clone(),
         }
     }
 }
@@ -1008,7 +1379,7 @@ pub struct Structure {
 
 /// 製造案に依る判定材料。製造法に当てはまらないmaskは空である。
 pub struct Manufacture {
-    /// 一辺`min_wall_mm`の立方体以上の大きさを持つ薄肉領域。
+    /// 表面の法線方向の肉厚が`min_wall_mm`に満たない領域。
     pub thin: Vec<bool>,
     /// FDMとUV樹脂: bridgeでも支持されないcell。
     pub unsupported: Vec<bool>,
@@ -1099,27 +1470,11 @@ impl Grid {
     pub fn manufacture(&self, limits: &Limits, void: &[bool]) -> Manufacture {
         let pitch = self.pitch;
         // 量子化の誤差を失敗側へ倒すため、要求値にgrid間隔を足した長さを求める。
-        let required_run = ((limits.min_wall_mm + pitch) / pitch).ceil() as usize;
-        let runs = self.axial_runs();
-        let thin_cells: Vec<bool> = self
-            .occupied
-            .iter()
-            .zip(runs.iter())
-            .map(|(solid, run)| *solid && *run < required_run)
-            .collect();
-        // 面の縁や稜線は必ず薄くなる。一辺min_wall_mmの立方体に満たない領域は
-        // 形状の縁であり、壁の薄さを示さないため数えない。
-        let minimum_cells = (limits.min_wall_mm.powi(3) / pitch.powi(3)).ceil() as usize;
-        let (labels, sizes) = self.labels(&thin_cells);
-        let thin: Vec<bool> = labels
-            .iter()
-            .map(|label| *label > 0 && sizes[*label as usize - 1] >= minimum_cells)
-            .collect();
-        let kept: Vec<usize> = sizes
-            .iter()
-            .copied()
-            .filter(|size| *size >= minimum_cells)
-            .collect();
+        let required = (limits.min_wall_mm + pitch) / pitch;
+        let thin = self.thin_chords(required);
+        // 薄い壁の角では、壁と斜めにだけ接する1 cellの薄肉が残る。辺と頂点でも連結して
+        // 1つの領域に数える。
+        let thin_sizes = self.labels_by(&thin, &NEIGHBOURS_26).1;
 
         let count = self.occupied.len();
         let (unsupported, unsupported_cells, spanned_cells) = match limits.process.layering() {
@@ -1181,8 +1536,8 @@ impl Grid {
             corner,
             undercut,
             thick,
-            thin_regions: kept.len(),
-            largest_thin: kept.iter().copied().max().unwrap_or(0),
+            thin_regions: thin_sizes.len(),
+            largest_thin: thin_sizes.iter().copied().max().unwrap_or(0),
             unsupported_cells,
             spanned_cells,
             thickest_cells,
@@ -1543,6 +1898,11 @@ impl Grid {
 
     /// 6-連結の連結成分のlabel (0は対象外、kは1始まり) と、各成分のcell数。
     fn labels(&self, mask: &[bool]) -> (Vec<u32>, Vec<usize>) {
+        self.labels_by(mask, &NEIGHBOURS)
+    }
+
+    /// `neighbours`で連結する成分のlabelと、各成分のcell数。
+    fn labels_by(&self, mask: &[bool], neighbours: &[(i32, i32, i32)]) -> (Vec<u32>, Vec<usize>) {
         let mut labels = vec![0u32; mask.len()];
         let mut stack = Vec::new();
         let mut sizes = Vec::new();
@@ -1560,11 +1920,11 @@ impl Grid {
                 let x = index % nx;
                 let y = (index / nx) % ny;
                 let z = index / (nx * ny);
-                for (dx, dy, dz) in NEIGHBOURS {
+                for (dx, dy, dz) in neighbours {
                     let (Some(nx_), Some(ny_), Some(nz_)) = (
-                        checked_step(x, dx, nx),
-                        checked_step(y, dy, ny),
-                        checked_step(z, dz, nz),
+                        checked_step(x, *dx, nx),
+                        checked_step(y, *dy, ny),
+                        checked_step(z, *dz, nz),
                     ) else {
                         continue;
                     };
@@ -1621,30 +1981,47 @@ impl Grid {
     /// maskの連結成分ごとの外接box。大きい成分から`MAX_LOCATIONS`件までと、成分の総数。
     /// `margin_mm`だけ各方向へ広げる。cellは中心から半pitchの範囲を占める。
     pub fn locations(&self, mask: &[bool], margin_mm: f64) -> (Vec<Location>, usize) {
-        let (labels, sizes) = self.labels(mask);
-        let mut low = vec![[usize::MAX; 3]; sizes.len()];
-        let mut high = vec![[0usize; 3]; sizes.len()];
-        let [nx, ny, _] = self.size;
+        self.locations_by(mask, margin_mm, &NEIGHBOURS)
+    }
+
+    /// `neighbours`で連結する成分ごとの外接box。
+    fn locations_by(
+        &self,
+        mask: &[bool],
+        margin_mm: f64,
+        neighbours: &[(i32, i32, i32)],
+    ) -> (Vec<Location>, usize) {
+        let (labels, sizes) = self.labels_by(mask, neighbours);
+        // cellの中心を組立座標で囲む。傾けた格子では中心を組立座標へ戻してから囲む。
+        // 格子の箱を回して囲むと、斜めに長い領域では箱が大きくなりすぎるためである。
+        let back = self.rotation.as_ref().map(transpose);
+        let mut low = vec![[f64::INFINITY; 3]; sizes.len()];
+        let mut high = vec![[f64::NEG_INFINITY; 3]; sizes.len()];
         for (index, label) in labels.iter().enumerate() {
             if *label == 0 {
                 continue;
             }
-            let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
+            let mut centre = self.centre_of(index);
+            if let Some(back) = &back {
+                centre = apply(back, centre);
+            }
             let slot = *label as usize - 1;
-            for axis in 0..3 {
-                low[slot][axis] = low[slot][axis].min(cell[axis]);
-                high[slot][axis] = high[slot][axis].max(cell[axis]);
+            for (axis, value) in centre.into_iter().enumerate() {
+                low[slot][axis] = low[slot][axis].min(value);
+                high[slot][axis] = high[slot][axis].max(value);
             }
         }
         let mut order: Vec<usize> = (0..sizes.len()).collect();
         order.sort_by(|a, b| sizes[*b].cmp(&sizes[*a]).then(a.cmp(b)));
-        let half = self.pitch / 2.0 + margin_mm;
+        // cellは中心から半pitchの範囲を占める。傾けたcellは対角の半分まで張り出す。
+        let reach = if back.is_some() { 3f64.sqrt() } else { 1.0 };
+        let half = self.pitch / 2.0 * reach + margin_mm;
         let boxes = order
             .into_iter()
             .take(MAX_LOCATIONS)
             .map(|slot| Location {
-                min: std::array::from_fn(|axis| self.centre(axis, low[slot][axis]) - half),
-                max: std::array::from_fn(|axis| self.centre(axis, high[slot][axis]) + half),
+                min: std::array::from_fn(|axis| low[slot][axis] - half),
+                max: std::array::from_fn(|axis| high[slot][axis] + half),
             })
             .collect();
         (boxes, sizes.len())
@@ -1652,20 +2029,24 @@ impl Grid {
 }
 
 /// 1つの占有格子に対する最終形状のrule。plansは製造案と、採用したものかの組である。
+///
+/// 傾けた姿勢の製造案は`tilted`が作る製造機の座標の格子で判定する。形状だけで決まる
+/// rule (接続部、閉空洞) は組立座標の格子で1回だけ判定する。
 fn evaluate_grid(
     grid: &Grid,
     target: &str,
     policy: &Policy,
     plans: &[(&ManufacturingPlan, bool)],
-) -> Vec<Check> {
+    tilted: &dyn Fn(&Orientation) -> Result<Grid, String>,
+) -> Result<Vec<Check>, String> {
     let pitch = grid.pitch;
     let solid_cells = grid.occupied_cells();
     if solid_cells == 0 {
         // 空形状はvalid_solidが扱う。ここでは判定材料が無いことを明示する。
-        return Rule::VOXEL
+        return Ok(Rule::VOXEL
             .into_iter()
             .map(|rule| check(rule, target, false, "rasterized geometry is empty".into()))
-            .collect();
+            .collect());
     }
     let cell_mm3 = pitch.powi(3);
     let located = |mut result: Check, mask: &[bool], margin: f64| {
@@ -1717,26 +2098,49 @@ fn evaluate_grid(
 
     for (plan, adopted) in plans {
         let limits = Limits::of(plan);
-        let made = grid.manufacture(&limits, &structure.void);
+        // 傾けた姿勢では、製造機の座標の格子とその閉空洞で判定する。
+        let machine = if plan.orientation.is_tilted() {
+            let machine = tilted(&plan.orientation)?;
+            let void = machine.enclosed_void_mask();
+            Some((machine, void))
+        } else {
+            None
+        };
+        let (plan_grid, void) = match &machine {
+            Some((machine, void)) => (machine, void.as_slice()),
+            None => (grid, structure.void.as_slice()),
+        };
+        let made = plan_grid.manufacture(&limits, void);
+        let located_by = |mut result: Check, mask: &[bool], margin: f64, neighbours: &[_]| {
+            if result.status == Status::Fail {
+                let (locations, total) = plan_grid.locations_by(mask, margin, neighbours);
+                result.message.push_str(&format!("; {total} location(s)"));
+                result.locations = locations;
+            }
+            result
+        };
+        let located = |result: Check, mask: &[bool], margin: f64| {
+            located_by(result, mask, margin, &NEIGHBOURS)
+        };
         let planned_check = |rule: Rule, passed: bool, message: String| {
             planned(rule, target, Some(&plan.id), *adopted, passed, message)
         };
-        checks.push(located(
+        checks.push(located_by(
             planned_check(
                 Rule::FinalWallThickness,
                 made.thin_regions == 0,
                 format!(
-                    "{} region(s) thinner than {} mm; largest {:.3} mm³ of {:.3} mm³; grid {} mm; regions below {} mm³ are treated as edges",
+                    "{} region(s) thinner than {} mm across the surface normal; largest {:.3} mm³ of {:.3} mm³; grid {} mm",
                     made.thin_regions,
                     limits.min_wall_mm,
                     made.largest_thin as f64 * cell_mm3,
-                    solid_cells as f64 * cell_mm3,
-                    pitch,
-                    limits.min_wall_mm.powi(3)
+                    plan_grid.occupied_cells() as f64 * cell_mm3,
+                    pitch
                 ),
             ),
             &made.thin,
             0.0,
+            &NEIGHBOURS_26,
         ));
         match limits.process.layering() {
             Some((overhang, bridge)) => checks.push(located(
@@ -1747,7 +2151,7 @@ fn evaluate_grid(
                         "{:.3} mm³ unsupported beyond {}° from {}; {:.3} mm³ carried by bridges up to {} mm; grid {} mm; slicer settings are not modelled",
                         made.unsupported_cells as f64 * cell_mm3,
                         overhang,
-                        limits.up,
+                        limits.orientation,
                         made.spanned_cells as f64 * cell_mm3,
                         bridge,
                         pitch
@@ -1788,7 +2192,7 @@ fn evaluate_grid(
                         made.suction_regions == 0,
                         format!(
                             "{} cup(s) sealed toward the build plate while printing along {}; cups narrower than {drain} mm are ignored; grid {pitch} mm",
-                            made.suction_regions, limits.up
+                            made.suction_regions, limits.orientation
                         ),
                     ),
                     &made.suction,
@@ -1836,13 +2240,13 @@ fn evaluate_grid(
                         format!(
                             "{:.3} mm³ cannot be released toward {} or the opposite direction; side actions are not modelled; grid {pitch} mm",
                             made.undercut_cells as f64 * cell_mm3,
-                            limits.up
+                            limits.orientation
                         ),
                     ),
                     &made.undercut,
                     0.0,
                 ));
-                let thick_regions = grid.labels(&made.thick).1.len();
+                let thick_regions = plan_grid.labels(&made.thick).1.len();
                 checks.push(located(
                     planned_check(
                         Rule::MoldThickWall,
@@ -1867,7 +2271,7 @@ fn evaluate_grid(
             Process::Fdm { .. } => {}
         }
     }
-    checks
+    Ok(checks)
 }
 
 #[cfg(test)]
@@ -1901,7 +2305,7 @@ mod tests {
                 overhang_angle_deg: overhang,
                 bridge_max_mm: bridge,
             },
-            orientation: Orientation { up, turn_deg: 0 },
+            orientation: Orientation::facing(up),
             source: "test".into(),
         }
     }
@@ -2115,6 +2519,38 @@ mod tests {
         ]);
         let checks = evaluate(&model_with(bridged, policy(1.0, 1.0, 0.5))).unwrap();
         assert_eq!(status(&checks, Rule::SupportFree), Status::Pass);
+    }
+
+    /// 2本の柱と、その上に渡した板を、z軸周りに30°回したmesh。柱の間はgap mmである。
+    fn turned_bridge(gap: f64) -> Vec<u8> {
+        let (s, c) = 30f64.to_radians().sin_cos();
+        let right = 4.0 + gap;
+        let triangles: Vec<[[f64; 3]; 3]> = [
+            box_triangles([0., 0., 0.], [4., 4., 6.], false),
+            box_triangles([right, 0., 0.], [right + 4., 4., 6.], false),
+            box_triangles([0., 0., 6.], [right + 4., 4., 8.], false),
+        ]
+        .concat()
+        .into_iter()
+        .map(|triangle| triangle.map(|[x, y, z]| [c * x - s * y, s * x + c * y, z]))
+        .collect();
+        binary_stl(&triangles, b"bridge")
+    }
+
+    #[test]
+    fn bridges_across_the_grid_axes_are_found() {
+        // 板は格子の軸から30°回っている。4 mmの隙間は5 mmのbridgeで渡せ、12 mmは渡せない。
+        // 重なった柱と板はmeshの上で和として扱う。
+        let setup = policy(1.0, 1.0, 0.5);
+        let short = stl(&turned_bridge(4.0), "bridge", &setup).unwrap();
+        let message = &short
+            .iter()
+            .find(|c| c.rule == Rule::SupportFree)
+            .unwrap()
+            .message;
+        assert_eq!(status(&short, Rule::SupportFree), Status::Pass, "{message}");
+        let wide = stl(&turned_bridge(12.0), "bridge", &setup).unwrap();
+        assert_eq!(status(&wide, Rule::SupportFree), Status::Fail);
     }
 
     #[test]
@@ -2546,7 +2982,7 @@ mod tests {
                 bridge_max_mm: 5.0,
                 min_drain_mm: min_drain,
             },
-            orientation: Orientation { up, turn_deg: 0 },
+            orientation: Orientation::facing(up),
             source: "test".into(),
         }
     }
@@ -2675,15 +3111,9 @@ mod tests {
                 min_wall_mm: 0.5,
                 tool_diameter_mm: diameter,
                 tool_length_mm: length,
-                additional_setups: more
-                    .iter()
-                    .map(|up| Orientation {
-                        up: *up,
-                        turn_deg: 0,
-                    })
-                    .collect(),
+                additional_setups: more.iter().map(|up| Orientation::facing(*up)).collect(),
             },
-            orientation: Orientation { up, turn_deg: 0 },
+            orientation: Orientation::facing(up),
             source: "test".into(),
         }
     }
@@ -2696,7 +3126,7 @@ mod tests {
                 min_wall_mm: 0.5,
                 max_wall_mm: max_wall,
             },
-            orientation: Orientation { up, turn_deg: 0 },
+            orientation: Orientation::facing(up),
             source: "test".into(),
         }
     }
@@ -2925,6 +3355,125 @@ mod tests {
         model.policy.voxel_mm = 0.5;
         model.parts[0].manufacturing[0] = milling(20.0, 30.0, Direction::PlusZ, &[]);
         model.validate().unwrap();
+    }
+
+    /// 厚さ`thickness` mm、20 mm角の板を、y軸周りに45°傾けたmesh。
+    fn slanted_plate(thickness: f64) -> Vec<u8> {
+        let (c, s) = (
+            std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        );
+        let triangles: Vec<[[f64; 3]; 3]> =
+            box_triangles([-10., -10., 0.], [10., 10., thickness], false)
+                .into_iter()
+                .map(|triangle| triangle.map(|[x, y, z]| [c * x + s * z, y, -s * x + c * z]))
+                .collect();
+        binary_stl(&triangles, b"slanted")
+    }
+
+    #[test]
+    fn slanted_walls_are_measured_across_their_normal() {
+        // 厚さ1.4 mmの45°の壁は、軸方向の連続長では1.98 mmとなり要求 (1.2 + 0.5 mm) を満たして
+        // 見える。法線方向の弦長は1.4 mmを測り、薄肉とする。
+        let setup = with_plan(fdm(1.2, 45.0, 5.0, Direction::PlusZ));
+        let thin = stl(&slanted_plate(1.4), "plate", &setup).unwrap();
+        assert_eq!(status(&thin, Rule::FinalWallThickness), Status::Fail);
+        let thick = stl(&slanted_plate(2.5), "plate", &setup).unwrap();
+        assert_eq!(status(&thick, Rule::FinalWallThickness), Status::Pass);
+    }
+
+    #[test]
+    fn a_ring_around_a_hole_is_measured_radially() {
+        // 外径6 mm、下穴2.1 mmのbossの肉は1.95 mm。格子化した穴の段差で法線が乱れても、
+        // 1.2 mmに格子1つ分を加えた要求を満たす。
+        let boss = part(vec![
+            add("floor", box_shape([0.; 3], [23., 23., 2.])),
+            add(
+                "boss",
+                Shape::Cylinder {
+                    axis: crate::Axis::Z,
+                    center: [11.5, 11.5],
+                    radius: 3.0,
+                    span: [1.0, 7.0],
+                },
+            ),
+            z_cylinder("pilot", [11.5, 11.5], 1.05, [2.0, 8.0]),
+        ]);
+        let checks = evaluate(&model_with(
+            boss,
+            with_plan(fdm(1.2, 45.0, 5.0, Direction::PlusZ)),
+        ))
+        .unwrap();
+        let wall = checks
+            .iter()
+            .find(|c| c.rule == Rule::FinalWallThickness)
+            .unwrap();
+        assert_eq!(wall.status, Status::Pass, "{}", wall.message);
+    }
+
+    fn tilted(tilt_deg: f64) -> Setup {
+        let mut setup = policy(1.2, 1.0, 0.5);
+        setup.plan.orientation = Orientation {
+            up: Direction::PlusZ,
+            turn_deg: 90.0,
+            tilt_deg,
+        };
+        setup
+    }
+
+    #[test]
+    fn a_plate_tilted_beyond_the_overhang_angle_needs_no_support() {
+        // 20 mm角、厚さ2 mmの板。60°傾けると下面は鉛直から30°で、支持なしで積める。
+        // 30°では下面が鉛直から60°となり、45°を超えて支持を要する。
+        let plate = || part(vec![add("plate", box_shape([0.; 3], [20., 20., 2.]))]);
+        let steep = evaluate(&model_with(plate(), tilted(60.0))).unwrap();
+        assert_eq!(status(&steep, Rule::SupportFree), Status::Pass);
+        // 肉厚は傾けた格子でも板の法線の向きに測る。
+        assert_eq!(status(&steep, Rule::FinalWallThickness), Status::Pass);
+        let shallow = evaluate(&model_with(plate(), tilted(30.0))).unwrap();
+        assert_eq!(status(&shallow, Rule::SupportFree), Status::Fail);
+        let message = &shallow
+            .iter()
+            .find(|c| c.rule == Rule::SupportFree)
+            .unwrap()
+            .message;
+        assert!(
+            message.contains("plus_z turned 90° and tilted 30°"),
+            "{message}"
+        );
+        // 検出箇所は組立座標で板を囲む。
+        for location in locations(&shallow, Rule::SupportFree) {
+            for axis in 0..3 {
+                assert!(
+                    location.min[axis] > -3.0 && location.max[axis] < 23.0,
+                    "{location:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tilted_sections_are_cut_in_assembly_coordinates() {
+        let plate = part(vec![add("plate", box_shape([0.; 3], [20., 20., 2.]))]);
+        let model = model_with(plate, tilted(30.0));
+        let planes = [Plane {
+            axis: Axis::Z,
+            coordinate: Some(1.0),
+        }];
+        let sections = sections_of_part(&model, "block", None, &planes).unwrap();
+        // 断面は組立座標の板を水平に切り、支持のない下面側のcellを含む。
+        assert!(count_bits(&sections[0], SECTION_SOLID) > 1500);
+        let flat = sections_of_part(
+            &model_with(
+                part(vec![add("plate", box_shape([0.; 3], [20., 20., 2.]))]),
+                tilted(60.0),
+            ),
+            "block",
+            None,
+            &planes,
+        )
+        .unwrap();
+        assert_eq!(count_bits(&flat[0], SECTION_UNSUPPORTED), 0);
     }
 
     #[test]

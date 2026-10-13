@@ -92,10 +92,12 @@ class Resin:
 @dataclass(frozen=True)
 class Orientation:
     """製造時の姿勢。upは製造機の+Z (積層方向、工具を下ろす側、型を開く軸) に向ける組立座標の
-    方向、turn_degはそのあと製造機の+Z周りに回す角度 (0、90、180、270)。"""
+    方向、turn_degはそのあと製造機の+Z周りに回す角度 (0以上360未満)、tilt_degはさらに
+    製造機のX軸周りに傾ける角度 (0〜90)。tilt_degが0ならturn_degは検査の結果を変えない。"""
 
     up: Direction = "plus_z"
-    turn_deg: int = 0
+    turn_deg: float = 0.0
+    tilt_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -408,7 +410,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 11
+    schema_version: int = 12
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)

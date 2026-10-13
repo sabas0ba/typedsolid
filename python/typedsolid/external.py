@@ -107,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         "--build-direction", choices=get_args(Direction), default="plus_z",
         help="製造案の姿勢のup。積層方向、切削で工具を下ろす側、成形で型を開く軸",
     )
+    parser.add_argument("--turn-deg", type=float, default=0.0, help="製造案の姿勢のturn_deg (製造機の+Z周り)")
+    parser.add_argument("--tilt-deg", type=float, default=0.0, help="製造案の姿勢のtilt_deg (製造機のX軸周り、0〜90)")
     parser.add_argument("--min-wall-mm", type=float, help=f"fdmの既定値は{fdm.min_wall_mm}")
     parser.add_argument("--overhang-angle-deg", type=float, help=f"fdmとresin。fdmの既定値は{fdm.overhang_angle_deg}")
     parser.add_argument("--bridge-max-mm", type=float, help=f"fdmとresin。fdmの既定値は{fdm.bridge_max_mm}")
@@ -123,7 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     policy = replace(defaults, voxel_mm=args.voxel_mm, min_neck_mm=args.min_neck_mm)
     process = _process(parser, args)
-    plan = ManufacturingPlan(args.process, process, "command line", Orientation(args.build_direction))
+    orientation = Orientation(args.build_direction, args.turn_deg, args.tilt_deg)
+    plan = ManufacturingPlan(args.process, process, "command line", orientation)
     checks, part = _inspect(args.path, policy, plan, None, args.figures)
     if part is not None:
         # 標準出力は結果 (--jsonではJSON) だけとし、viewerの大きさは標準エラーに書く。

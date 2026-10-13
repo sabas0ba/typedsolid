@@ -216,7 +216,7 @@ model = Model(parts=(tray, lid), default_manufacturing=profile.plan(up="plus_y")
               materials=(profile.material,), snap_fits=(clip.snap,))
 ```
 
-梁の長さ方向を、梁を持つ部品の採用した製造案の積層方向と平行にすると`layer`が落ちる。この例では梁が縦に立つため、積層方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。部品ごとに姿勢を変える場合は、`Part(manufacturing=...)`で蓋だけに与える。検査項目は [設計](design.md#snap-fitの検査) を参照する。
+梁の長さ方向と、梁を持つ部品の製造案の積層方向の間の角が45°未満だと`layer`が落ちる。この例では梁が縦に立つため、積層方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。横倒しにできない場合は、`Orientation(up, turn_deg, tilt_deg)`で蓋を45°以上傾ける。部品ごとに姿勢を変える場合は、`Part(manufacturing=...)`で蓋だけに与える。検査項目は [設計](design.md#snap-fitの検査) を参照する。
 
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
@@ -251,7 +251,7 @@ power = connector_opening(
 
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
-肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向、切削で工具を下ろす側、射出成形で型を開く軸) に向ける方向である。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
+肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向、切削で工具を下ろす側、射出成形で型を開く軸) に向ける方向である。`Orientation(up, turn_deg, tilt_deg)`は、`up`を+Zへ向けた後に+Z周りに`turn_deg`回し、製造機のX軸周りに`tilt_deg` (0〜90) 傾ける。傾けた製造案は部品を製造機の座標で格子化し直して判定する。切削の段取りは傾けられない。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
 
 ```python
 from typedsolid import Fdm, ManufacturingPlan, Orientation, Part, Resin
@@ -263,6 +263,9 @@ upright = ManufacturingPlan("fdm_upright", printer, "手持ちの印刷機で確
 resin = ManufacturingPlan("resin", Resin(min_wall_mm=1.2, overhang_angle_deg=30.0, bridge_max_mm=15.0,
                                          min_drain_mm=3.0), "樹脂の推奨値")
 lid = Part("lid", features, manufacturing=(upside_down, upright, resin), adopted="fdm_upside_down")
+# 裏返した後、+Z周りに180°回してX軸周りに50°傾ける。積層方向は組立座標で後方の下を向く。
+tilted = ManufacturingPlan("fdm_tilted", printer, "手持ちの印刷機で確かめたbridge長",
+                           orientation=Orientation("minus_z", turn_deg=180.0, tilt_deg=50.0))
 ```
 
 切削と射出成形の案も同じ部品に並べられる。値は既定値を持たず、工具や成形条件の資料から与える。
@@ -301,7 +304,7 @@ molding = ManufacturingPlan("molding", Molding(min_wall_mm=1.2, max_wall_mm=3.0)
 .venv/bin/python -m typedsolid.external path/to/case.stl --process molding --min-wall-mm 1.2 --max-wall-mm 3
 ```
 
-製造案は`--process`と`--build-direction` (製造案の`up`) と、製造法の特性のoptionから1件を作る。他の製造法のoptionを与えると拒否する。
+製造案は`--process`と`--build-direction` (製造案の`up`)、`--turn-deg`、`--tilt-deg`と、製造法の特性のoptionから1件を作る。他の製造法のoptionを与えると拒否する。
 
 | `--process` | 特性のoption |
 | --- | --- |
