@@ -363,7 +363,7 @@ Python APIの`connector_opening`は、抜く向き、プラグ断面の中心と
 ### 解析ケース
 
 - `StructuralCase`は`id`、`part`、変位を0に拘束する`supports` (領域の列)、`forces` (領域と合計の力`newtons` [N])、許容応力を割る`safety_factor` (1〜100)、任意の`max_deflection_mm`、任意の`voxel_mm`を持つ。材料に`elastic`と`allowable_stress_mpa`が必要で、採用した製造案が積層する製造法 (FDM、光造形) なら`interlayer_allowable_stress_mpa`も必要である。
-- `ThermalCase`は`id`、`part`、`heat_inputs` (領域と`watts`)、`fixed_temperatures` (領域と`celsius`)、`convection` (領域、熱伝達係数`h_w_per_m2k`、周囲温度`ambient_c`)、上限`max_temperature_c`、任意の`voxel_mm`を持つ。熱の出口として対流か固定温度が1つ以上必要である。筐体内の空気は利用者が与える周囲温度として扱い、空気の流れは解かない。接触熱抵抗と放射は扱わない。
+- `ThermalCase`は`id`、`part`、`heat_inputs` (領域と`watts`)、`fixed_temperatures` (領域と`celsius`)、`convection` (領域、熱伝達係数`h_w_per_m2k`、周囲温度`ambient_c`)、上限`max_temperature_c`、任意の`voxel_mm`を持つ。熱の出口として対流か固定温度が1つ以上必要である。異なる温度の固定温度の領域が節点を共有する場合は、記述順で解が変わるためnot_evaluatedとする。筐体内の空気は利用者が与える周囲温度として扱い、空気の流れは解かない。接触熱抵抗と放射は扱わない。
 - 領域は`surface` (表面すべて)、`box` (軸平行のbox内の表面)、`fastener` (baseの部品では下穴の壁、clampの部品では頭の座面)、`keepout` (keepoutの箱に接する表面)、`connector` (コネクタ開口の縁) である。Boolean後の面番号は使わない。格子の露出した面のうち、面の中心が領域に入るものを選ぶ。参照による領域は、最も粗い格子の段を含めるため`2·voxel_mm`だけ広げる。1つの面は、先に書いた対流の領域にだけ属する。
 - 力と熱量は、領域の表面へ一様に分布させる。
 

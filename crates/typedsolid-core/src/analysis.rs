@@ -1024,6 +1024,8 @@ fn solve_thermal(
     let faces = mesh.exposed_faces();
     let mut fixed: Vec<bool> = (0..n).map(|node| !mesh.active[node]).collect();
     let mut temperature = vec![0.0; n];
+    // 節点に固定した温度。異なる温度の領域が節点を共有すると、記述順で解が変わるため解かない。
+    let mut assigned: Vec<Option<f64>> = vec![None; n];
     for item in &case.fixed_temperatures {
         let selected = region_faces(&mesh, model, part, &item.region, &faces, reach);
         if selected.is_empty() {
@@ -1034,6 +1036,15 @@ fn solve_thermal(
         }
         for (cell, axis, positive) in selected {
             for node in mesh.face_nodes(cell, axis, positive) {
+                if let Some(other) = assigned[node]
+                    && other != item.celsius
+                {
+                    return Ok(Err(format!(
+                        "fixed temperatures {other} °C and {} °C meet at the same surface at grid {pitch} mm",
+                        item.celsius
+                    )));
+                }
+                assigned[node] = Some(item.celsius);
                 fixed[node] = true;
                 temperature[node] = item.celsius;
             }
@@ -1816,6 +1827,39 @@ mod tests {
         assert!(!check.locations.is_empty());
         let maximum = value(check, "maximum temperature");
         assert!((maximum - 145.625).abs() < 0.01, "{}", check.message);
+    }
+
+    #[test]
+    fn conflicting_fixed_temperatures_are_not_evaluated() {
+        // 両端の領域が中央の断面で重なり、20 °Cと80 °Cが同じ節点に掛かる。順序で解が変わるため解かない。
+        for order in [[20.0, 80.0], [80.0, 20.0]] {
+            let model = rod(|case| {
+                case.fixed_temperatures = vec![
+                    FixedTemperature {
+                        region: Region::Box {
+                            min: [-1.0, -1.0, -1.0],
+                            max: [10.0, 100.0, 100.0],
+                        },
+                        celsius: order[0],
+                    },
+                    FixedTemperature {
+                        region: Region::Box {
+                            min: [10.0, -1.0, -1.0],
+                            max: [21.0, 100.0, 100.0],
+                        },
+                        celsius: order[1],
+                    },
+                ];
+            });
+            let checks = evaluate(&model).unwrap();
+            let check = find(&checks, "heat/temperature");
+            assert_eq!(check.status, Status::NotEvaluated, "{}", check.message);
+            assert!(
+                check.message.contains("meet at the same surface"),
+                "{}",
+                check.message
+            );
+        }
     }
 
     #[test]
