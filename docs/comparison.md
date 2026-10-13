@@ -45,15 +45,15 @@ sha256sum .work/external/parts_holder.stl       # 上表の値と照合する
 | MiSTeryNano蓋 | pass | pass | pass | fail (0.128 mm³) |
 | Framework Expansion Card筐体 | fail (7領域、最大132.2 mm³) | pass | pass | fail (2.816 mm³、bridge 0.576 mm³) |
 
-- **Tang Nano 9K 部品holder**: 体積126,124 mm³ (格子上)。4 ruleとも通る。
+- **Tang Nano 9K 部品holder**: 体積126,124 mm³ (格子上)。4 ruleすべてに合格する。
 - **MiSTeryNano筐体**: 向き付きで対にならない辺が8本あり、閉じていないか向きが不整合なmeshとして評価を拒否した。T字接続か実際の隙間かは区別していない。
 - **MiSTeryNano蓋**: 0.128 mm³ (0.2 mm格子で16 cell) の未支持を検出した。0.1 mm格子では0.076 mm³となる。局所的な小さい張り出しである。`support_free`はslicer条件を含まない保守的な近似であり、実際の印刷で支持が要るかは別途slicerで確かめる。
-- **Framework Expansion Card筐体**: 1.2 mm未満の領域が7つある。`min_wall_mm`を1.0とすると9領域 (最大34.4 mm³)、0.8としても12領域 (最大19.6 mm³) が残る。値を下げると縁とみなす領域の下限 (`min_wall_mm`³) も下がるため、領域数は減るとは限らない。標準policyの1.2 mmより薄い造作を持つ設計である。
+- **Framework Expansion Card筐体**: 1.2 mm未満の領域が7つある。`min_wall_mm`を1.0とすると9領域 (最大34.4 mm³)、0.8としても12領域 (最大19.6 mm³) が残る。値を下げると縁とみなす領域の下限 (`min_wall_mm`³) も下がるため、領域数は減るとは限らない。標準policyの1.2 mmより薄い形状を含む設計である。
 
 同じリポジトリの`ExpansionCard_SelfTapping.stp`は、印刷する筐体のほかに、厚さ0.8 mmの板と小さな部品2つの計4 solidを含む組立体である。印刷用のSTLと対象が異なるため比較に用いない。
 
 ## 解釈
 
-- 既知の欠陥fixture (`tests/test_enclosure_fixtures.py`) を自前のIRからSTLとSTEPへ出力し、この経路でもIRの経路と同じruleが落ちることを`tests/test_external.py`で確かめている。
+- 既知の欠陥fixture (`tests/test_enclosure_fixtures.py`) をTypedSolidのIRからSTLとSTEPへ出力し、この経路でもIRの経路と同じruleが不合格となることを`tests/test_external.py`で確かめている。
 - 第三者の筐体では、判定が作者の設計前提 (肉厚、印刷の向き、slicer設定) に強く依存する。failは欠陥の断定ではなく、標準policyとの差を示す。`--min-wall-mm`や`--build-direction`を作者の前提に合わせて与えると、差の内訳を確かめられる。
 - 閉じていないmeshは評価しない。検査の前提 (内外が定まること) が成り立たないためである。

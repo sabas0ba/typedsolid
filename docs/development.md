@@ -53,7 +53,7 @@ make clean-cache   # 生成cacheを消す
 
 Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative moduleを読み込む統合testで検証し、libpythonをリンクするembedding用Rust testとは分離する。bindingもworkspace全体のclippy検査に含める。
 
-`tests/test_enclosure_fixtures.py`は、開口を持つ筐体に既知の欠陥を1つずつ入れ、落ちるruleの集合が宣言と完全に一致することを見る。個々のruleは単純形状のtestが検証しており、ここで確かめるのは実形状での成立と過検出の不在である。詳細は [ロードマップ](roadmap.md) を参照する。
+`tests/test_enclosure_fixtures.py`は、開口を持つ筐体に既知の欠陥を1つずつ入れ、不合格となるruleの集合が宣言と完全に一致することを検証する。個々のruleは単純形状のtestが検証しており、ここで確かめるのは実際の筐体形状での欠陥検出と過検出の有無である。詳細は [ロードマップ](roadmap.md) を参照する。
 
 別の出力先を使う場合:
 
@@ -77,7 +77,7 @@ Rust unit testはcoreを対象とする。PyO3 bindingはPythonからnative modu
 
 `examples/electronics_enclosure.py`は80×55×24 mm、床・壁厚2 mmの上面開放の筐体を生成する。床から立つφ8 mmのboss 4個を上面z=6 mmの支持面とし、φ3 mmの穴で床とbossを貫く。前面にz=7 mmから上端までの幅20 mmのコネクタ用切り欠き、背面に3×10 mmの通気スリット5本を開ける。60×35×3 mmの基板領域をbossの上に確保し、+Zへ抜けることを検査する。寸法は説明用で、特定の基板やコネクタの仕様ではない。
 
-前面の開口は上端まで開けた切り欠きとしている。上端を閉じた窓にすると上辺が幅20 mmのbridgeとなり、既定の`bridge_max_mm` (5 mm) で`support_free`が落ちる。使用する印刷機がそれ以上を渡せることを確かめた場合は、製造案の`Fdm(bridge_max_mm=...)`で指定して窓にできる。
+前面の開口は上端まで開けた切り欠きとしている。上端を閉じた窓にすると上辺が幅20 mmのbridgeとなり、既定の`bridge_max_mm` (5 mm) で`support_free`が不合格となる。使用する印刷機で幅20 mm以上のbridgeを造形できることを確認した場合は、製造案の`Fdm(bridge_max_mm=...)`で指定して窓にできる。
 
 ```bash
 .venv/bin/python examples/electronics_enclosure.py --output .work/electronics-enclosure
@@ -152,7 +152,7 @@ pcb = Keepout("pcb", Box((8, 8, 4), (32, 32, 10)), Clearance(default=0.5, minus_
 pull = Step("pull_tray", ("tray",), (Move("minus_y"),))
 ```
 
-catalogの`board.keepout(..., attached_to="tray")`でも指定できる。取付先を省いたkeepoutは外部に固定されたものとして最後まで残り、そこを通る分解経路は`disassembly_path`で落ちる。
+catalogの`board.keepout(..., attached_to="tray")`でも指定できる。取付先を省いたkeepoutは外部に固定されたものとして最後まで残り、そこを通る分解経路は`disassembly_path`で不合格となる。
 
 `Keepout(access=("plus_z",))`は、組立完了の状態で外まで抜く`Sweep("pcb_plus_z", "plus_z", keepout="pcb")`の省略形である。
 
@@ -176,7 +176,7 @@ lid = Part("lid", (Feature("panel", Box((0, 0, 10), (40, 30, 12))),) + corner.cl
 model = Model(parts=(tray, lid), sweeps=(corner.sweep,), fasteners=(corner.fastener,))
 ```
 
-ネジを外す手順がある場合は`release=Release("open_lid")`のように外す状態を与える。蓋を外すstepより前に外すなら`Release()` (組立完了の状態) とする。省くとネジは外さないものとして扱い、ネジで留めた部品を引き離す分解stepがあると`fastener_release`が落ちる。基板をネジで締める場合は`clamp_keepouts=("pcb",)`で基板のkeepoutを示す。
+ネジを外す手順がある場合は`release=Release("open_lid")`のように外す状態を与える。蓋を外すstepより前に外すなら`Release()` (組立完了の状態) とする。省くとネジは外さないものとして扱い、ネジで留めた部品を引き離す分解stepがあると`fastener_release`が不合格となる。基板をネジで締める場合は`clamp_keepouts=("pcb",)`で基板のkeepoutを示す。
 
 熱圧入インサートを使う場合は`insert=InsertSpec(name, source, hole_mm, length_mm)`を与える。インサートは境目と面一に埋め、下穴はネジの先端と`tip_clearance_mm`の分まで延ばす。検査項目は [設計](design.md#ネジ固定の検査) を参照する。
 
@@ -216,7 +216,7 @@ model = Model(parts=(tray, lid), default_manufacturing=profile.plan(up="plus_y")
               materials=(profile.material,), snap_fits=(clip.snap,))
 ```
 
-梁の長さ方向と、梁を持つ部品の製造案の積層方向の間の角が45°未満だと`layer`が落ちる。この例では梁が縦に立つため、積層方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。横倒しにできない場合は、`Orientation(up, turn_deg, tilt_deg)`で蓋を45°以上傾ける。部品ごとに姿勢を変える場合は、`Part(manufacturing=...)`で蓋だけに与える。検査項目は [設計](design.md#snap-fitの検査) を参照する。
+梁の長さ方向と、梁を持つ部品の製造案の積層方向の間の角が45°未満だと`layer`が不合格となる。この例では梁が縦に立つため、積層方向を`plus_y`とし、蓋を横倒しで印刷する想定にしている。横倒しにできない場合は、`Orientation(up, turn_deg, tilt_deg)`で蓋を45°以上傾ける。部品ごとに姿勢を変える場合は、`Part(manufacturing=...)`で蓋だけに与える。検査項目は [設計](design.md#snap-fitの検査) を参照する。
 
 収める基板が [部品catalog](catalog.md) にある場合は、外形と取付穴を手で書かずにcatalogから取れる。
 
@@ -247,11 +247,11 @@ power = connector_opening(
 # power.featureを前壁の部品へ、power.sweepとpower.connectorをModelへ加える。
 ```
 
-`connector_fit`は開口と掃引とプラグ寸法の整合を、`access_clearance`は抜く経路上の干渉を見る。縦の壁の開口は上縁がbridgeになるため、幅が`bridge_max_mm`を超えると`support_free`が落ちる。詳細は [設計](design.md#コネクタ開口の検査) を参照する。
+`connector_fit`は開口と掃引とプラグ寸法の整合を、`access_clearance`は抜く経路上の干渉を見る。縦の壁の開口は上縁がbridgeになるため、幅が`bridge_max_mm`を超えると`support_free`が不合格となる。詳細は [設計](design.md#コネクタ開口の検査) を参照する。
 
 最終肉厚・接続部断面・閉空洞・支持の要否はIRをrasterizeして判定する。格子は`Policy.voxel_mm` (既定0.2 mm) で、細かいほど正確になり、cell数は3乗で増える。作例 (60×40×20 mm) では0.2 mmで約5秒、0.4 mmで約0.6秒かかる。大きなモデルを扱う場合は格子を粗くする。
 
-肉厚、製造時の姿勢、支持なしで許す傾斜、渡せる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向、切削で工具を下ろす側、射出成形で型を開く軸) に向ける方向である。`Orientation(up, turn_deg, tilt_deg)`は、`up`を+Zへ向けた後に+Z周りに`turn_deg`回し、製造機のX軸周りに`tilt_deg` (0〜90) 傾ける。傾けた製造案は部品を製造機の座標で格子化し直して判定する。切削の段取りは傾けられない。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
+肉厚、製造時の姿勢、支持なしで許す傾斜、bridgeとして造形できる未支持区間の長さは、部品の製造案 (`ManufacturingPlan`) で指定する。IRの座標は組立状態の姿勢であり、製造案の`Orientation(up)`が製造機の+Z (積層方向、切削で工具を下ろす側、射出成形で型を開く軸) に向ける方向である。`Orientation(up, turn_deg, tilt_deg)`は、`up`を+Zへ向けた後に+Z周りに`turn_deg`回し、製造機のX軸周りに`tilt_deg` (0〜90) 傾ける。傾けた製造案は部品を製造機の座標で格子化し直して判定する。切削の段取りは傾けられない。部品が製造案を持たない場合は`Model.default_manufacturing` (既定はFDMで、`min_wall_mm` 1.2、`overhang_angle_deg` 45、`bridge_max_mm` 5.0、`up="plus_z"`) を使う。
 
 ```python
 from typedsolid import Fdm, ManufacturingPlan, Orientation, Part, Resin
@@ -355,7 +355,7 @@ make viewer-check                    # imageを作り、.work/viewer-check に�
 .venv/bin/python scripts/check-viewer.py --chromium /path/to/chromium   # containerを使わない場合
 ```
 
-撮影は`docker run --network none`で行い、書き出したローカルのHTMLだけを開く。各fixtureで概観、checkの選択と半透明、検出箇所の注視、断面の4状態を撮り、部品、検出箇所、断面の色が画面に現れることを確かめる。scriptやWebGLが失敗すると画面が白く残り、検査が落ちる。docsの画像は`--docs docs/assets/viewer`で撮影結果から複製する。画素の値はChromiumの版で変わりうるため、docsの画像とは照合しない。
+撮影は`docker run --network none`で行い、書き出したローカルのHTMLだけを開く。各fixtureで概観、checkの選択と半透明、検出箇所の注視、断面の4状態を撮り、部品、検出箇所、断面の色が画面に現れることを確かめる。scriptやWebGLが失敗すると画面が白く残り、検査が失敗する。docsの画像は`--docs docs/assets/viewer`で撮影結果から複製する。画素の値はChromiumの版で変わりうるため、docsの画像とは照合しない。
 
 ## slicerとの突合
 

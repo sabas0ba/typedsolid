@@ -7,7 +7,7 @@
 - 最終solid数、形状妥当性、keepout、+Zアクセス、部品間干渉
 - 成功・失敗作例、単体/統合test、CI、再現手順
 
-今回のPRの範囲。製造可能性全体を保証する段階ではない。
+M0は初期実装の範囲であり、製造可能性全体を保証する段階ではない。
 
 ## M1: 実用筐体の構造と寸法
 
@@ -23,9 +23,9 @@ catalogは公式資料が寸法線として与える値だけを持ち、記載�
 
 合格条件: 開口を持つ筐体で、薄肉・折れやすい接続・孤立・支持不能箇所の既知の失敗fixtureを検出し、Tang Nano等の既存ケースへ適用して比較する。
 
-fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×26×14 mmの筐体を基準形状とし、欠陥を1つずつ入れて、落ちるruleの集合が宣言と完全に一致することを見る。検出漏れと過検出のどちらもこの比較で落ちる。
+fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×26×14 mmの筐体を基準形状とし、欠陥を1つずつ入れて、不合格となるruleの集合が宣言と完全に一致することを検証する。この比較により、検出漏れと過検出の両方を検出する。
 
-| fixture | 欠陥 | 落ちるrule |
+| fixture | 欠陥 | 不合格となるrule |
 | --- | --- | --- |
 | `baseline` | なし | なし |
 | `thin_wall` | 右壁の内側を削り残り1 mm | `final_wall_thickness` |
@@ -36,7 +36,7 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 `min_neck_mm`は2.0とし、既定の`min_wall_mm` 1.2と分けている。両者が同じ値だと、断面が足りない箇所は必ず肉厚も足りず、2つのruleを区別できない。
 
-既存ケースへは、外部のSTL/STEPへ最終形状のruleを適用する経路 (`typedsolid.external`) で適用した。第三者のファイルはリポジトリに含めず、取得元、commit、sha256と結果だけを [既存ケースとの比較](comparison.md) に記す。Tang Nano 9K用の部品holderは4 ruleとも通り、Tang Nano 20K用のMiSTeryNano筐体は閉じていないmeshのため評価できなかった。
+既存ケースへは、外部のSTL/STEPへ最終形状のruleを適用する経路 (`typedsolid.external`) で適用した。第三者のファイルはリポジトリに含めず、取得元、commit、sha256と結果だけを [既存ケースとの比較](comparison.md) に記す。Tang Nano 9K用の部品holderは4 ruleすべてに合格し、Tang Nano 20K用のMiSTeryNano筐体は閉じていないmeshのため評価できなかった。
 
 ## M2: 組立と保守アクセス
 
@@ -49,7 +49,7 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 実装順はworker隔離、分解stepと着脱検査、掃引、profileとネジ固定、snap fitとする。状態ごとに評価が増えるため、打ち切りとcacheを先に入れる。
 
 - **組立状態**: IRに記述した部品位置を組立状態とし、分解手順を順序付きのstepで表す。各stepは部品を軸平行の直線区間を連ねた経路で動かして取り除く。組立順序は分解の逆とする。回転と任意軸の配置変換は扱わない。
-- **干渉判定**: 着脱と掃引の干渉はOCCTのBooleanで判定し、clearanceは形状間の最短距離で見る。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと正しい設計まで落ちるためである。既存の`part_interference`と同じ方式になる。
+- **干渉判定**: 着脱と掃引の干渉はOCCTのBooleanで判定し、clearanceは形状間の最短距離で見る。はめ合い隙間は0.2〜0.3 mm程度でvoxelの既定pitchと同じ桁にあり、量子化を失敗側に倒すと要件を満たす設計も不合格となるためである。既存の`part_interference`と同じ方式になる。
 - **掃引**: 現在の`access`を一般化し、box又は軸平行cylinderの断面、方向、距離、必要となる分解stepを持つ`Sweep`とする。
 - **数値の出典**: 材料の許容ひずみ、ネジ・インサート寸法は型だけを用意し、値は利用者が与える。catalogと同じく根拠のない既定値を組み込まない。
 - **設計profile**: 材料はIRの`Material`とし、部品へ割り当てる。snap fitの許容ひずみを材料に持たせ、M3の材料定数も同じ型へ追加する。印刷機と設計値はPythonのhelperに留め、IRに現れるのはprofileから作った`Policy`、製造案、はめ合い隙間だけである。
@@ -73,4 +73,4 @@ fixtureは `tests/test_enclosure_fixtures.py` が持つ。上面の開いた36×
 
 ## 後続判断
 
-Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図、OCCTで判定するruleの検出箇所、組立状態の投影図、3D viewer (IRのモデルと外部のSTL/STEP、断面の切り口を含む) を実装した。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開はこのPRでは行わない。
+Nix/Docker環境、Windows/macOSのwheel、API拡張は需要とCI費用を見て追加する。可視化は、最終形状の検出箇所の断面図、OCCTで判定するruleの検出箇所、組立状態の投影図、3D viewer (IRのモデルと外部のSTL/STEP、断面の切り口を含む) を実装した。初期対応はLinux x86_64 / CPython 3.12。公開レジストリへのpublishとGitHub Pages公開は初期対応の対象外とする。
