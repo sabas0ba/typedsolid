@@ -21,14 +21,18 @@ catalogが持たない値、すなわち基板の高さ、PCBの厚み、コネ�
 
 傾けた姿勢では、蓋の縦の面が積層方向に対して50°張り出す。作例の印刷機は55°までの
 張り出しを支持なしで積めるものとする。
+
+底は、基板を締めるbossから受ける熱の定常伝導を解き、最高温度を判定する。強度の解析ケースは
+持たない。蓋を押す荷重は、0.5 mmの格子では厚さ2 mmの天板が4倍の格子で1 cellとなり、通気
+スリットの端とlipの付け根の鋭い内角が応力の特異点となるため、変位も応力も収束しなかった。
 """
 
 from dataclasses import replace
 
 from typedsolid import (
-    Assembly, Box, Clearance, Fdm, Feature, ManufacturingPlan, Material, Milling, Model, Molding, Move, Orientation,
-    Part, PlugSource, Policy, Release, Resin, ScrewSpec, Step, Sweep, board, boss, connector_opening, hole,
-    screw_fixing, snap_fit,
+    Analyses, Assembly, AtKeepout, Box, Clearance, Convection, Elastic, Fdm, Feature, HeatInput, ManufacturingPlan,
+    Material, Milling, Model, Molding, Move, Orientation, Part, PlugSource, Policy, Release, Resin, ScrewSpec, Step,
+    Surface, Sweep, ThermalCase, board, boss, connector_opening, hole, screw_fixing, snap_fit,
 )
 
 PI4 = board("raspberry_pi_4_model_b")
@@ -68,10 +72,14 @@ LID_TILTED = ManufacturingPlan(
 # 比較用。裏返しただけの案と、上面を造形板に置く案。
 LID_UPSIDE_DOWN = ManufacturingPlan("fdm_upside_down", PRINTER, PRINTER_SOURCE, orientation=Orientation("minus_z"))
 LID_UPRIGHT = ManufacturingPlan("fdm_upright", PRINTER, PRINTER_SOURCE)
-# snap fitの梁を持つ蓋の材料。許容ひずみは説明用の値であり、特定の樹脂の値ではない。
-LID_MATERIAL = Material(
+# 底と蓋の材料。値は説明用の値であり、特定の樹脂の値ではない。
+MATERIAL = Material(
     "pla_example", "example PLA", "example value for the typedsolid example, not a material specification",
     allowable_strain=0.02,
+    elastic=Elastic(youngs_modulus_mpa=3500.0, poisson_ratio=0.35),
+    allowable_stress_mpa=40.0,
+    interlayer_allowable_stress_mpa=15.0,
+    thermal_conductivity_w_per_mk=0.13,
 )
 # 比較用の光造形。値は作例が決めた説明用の値であり、特定の機種と樹脂の値ではない。
 RESIN = ManufacturingPlan(
@@ -247,6 +255,30 @@ def lid_vents(pitch_mm: float, count: int) -> tuple[Feature, ...]:
     )
 
 
+def analyses() -> Analyses:
+    """基板から底へ伝わる熱。値は説明用の値であり、製品の条件ではない。
+
+    底は基板を締めるbossの上面から、ネジと座面を伝わる0.05 Wを受け、外面から室温25 °Cへ、
+    内面から筐体内の空気40 °Cへ放熱する。筐体内の空気の温度は利用者が与える値であり、
+    解析は求めない。例とするPLAの軟化を避けるため、底の最高温度を55 °C以下とする。
+    """
+    # 外面は各面の平面上の薄い箱で選ぶ。1つの面は先に書いた対流にだけ属するため、
+    # 残りの内面をSurfaceで選ぶ。
+    outside = (
+        Box((-0.1, -1.0, -1.0), (0.1, WIDTH_MM + 1.0, HEIGHT_MM + 1.0)),
+        Box((LENGTH_MM - 0.1, -1.0, -1.0), (LENGTH_MM + 0.1, WIDTH_MM + 1.0, HEIGHT_MM + 1.0)),
+        Box((-1.0, -0.1, -1.0), (LENGTH_MM + 1.0, 0.1, HEIGHT_MM + 1.0)),
+        Box((-1.0, WIDTH_MM - 0.1, -1.0), (LENGTH_MM + 1.0, WIDTH_MM + 0.1, HEIGHT_MM + 1.0)),
+        Box((-1.0, -1.0, -0.1), (LENGTH_MM + 1.0, WIDTH_MM + 1.0, 0.1)),
+    )
+    heat = ThermalCase(
+        "board_heat", "base", max_temperature_c=55.0,
+        heat_inputs=(HeatInput(AtKeepout("pi4"), 0.05),),
+        convection=tuple(Convection(region, 10.0, 25.0) for region in outside) + (Convection(Surface(), 5.0, 40.0),),
+    )
+    return Analyses(thermal=(heat,))
+
+
 def model(
     *, post_diameters: dict[str, float] | None = None, vents: tuple[float, int] = (7.0, 5),
     base_extra: tuple[Feature, ...] = (), shift_opening: dict[str, float] | None = None,
@@ -266,12 +298,12 @@ def model(
         opening_features.append(feature)
     base = Part("base", shell() + tuple(opening_features) + tuple(
         feature for fixing in lid_fixings + board_fixings for feature in fixing.base_features
-    ) + snap_windows() + base_extra, manufacturing=(PLAN, RESIN, MILLING, MOLDING), adopted=PLAN.id)
+    ) + snap_windows() + base_extra, material=MATERIAL.id, manufacturing=(PLAN, RESIN, MILLING, MOLDING), adopted=PLAN.id)
     lid = Part("lid", (
         Feature("panel", Box((0, 0, HEIGHT_MM), (LENGTH_MM, WIDTH_MM, HEIGHT_MM + LID_MM)), "base"),
     ) + lid_lip() + tuple(feature for clip in clips for feature in clip.features) + tuple(
         feature for fixing in lid_fixings for feature in fixing.clamp_features
-    ) + lid_vents(*vents), material=LID_MATERIAL.id,
+    ) + lid_vents(*vents), material=MATERIAL.id,
         manufacturing=(LID_TILTED, LID_UPSIDE_DOWN, LID_UPRIGHT), adopted=LID_TILTED.id)
     # 基板は底のbossの上面に接するため、下面のclearanceだけを0とする。
     keepout = PI4.keepout(
@@ -288,9 +320,10 @@ def model(
             fixing.sweep for fixing in lid_fixings + board_fixings
         ),
         fasteners=tuple(fixing.fastener for fixing in lid_fixings + board_fixings),
-        materials=(LID_MATERIAL,),
+        materials=(MATERIAL,),
         snap_fits=tuple(clip.snap for clip in clips),
         connectors=tuple(o.connector for o in connector_parts),
+        analyses=analyses(),
     )
 
 
@@ -300,14 +333,15 @@ def pi4_enclosure() -> Model:
 
 
 def pi4_enclosure_defects() -> Model:
-    """5種類の欠陥を同時に入れた筐体。2部品にまたがり、6つのruleの7つのcheckが落ちる。
+    """5種類の欠陥を同時に入れた筐体。2部品にまたがり、7つのruleの8つのcheckが落ちる。
     採用しない製造案では、正常版と同じcheckに加えて各案の薄肉が落ちる。
 
     - 蓋の通気スリットの間隔を詰め、桟を1 mmにする (蓋のfinal_wall_thickness)。
     - 床の上面を基板の下で削り、残りを0.8 mmにする (底のfinal_wall_thickness)。
     - 奥左のネジ柱を細くし、下穴の周りの肉を欠く (fastener_fit)。
     - 基板のboss 0の上に1.5 mmのshimを載せ、基板の領域へ食い込ませる (keepout_clearance)。
-      shimは基板を上へ取り出す経路も塞ぐ (access_clearance)。
+      shimは基板を上へ取り出す経路も塞ぐ (access_clearance)。基板の領域に入ったshimは基板から
+      熱を受け、床から離れた細い円柱であるため底の最高温度が上限を超える (thermal)。
     - Ethernetの開口を3 mm下へずらす。プラグが壁に当たり (access_clearance)、開口がプラグを
       含まない (connector_fit)。
     """
@@ -350,6 +384,7 @@ PI4_CASES = (
         ("access_clearance", "pi4_lift/base"),
         ("access_clearance", "ethernet_plug/base"),
         ("connector_fit", "ethernet"),
+        ("thermal", "board_heat/temperature"),
     }, ALTERNATIVES | {
         ("final_wall_thickness", "base", "resin"),
         ("final_wall_thickness", "base", "milling"),

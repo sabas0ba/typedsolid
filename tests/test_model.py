@@ -115,7 +115,7 @@ class ModelTests(unittest.TestCase):
             "policy": {"min_feature_mm": 1.2, "required": ["single_solid"]},
         }
         upgraded = json.loads(_native.normalize_model(json.dumps(v1)))
-        self.assertEqual(upgraded["schema_version"], 12)
+        self.assertEqual(upgraded["schema_version"], 13)
         # v9までのPolicyの製造の値は、部品ごとのFDMの製造案になる。
         self.assertEqual(upgraded["parts"][0]["adopted"], "v9_policy")
         self.assertEqual(upgraded["parts"][0]["manufacturing"][0]["process"]["kind"], "fdm")
@@ -140,7 +140,7 @@ class ModelTests(unittest.TestCase):
         for part in data["parts"]:
             del part["manufacturing"], part["adopted"]
         upgraded = json.loads(_native.normalize_model(json.dumps(data)))
-        self.assertEqual(upgraded["schema_version"], 12)
+        self.assertEqual(upgraded["schema_version"], 13)
         self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
 
     def test_assembly_serializes_exit_and_omits_unset_clearance(self):
@@ -201,6 +201,6 @@ class ModelTests(unittest.TestCase):
             _native.normalize_model(json.dumps(data))
 
     def test_wrong_units_and_schema_rejected(self):
-        for model in [replace(block(), units="in"), replace(block(), schema_version=13)]:
+        for model in [replace(block(), units="in"), replace(block(), schema_version=14)]:
             with self.assertRaises(ValueError):
                 model.to_json()

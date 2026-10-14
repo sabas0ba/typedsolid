@@ -80,27 +80,27 @@ pub fn grid_cells(part: &Part, pitch: f64) -> Option<u64> {
 
 /// 軸平行の占有格子。cellはvoxel中心で内外を判定する。
 pub struct Grid {
-    size: [usize; 3],
+    pub(crate) size: [usize; 3],
     /// cell (0,0,0) の中心座標。
-    origin: [f64; 3],
-    pitch: f64,
-    occupied: Vec<bool>,
+    pub(crate) origin: [f64; 3],
+    pub(crate) pitch: f64,
+    pub(crate) occupied: Vec<bool>,
     /// 傾けた姿勢の格子では、組立座標から格子の座標 (製造機の座標) への回転。
     /// 組立座標の格子ではNone。
     rotation: Option<Matrix3>,
 }
 
 impl Grid {
-    fn index(&self, x: usize, y: usize, z: usize) -> usize {
+    pub(crate) fn index(&self, x: usize, y: usize, z: usize) -> usize {
         (z * self.size[1] + y) * self.size[0] + x
     }
 
-    fn centre(&self, axis: usize, cell: usize) -> f64 {
+    pub(crate) fn centre(&self, axis: usize, cell: usize) -> f64 {
         self.origin[axis] + cell as f64 * self.pitch
     }
 
     /// cellの中心の座標 (格子の座標)。
-    fn centre_of(&self, index: usize) -> [f64; 3] {
+    pub(crate) fn centre_of(&self, index: usize) -> [f64; 3] {
         let [nx, ny, _] = self.size;
         let cell = [index % nx, (index / nx) % ny, index / (nx * ny)];
         std::array::from_fn(|axis| self.centre(axis, cell[axis]))
@@ -144,6 +144,17 @@ impl Grid {
 
     /// 「すべてのAddの和から、すべてのCutを引く」をcell単位で構成する。
     pub fn rasterize(part: &Part, pitch: f64) -> Result<Self, String> {
+        Self::rasterize_shifted(part, pitch, 0.0)
+    }
+
+    /// cellの中心を半pitchずらし、部品のAABBの端から`(i + 1/2)·pitch`に置いた格子。
+    /// cellの立方体の和が形状の体積を偏りなく近似するため、要素の格子に使う。
+    /// `rasterize`の格子は中心がAABBの端の上に乗り、各軸に1 pitch太くなる。
+    pub(crate) fn rasterize_midpoint(part: &Part, pitch: f64) -> Result<Self, String> {
+        Self::rasterize_shifted(part, pitch, 0.5)
+    }
+
+    fn rasterize_shifted(part: &Part, pitch: f64, shift: f64) -> Result<Self, String> {
         let (low, high) = part
             .bounds()
             .ok_or_else(|| format!("{} has no additive geometry", part.id))?;
@@ -157,7 +168,7 @@ impl Grid {
         for axis in 0..3 {
             let count = ((high[axis] - low[axis]) / pitch).ceil() as u64 + 1 + 2 * PADDING_CELLS;
             size[axis] = count as usize;
-            origin[axis] = low[axis] - PADDING_CELLS as f64 * pitch;
+            origin[axis] = low[axis] + (shift - PADDING_CELLS as f64) * pitch;
         }
         let mut grid = Self {
             size,
@@ -2347,6 +2358,7 @@ mod tests {
             materials: vec![],
             snap_fits: vec![],
             connectors: vec![],
+            analyses: crate::Analyses::default(),
             policy,
         }
     }
