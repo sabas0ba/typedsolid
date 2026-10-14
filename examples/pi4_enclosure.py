@@ -337,11 +337,11 @@ def pi4_enclosure_defects() -> Model:
     採用しない製造案では、正常版と同じcheckに加えて各案の薄肉が落ちる。
 
     - 蓋の通気スリットの間隔を詰め、桟を1 mmにする (蓋のfinal_wall_thickness)。
-    - 床の上面を基板の下で削り、残りを0.8 mmにする (底のfinal_wall_thickness)。薄い床は
-      bossから受けた熱を広げにくく、底の最高温度が上限を超える (thermal)。
+    - 床の上面を基板の下で削り、残りを0.8 mmにする (底のfinal_wall_thickness)。
     - 奥左のネジ柱を細くし、下穴の周りの肉を欠く (fastener_fit)。
     - 基板のboss 0の上に1.5 mmのshimを載せ、基板の領域へ食い込ませる (keepout_clearance)。
-      shimは基板を上へ取り出す経路も塞ぐ (access_clearance)。
+      shimは基板を上へ取り出す経路も塞ぐ (access_clearance)。基板の領域に入ったshimは基板から
+      熱を受け、床から離れた細い円柱であるため底の最高温度が上限を超える (thermal)。
     - Ethernetの開口を3 mm下へずらす。プラグが壁に当たり (access_clearance)、開口がプラグを
       含まない (connector_fit)。
     """
