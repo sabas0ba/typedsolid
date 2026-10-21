@@ -101,15 +101,34 @@ def _aabb(shape: dict) -> tuple[list[float], list[float]]:
     low, high = [0.0] * 3, [0.0] * 3
     low[axis], high[axis] = shape["span"]
     for slot, index in enumerate(_perpendicular(axis)):
-        low[index] = shape["center"][slot] - shape["radius"]
-        high[index] = shape["center"][slot] + shape["radius"]
+        if shape["kind"] == "fillet":
+            far = _fillet_far(shape, slot)
+            low[index], high[index] = sorted((shape["edge"][slot], far))
+        else:
+            low[index] = shape["center"][slot] - shape["radius"]
+            high[index] = shape["center"][slot] + shape["radius"]
     return low, high
 
 
-def _solid(shape: dict) -> cq.Solid:
+def _fillet_far(shape: dict, slot: int) -> float:
+    """filletの正方形の、辺と反対側の座標。"""
+    sign = 1.0 if shape["toward"][slot].startswith("plus") else -1.0
+    return shape["edge"][slot] + sign * shape["radius"]
+
+
+def _solid(shape: dict) -> cq.Shape:
     if shape["kind"] == "box":
         lo, hi = shape["min"], shape["max"]
         return cq.Solid.makeBox(*(hi[i] - lo[i] for i in range(3)), pnt=cq.Vector(*lo))
+    if shape["kind"] == "fillet":
+        # 正方形の柱から、奥の角を軸とする円柱を引く。辺の選択は使わない。
+        square = _box_solid(_aabb(shape))
+        center = [_fillet_far(shape, slot) for slot in range(2)]
+        cylinder = _solid({
+            "kind": "cylinder", "axis": shape["axis"], "center": center, "radius": shape["radius"],
+            "span": shape["span"],
+        })
+        return square.cut(cylinder)
     axis = AXES.index(shape["axis"])
     origin, direction = [0.0] * 3, [0.0] * 3
     origin[axis] = shape["span"][0]

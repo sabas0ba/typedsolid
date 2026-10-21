@@ -4,13 +4,18 @@ import unittest
 
 from typedsolid import (
     DEFAULT_PLAN, Assembly, Box, Clearance, Cylinder, Feature, Keepout, ManufacturingPlan, Milling, Model, Molding,
-    Move, Orientation, Part, Policy, Resin, Step, hole,
+    Move, Orientation, Part, Policy, Resin, Step, hole, round_edge,
 )
 from typedsolid import _native
 
 
 def block() -> Model:
     return Model((Part("block", (Feature("body", Box((0, 0, 0), (10, 10, 10))),)),))
+
+
+def add_feature_to_block(feature: Feature) -> Model:
+    part = block().parts[0]
+    return replace(block(), parts=(replace(part, features=(*part.features, feature)),))
 
 
 class ModelTests(unittest.TestCase):
@@ -104,6 +109,18 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(feature.operation, "cut")
         self.assertEqual(feature.shape.radius, 1.5)
 
+    def test_fillets_round_trip_and_are_checked_by_rust(self):
+        rounded = add_feature_to_block(round_edge("edge", "z", (10, 10), 2.0, (0, 10), ("minus_x", "minus_y")))
+        shape = json.loads(rounded.to_json())["parts"][0]["features"][1]["shape"]
+        self.assertEqual(shape, {
+            "kind": "fillet", "axis": "z", "edge": [10.0, 10.0], "radius": 2.0, "span": [0.0, 10.0],
+            "toward": ["minus_x", "minus_y"],
+        })
+        # towardは軸に垂直な2軸を、edgeと同じ順に並べる。
+        swapped = add_feature_to_block(round_edge("edge", "z", (10, 10), 2.0, (0, 10), ("minus_y", "minus_x")))
+        with self.assertRaises(ValueError):
+            swapped.to_json()
+
     def test_schema_v1_is_accepted(self):
         v1 = {
             "schema_version": 1, "units": "mm",
@@ -115,7 +132,7 @@ class ModelTests(unittest.TestCase):
             "policy": {"min_feature_mm": 1.2, "required": ["single_solid"]},
         }
         upgraded = json.loads(_native.normalize_model(json.dumps(v1)))
-        self.assertEqual(upgraded["schema_version"], 13)
+        self.assertEqual(upgraded["schema_version"], 14)
         # v9までのPolicyの製造の値は、部品ごとのFDMの製造案になる。
         self.assertEqual(upgraded["parts"][0]["adopted"], "v9_policy")
         self.assertEqual(upgraded["parts"][0]["manufacturing"][0]["process"]["kind"], "fdm")
@@ -140,7 +157,7 @@ class ModelTests(unittest.TestCase):
         for part in data["parts"]:
             del part["manufacturing"], part["adopted"]
         upgraded = json.loads(_native.normalize_model(json.dumps(data)))
-        self.assertEqual(upgraded["schema_version"], 13)
+        self.assertEqual(upgraded["schema_version"], 14)
         self.assertEqual(upgraded["assembly"], {"fit_clearance_mm": 0.0, "steps": []})
 
     def test_assembly_serializes_exit_and_omits_unset_clearance(self):
@@ -201,6 +218,6 @@ class ModelTests(unittest.TestCase):
             _native.normalize_model(json.dumps(data))
 
     def test_wrong_units_and_schema_rejected(self):
-        for model in [replace(block(), units="in"), replace(block(), schema_version=14)]:
+        for model in [replace(block(), units="in"), replace(block(), schema_version=15)]:
             with self.assertRaises(ValueError):
                 model.to_json()
