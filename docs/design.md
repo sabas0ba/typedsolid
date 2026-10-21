@@ -20,7 +20,7 @@
 | ネジ固定 | ネジ・インサートの寸法と実形状の整合を検査 | 貫通穴、座面、かかり長さ、先端の逃げ、bossの肉厚 |
 | snap fit | 梁のひずみ、積層方向、たわむ空間、保持、外れる経路を検査 | 矩形断面の片持ち梁 |
 | サポート不要化 | 印刷方向、overhang、bridge、閉空洞、層ごとの島を評価 | 印刷方向、overhang、bridge |
-| 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 未対応 |
+| 応力・熱解析 | 材料、境界条件、解析mesh、solverの条件を明示して連携 | 部品ごとの線形弾性 (等方性、層間の許容応力) と定常熱伝導。voxelの有限要素法、3段の格子で収束を判定 |
 
 「中空を減らす」は内部を一律に埋める規則にはしない。基板空間・軽量化・放熱と競合するため、閉じた空洞や支持のない天井を制約し、必要な開放空間を保持する。infill率はslicer設定であり、CADの空洞と区別する。
 
@@ -37,10 +37,10 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreで検証される。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v12
+## IR v13
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
-- `Model`は`schema_version=12`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`policy`を持つ。
+- `Model`は`schema_version=13`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`analyses`、`policy`を持つ。`analyses`は解析ケースを持たなければ出力を省く。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Part`は製造案`manufacturing` (1〜16件) と、そのうち採用する案のid`adopted`を持つ。IRに記述した座標は組立状態の姿勢であり、製造時の姿勢は製造案が持つ。詳細は [製造案](#製造案) を参照する。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
@@ -60,7 +60,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - `fit_clearance_mm`は移動方向に垂直な向きに要求する隙間で、`assembly`の値をstepごとに上書きできる。既定の0では、形状同士が共通体積を持つ干渉だけを検出する。
 - `Fastener`はネジ1本の固定を表し、`clamp`の部品を`base`の部品へ締める。`direction`は締め込む向き (頭から先端へ)、`center`は軸に垂直な面上の座標、`seat_mm`は頭の座面、`joint_mm`はclampとbaseの境目の軸方向の座標である。`screw`は長さ (座面から先端)、ねじ部の外径、頭の外径を、`through_mm`はclampの貫通穴の径を持つ。`anchor`は`self_tapping` (`pilot_mm`: 下穴径) か`insert` (`hole_mm`: 圧入前の下穴径、`length_mm`: インサート長。境目と面一に埋める) である。要求値として`min_engagement_mm`と`min_boss_wall_mm`を持つ。
 - ネジ・インサートの寸法と要求値に既定値はなく、利用者が規格表や実測から与える。Rust coreは、外径 ≤ 貫通穴径 < 頭径、下穴径 < 外径 (セルフタップ)、インサート下穴径 > 外径、座面から見て境目が締め込む向きにあることを検証する。`clamp`が空の場合、締める対象は部品として記述されていない (基板など) ことを表し、座面と境目は一致してよい。
-- `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。材料定数はM3の解析で追加する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`、製造案、はめ合い隙間を作る入力に留める。
+- `Material`は`id`、`name`、`source` (値の出典) と、曲げの許容ひずみ`allowable_strain` (無次元、0〜1) を持つ。`Part`は`material`でidを参照する。材料の値に既定値はない。解析に使う材料定数として、等方性の弾性定数`elastic` (`youngs_modulus_mpa`、`poisson_ratio`)、von Mises相当応力と比べる`allowable_stress_mpa`、積層方向の引張と比べる`interlayer_allowable_stress_mpa`、`thermal_conductivity_w_per_mk`を任意に持つ。解析ケースが参照する材料にだけ必須となる。詳細は [解析](#解析) を参照する。印刷機と設計値 (Pythonの`Printer`と`Profile`) はIRに入れず、`Policy`、製造案、はめ合い隙間を作る入力に留める。
 - `SnapFit`は矩形断面の片持ち梁によるsnap fitを表す。`part`の2つのadd box feature を`beam`と`hook`として参照し、`length_direction` (梁の根元から先端への向き)、`deflection` (外すときにフックが動く向き)、`deflection_mm`、フックが掛かる`mate`、外す分解`step`を持つ。梁の寸法はboxから求め、IRに重ねて持たない。
 - Rust coreは次を検証する: `part`の材料に`allowable_strain`がある、`beam`と`hook`が異なるadd boxである、たわむ向きが長さ方向に垂直である、フックが梁に接し梁の長さの範囲にあり根元から離れている、`step`が`part`と`mate`の一方だけを動かし、両者ともそれ以前のstepで取り外されていない。
 - `Connector`は筐体の壁に開けるコネクタ開口を表す。`part`のcut boxの`opening`、プラグを抜く`sweep` (box形状)、抜く向きに垂直なプラグ断面`plug_mm` (並びはcylinderの`center`と同じ軸順)、開口とプラグの間に各辺で要求する`clearance_mm`、値の出典`source`を持つ。`source`は`kind` (`datasheet`、`measured`、`other`) と`reference` (1〜500文字) からなる。プラグ寸法に既定値はなく、利用者が与える。
@@ -68,7 +68,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ### 旧版からの昇格
 
-`schema_version`が1〜11のJSONは、読み込み時に順に昇格してv12へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜12のJSONは、読み込み時に順に昇格してv13へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
@@ -81,8 +81,9 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - v9→v10: `policy`の`min_wall_mm`、`build_direction`、`overhang_angle_deg`、`bridge_max_mm`を取り除き、その値 (省略されていればv9の既定値1.2、`plus_z`、45、5.0) を持つFDMの製造案`v9_policy`を各部品へ加えて採用する。v9は部品ごとの姿勢を持たないため、全部品が同じ案となる。v9の入力に`manufacturing`か`adopted`が現れた場合は拒否する。
 - v10→v11: v10は切削と射出成形の製造案を持たないため、そのまま受理する。v10の入力に`kind`が`milling`か`molding`の製造案が現れた場合は拒否する。
 - v11→v12: v11の姿勢は傾きを持たず、`turn_deg`は直角に限られたため、そのまま受理する。v11の入力に`tilt_deg`が現れた場合は拒否する。
+- v12→v13: v12は解析ケースと解析の材料定数を持たないため、そのまま受理する。v12の入力に`analyses`か、材料の`elastic`、`allowable_stress_mpa`、`interlayer_allowable_stress_mpa`、`thermal_conductivity_w_per_mk`が現れた場合は拒否する。
 
-出力は常にv12で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv13で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
@@ -90,7 +91,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 標準policyは`feature_thickness/valid_solid/single_solid/keepout_clearance/access_clearance/part_interference/final_wall_thickness/neck_section/closed_cavity/support_free/disassembly_path/disassembly_separation/fastener_fit/snap_fit/fastener_release/connector_fit`を必須とする。`mesh_manifold/mesh_volume`はexport時に評価され、failがあれば出力を拒否する。適用対象がないkeepout・掃引・部品間干渉・分解・ネジ固定・snap fit・コネクタ開口の検査は「宣言された対象なし」と明示する。未宣言の基板・工具が存在しないことは保証しない。
 
-`strength/thermal`は常にnot_evaluatedである。requiredに指定した場合は出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
+`strength/thermal`は、解析ケースを宣言した場合に [解析](#解析) で判定し、宣言しなければnot_evaluatedとして残す。拘束と荷重の近傍の応力は常にnot_evaluatedとなるため、`strength`をrequiredに指定すると出力を拒否する。標準policyでの出力許可は「実装済み検査を満たした」の意味であり、印刷・構造安全の認証ではない。
 
 交差体積は1e-7 mm³を許容差とし、面接触は許容する。印刷公差や嵌合clearanceと、この数値誤差の許容差を混同しない。極小の干渉、STL meshのmanifold性、slicer上の層島・bridge・supportは別の検査が必要である。
 
@@ -206,7 +207,7 @@ DOMとWebGLに依存しない処理 (行列、データの復号、fragmentの�
 - 切削: 上面と、コネクタ開口とsnap fitの窓のある`minus_y`、`plus_x`、`plus_y`の3面から直径3 mmの工具を下ろす。どこへも届き`milling_reach`には合格するが、ネジ柱と壁の間の内角とφ2.1 mmの下穴を工具の径で削れず`milling_corner`で不合格となる。
 - 射出成形: 型を`z`軸に沿って開く。壁の6つの開口とsnap fitの2つの窓が`mold_undercut`で、壁の角と一体になった四隅のネジ柱が`mold_thick_wall` (最大肉厚3 mm) で不合格となる。抜き勾配はnot_evaluatedである。
 
-正常版 (`pi4_enclosure`) は採用した案ですべてのruleに合格し、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、採用した案では2部品にまたがって6 ruleの7 checkが不合格となる。`tests/test_pi4_enclosure.py`が採用した案と採用していない案のそれぞれで不合格となる検査項目の集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
+正常版 (`pi4_enclosure`) は採用した案ですべてのruleに合格し、部品間の検査はいずれも実際の対象で評価される。欠陥版 (`pi4_enclosure_defects`) は、蓋の通気スリットの桟、床の削り込み、細いネジ柱、基板のbossに載せたshim、下へずらしたEthernetの開口の5つの欠陥を同時に持ち、採用した案では2部品にまたがって7 ruleの8 checkが不合格となる。boss 0に載せたshimは、底の熱の解析でも上限を超える。`tests/test_pi4_enclosure.py`が採用した案と採用していない案のそれぞれで不合格となる検査項目の集合を照合し、`scripts/check-viewer.py`が欠陥版のviewerを撮影する。
 
 ## 着脱の検査
 
@@ -355,8 +356,48 @@ Python APIの`snap_fit`は、根元の面の中心、寸法、向きから梁と
 
 Python APIの`connector_opening`は、抜く向き、プラグ断面の中心と寸法、嵌合状態のプラグの範囲、切り欠く壁の範囲、clearance、出典から、cut feature、`Sweep`、`Connector`を作る。catalogの`Board.connector_center`は、資料が寸法化したコネクタの辺上の位置から`center`を求める。高さ方向の中心は資料が与えないため、呼び出し側が指定する。
 
-## 解析への拡張
+## 解析
 
-応力解析は材料定数、積層方向・異方性、荷重、支持条件、接触、mesh品質・収束性を明示する。熱解析は発熱量、熱伝導率、接触熱抵抗、対流条件、周囲温度を明示する。値が欠ける場合に任意の既定値で合格扱いしない。
+部品1つの線形弾性 (`StructuralCase`) と定常熱伝導 (`ThermalCase`) を、最終形状の検査と同じvoxel格子の上で解く。外部solverとmesherは使わず、Rust coreに実装した。候補としたscikit-femとMFEMはBSD-3であるが、四面体のmesherはいずれもcopyleft (GmshはGPL、fTetWildはMPL-2.0) であり、voxelの格子をそのまま要素とする方式を選んだ。
 
-Part/Featureから解析境界へstableな参照を渡す。ただしBoolean後に対応が失われた境界を推測で指定しない。印刷用STLをそのまま解析用体積meshとして扱わず、solver連携は別adapterとする。初期実装にはsolver依存を含めない。
+### 解析ケース
+
+- `StructuralCase`は`id`、`part`、変位を0に拘束する`supports` (領域の列)、`forces` (領域と合計の力`newtons` [N])、許容応力を割る`safety_factor` (1〜100)、任意の`max_deflection_mm`、任意の`voxel_mm`を持つ。材料に`elastic`と`allowable_stress_mpa`が必要で、採用した製造案が積層する製造法 (FDM、光造形) なら`interlayer_allowable_stress_mpa`も必要である。
+- `ThermalCase`は`id`、`part`、`heat_inputs` (領域と`watts`)、`fixed_temperatures` (領域と`celsius`)、`convection` (領域、熱伝達係数`h_w_per_m2k`、周囲温度`ambient_c`)、上限`max_temperature_c`、任意の`voxel_mm`を持つ。熱の出口として対流か固定温度が1つ以上必要である。異なる温度の固定温度の領域が節点を共有する場合は、記述順で解が変わるためnot_evaluatedとする。筐体内の空気は利用者が与える周囲温度として扱い、空気の流れは解かない。接触熱抵抗と放射は扱わない。
+- 領域は`surface` (表面すべて)、`box` (軸平行のbox内の表面)、`fastener` (baseの部品では下穴の壁、clampの部品では頭の座面)、`keepout` (keepoutの箱に接する表面)、`connector` (コネクタ開口の縁) である。Boolean後の面番号は使わない。格子の露出した面のうち、面の中心が領域に入るものを選ぶ。参照による領域は、最も粗い格子の段を含めるため`2·voxel_mm`だけ広げる。1つの面は、先に書いた対流の領域にだけ属する。
+- 力と熱量は、領域の表面へ一様に分布させる。
+
+### 離散化と解法
+
+- 材料のcellを8節点の六面体要素とし、cellの中心を部品のAABBの端から`(i + 1/2)·voxel_mm`に置く。最終形状の検査の格子は中心がAABBの端に乗り、各軸に1 pitch太くなるため、解析では使わない。
+- 弾性の要素には非適合モード (Wilsonの要素) を加え、要素内で静的縮約する。完全積分の8節点要素は曲げで寄生的なせん断ひずみを生じて硬くなり、薄い壁を数要素で表す格子では変位を過小に見積もる。非適合モードは立方体の要素で純曲げを厳密に表す。
+- 連立方程式は、voxelの階層 (2倍ずつ粗くした格子) による幾何マルチグリッドを前処理とする共役勾配法で解く。粗い格子の演算子は三重線形補間PによるGalerkin近似P^T A Pで、薄い壁が粗い格子で失われない。平滑化はD⁻¹AのChebyshev多項式で、最大固有値を格子ごとに冪乗法で見積もる。減衰Jacobi法は弾性の要素でD⁻¹Aの最大固有値が3.5〜4となり、係数0.6では高周波の誤差を増やした。要素ごとの積はz方向の区間に分けて並列に計算する。
+- 拘束にも放熱にも接しない連結成分がある場合は、方程式が特異になるため解かずに未評価とする。
+- 応力は要素の8隅で求める。平らな面の曲げでは表面の応力に当たる。
+
+### 収束と判定
+
+- 格子間隔h、2h、4hで解き、判定する量 (応力、層間の引張、変位、温度の上昇) について、hと2hの相対差が20%以下であり、かつhと2hの差が2hと4hの差の0.7倍以下である (収束の次数0.5以上) ことを求める。相対差が1%以下なら差の縮みは問わない。満たさなければnot_evaluatedとする。鋭い内角の応力は特異点であり、細分するほど値が増える。2段の比較だけでは、粗い格子で特異性の増え方が小さく、見逃した。
+- 上限と比べる値は、hの値に、差が等比で縮むとみなした残りの和を加えたものとし、1次の収束に当たるhと2hの差を下限とする。細分で値が減る場合は外挿しない。
+- 拘束と荷重の領域から各軸に`8·voxel_mm` (最も粗い格子の2 cell分) 以内のcellは、応力と層間の引張の判定から除く。拘束域の縁は理想化した境界条件による特異点であり、細分するほど応力が増える。除いた範囲は`<case>/boundary_stress`として常にnot_evaluatedで残し、その範囲の最大値をmessageに書く。
+- 4hの格子でも部品と領域を表せる必要がある。`voxel_mm`の4倍より細い壁は最も粗い格子で消え、連結が切れるか領域が面を持たなくなり、not_evaluatedとなる。
+- checkのtargetは`<case>/stress`、`<case>/interlayer` (積層する製造法のみ)、`<case>/deflection` (`max_deflection_mm`を与えた場合)、`<case>/boundary_stress`、`<case>/temperature`である。failでは、判定値と同じ比で外挿したcellの値が上限を超えたcellを検出箇所とする。
+
+### 検証
+
+| 問題 | 解析解 | 結果 |
+|---|---|---|
+| 引張棒 (20×6×6 mm、360 N) | σ = 10 MPa、δ = FL/(EA) = 0.2 mm | 一致 (表示桁の範囲) |
+| 片持ち梁 (30×6×6 mm、先端1 N、ν = 0) | たわみ FL³/(3EI) + FL/(κGA) = 0.0853 mm | 0.0863 mm (+1.2%) |
+| 同、拘束から4.5 mmの断面の曲げ応力 | F(L − x)c/I = 0.708 MPa | 0.701 MPa、判定値0.722 MPa |
+| 一端加熱・他端固定温度の棒 | T = T₀ + QL/(kA) | 一致 |
+| 同、他端を対流 | 膜の抵抗Q/(hA)を加えた値 | 一致 |
+| L字の腕の付け根の内角 | 応力の特異点 | 1.31、1.62、2.12 MPaと増え、not_evaluated |
+
+### 作例と制約
+
+Raspberry Pi 4の筐体の底は、基板を締めるbossから0.05 Wを受け、外面から25 °C、内面から筐体内の空気40 °Cへ放熱する。0.5 mmの格子で最高温度は50.2、49.7、48.6 °C (h、2h、4h) と収束し、判定値50.7 °Cで上限55 °Cを満たす。解く時間は4 coreで約9秒である。欠陥版では、基板の領域に入り込んだboss 0のshimが基板から熱を受け、床から離れた細い円柱であるため55.8 °Cとなり、不合格となる。超過箇所はshimの位置に示される。shimを除くと50.2 °Cで合格し、床の削り込みを除いても結果は変わらない。
+
+蓋を四隅のネジの座面で支え、天板の中央を20 Nで押すケースは収束しなかった。0.5 mmの格子で変位は1.085、0.946、1.038 mmと単調でなく、除外域の外の応力も16.9、10.9、12.1 MPaであった。厚さ2 mmの天板と通気スリットが4hの格子 (2 mm) で崩れ、スリットの端とlipの付け根の鋭い内角が特異点となるためである。解く時間は約3分であった。IRはfilletを持たないため、荷重を受ける接合部の応力はnot_evaluatedとなりやすい。作例は強度のケースを持たない。
+
+接触、ネジの締結力、異方性 (層間以外)、大変形、座屈、放射、空気の流れは扱わない。印刷用STLを解析meshとして使わない。

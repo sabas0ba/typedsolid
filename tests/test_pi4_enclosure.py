@@ -29,6 +29,15 @@ class Pi4EnclosureTests(unittest.TestCase):
         layer = next(c for c in tilted if c["target"] == "clip_0/layer")
         self.assertIn("50.0°", layer["message"])
 
+    def test_board_heat_is_solved_on_three_grids(self):
+        """底の熱のケースは3つの格子で収束し、上限との比較で合格する。強度のケースは宣言しない。"""
+        checks = build(pi4_enclosure()).report["checks"]
+        heat = next(c for c in checks if c["target"] == "board_heat/temperature")
+        self.assertEqual(heat["status"], "pass", heat["message"])
+        self.assertIn("(grid 2 mm)", heat["message"])
+        strength = [c for c in checks if c["rule"] == "strength"]
+        self.assertEqual([c["status"] for c in strength], ["not_evaluated"])
+
     def test_normal_case_exercises_every_assembly_rule(self):
         """正常版は部品間の検査をすべて実際に評価する。対象のない合格 (model) で通っていない。"""
         checks = build(pi4_enclosure()).report["checks"]

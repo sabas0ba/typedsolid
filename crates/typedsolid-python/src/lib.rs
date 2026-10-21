@@ -1,7 +1,9 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use typedsolid_core::{MAX_LOCATIONS, ManufacturingPlan, Model, Policy, Report, mesh, voxel};
+use typedsolid_core::{
+    MAX_LOCATIONS, ManufacturingPlan, Model, Policy, Report, analysis, mesh, voxel,
+};
 
 #[pyfunction]
 fn normalize_model(json: &str) -> PyResult<String> {
@@ -29,6 +31,14 @@ fn evaluate_voxels(json: &str) -> PyResult<String> {
 fn evaluate_snap_fits(json: &str) -> PyResult<String> {
     let model = Model::from_json(json).map_err(PyValueError::new_err)?;
     let checks = model.evaluate_snap_fits().map_err(PyValueError::new_err)?;
+    serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// 解析ケースの線形弾性と定常熱伝導。IRから直接rasterizeするためbackendに依存しない。
+#[pyfunction]
+fn evaluate_analyses(json: &str) -> PyResult<String> {
+    let model = Model::from_json(json).map_err(PyValueError::new_err)?;
+    let checks = analysis::evaluate(&model).map_err(PyValueError::new_err)?;
     serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
@@ -136,6 +146,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(preflight, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_voxels, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_snap_fits, module)?)?;
+    module.add_function(wrap_pyfunction!(evaluate_analyses, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_fastener_releases, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_connectors, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_stl_voxels, module)?)?;

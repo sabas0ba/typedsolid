@@ -16,7 +16,7 @@
 | nixpkgs | `597283ad8aa0b331c788e97c4c262d58877074ef` (nixos-26.05) | 開発シェルの周辺ツール。NixOS公式。flake.lockにrevisionとnarHashで固定 |
 | fenix | `9efa138447c5773995d98d9aafa9eba4982aceab` (2026-09-08) | 開発シェルのRust toolchain構成。nix-community org、maintainerは2名 |
 
-CadQueryは13の通常依存を宣言し、OCCT/VTK、数値計算、trame系の推移依存を持つ。Python lock全45件のうちmaturin以外はこのbackend側である。代表的な経路は`cadquery → trame → trame-server → wslink → aiohttp → multidict`で5段ある。coreだけの利用時にCadQueryをimportしないテストを設ける。solver、GUI server、viewer追加依存は導入しない。trame等はCadQueryの通常依存として含まれるが、このprojectからserverを起動しない。
+CadQueryは13の通常依存を宣言し、OCCT/VTK、数値計算、trame系の推移依存を持つ。Python lock全45件のうちmaturin以外はこのbackend側である。代表的な経路は`cadquery → trame → trame-server → wslink → aiohttp → multidict`で5段ある。coreだけの利用時にCadQueryをimportしないテストを設ける。solver、GUI server、viewer追加依存は導入しない。M3の強度と熱の解析は、Rust coreに実装した有限要素法とマルチグリッドで解き、依存を追加していない。trame等はCadQueryの通常依存として含まれるが、このprojectからserverを起動しない。
 
 Rustの直接外部依存は3件、推移を含め21件。手動FFIや独自JSON parserはメモリ安全性・検証負担が増すため採用しない。serdeの代替は将来検討可能だが、初期段階では追加実装の複雑化を避ける。
 
