@@ -241,8 +241,10 @@
     if (mode === "custom" && range && range[1] > range[0]) {
       return { low: range[0], high: range[1], over: false };
     }
-    if (mode === "limit" && hasLimit && field.limit > field.reference) {
-      return { low: field.reference, high: field.limit, over: true };
+    if (mode === "limit" && hasLimit) {
+      // 上限が基準値以下でも、上限を超える値は上限超過の色で示す。
+      const low = Math.min(field.reference, field.minimum);
+      return { low: low < field.limit ? low : field.limit - 1e-12, high: field.limit, over: true };
     }
     if (mode === "diverging" && hasLimit) {
       const half = Math.max(field.limit - Math.min(field.reference, field.minimum), field.maximum - field.limit, 1e-12);

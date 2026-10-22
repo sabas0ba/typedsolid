@@ -243,6 +243,12 @@ test("field scales follow the chosen range", () => {
   // 上限の無い量と、不正な数値の範囲は、値の最小から最大までとする。
   assert.deepEqual(core.fieldScale({ ...field, limit: null }, "limit", null), { low: 2, high: 30, over: false });
   assert.deepEqual(core.fieldScale(field, "custom", [8, 5]), { low: 2, high: 30, over: false });
+  // 上限が基準値 (周囲温度など) 以下でも、上限を超える値は上限超過として示す。
+  const hot = { minimum: 45, maximum: 80, limit: 30, reference: 40 };
+  const scale = core.fieldScale(hot, "limit", null);
+  assert.equal(scale.high, 30);
+  assert.ok(scale.over && scale.low < scale.high);
+  assert.equal(core.rgbToHex(core.fieldColour(45, scale, "sequential")), core.OVER_LIMIT);
 });
 
 test("field colours mark values over the limit and leave missing values to the part", () => {

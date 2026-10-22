@@ -1421,7 +1421,9 @@ impl<'a> Sampler<'a> {
                 }
             }
         }
-        best.map(|(_, k)| k)
+        // 立方体の隅は2 pitchより遠いため、距離で棄却する。
+        best.filter(|(distance, _)| *distance <= (reach * reach) as f64)
+            .map(|(_, k)| k)
     }
 
     fn value(&self, point: [f32; 3]) -> f32 {
@@ -2069,6 +2071,30 @@ mod tests {
         assert!((values[0] - 10.0).abs() < 1e-3);
         assert_eq!(excluded[..2], [false, true]);
         assert!(values[2].is_nan());
+
+        // 隅のcellから1軸に1.9 pitch離れた点は値を持ち、3軸に1.9 pitch (約3.3 pitch) 離れた点は持たない。
+        let corner = stress
+            .cells
+            .iter()
+            .map(|&cell| {
+                let (nx, ny) = (stress.size[0], stress.size[1]);
+                let cell = cell as usize;
+                let index = [cell % nx, cell / nx % ny, cell / (nx * ny)];
+                std::array::from_fn::<f32, 3, _>(|axis| {
+                    (stress.origin[axis] + index[axis] as f64 * stress.pitch) as f32
+                })
+            })
+            .max_by(|a, b| a.iter().sum::<f32>().total_cmp(&b.iter().sum::<f32>()))
+            .unwrap();
+        let away = 1.9 * stress.pitch as f32;
+        let (values, _) = sample(
+            stress,
+            &[
+                [corner[0] + away, corner[1], corner[2]],
+                corner.map(|v| v + away),
+            ],
+        );
+        assert!(!values[0].is_nan() && values[1].is_nan(), "{values:?}");
 
         // 変位は拘束端で0、引く端で0.2 mm。
         let (values, _) = sample(&fields[1], &[[0.0, 3.0, 3.0], [20.0, 3.0, 3.0]]);
