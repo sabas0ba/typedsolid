@@ -818,7 +818,28 @@ struct ElasticSolution {
     boundary_mpa: Option<f64>,
     /// 変位の大きい節点を含むcell。
     displaced: Vec<(usize, f64)>,
+    /// 表面のcellの値。分布の表示に使う。
+    surface: Vec<SurfaceCell>,
     iterations: usize,
+}
+
+/// 表面の1 cellの、要素の8隅の応力の最大、層間の引張の最大、8節点の変位の大きさの最大。
+struct SurfaceCell {
+    cell: usize,
+    stress: f64,
+    interlayer: f64,
+    deflection: f64,
+    /// 拘束と荷重の近傍で、応力を判定しない。
+    excluded: bool,
+}
+
+/// 露出した面を持つcell。
+fn surface_mask(length: usize, faces: &[(usize, usize, bool)]) -> Vec<bool> {
+    let mut mask = vec![false; length];
+    for (cell, _, _) in faces {
+        mask[*cell] = true;
+    }
+    mask
 }
 
 /// 解析できない理由。checkのmessageに書く。
@@ -929,11 +950,11 @@ fn solve_elastic(
     let mut stress = Vec::with_capacity(mesh.elements.len());
     let mut interlayer = Vec::new();
     let mut displaced = Vec::with_capacity(mesh.elements.len());
+    let on_surface = surface_mask(grid.occupied.len(), &faces);
+    let mut surface = Vec::new();
     for (nodes, cell) in mesh.elements.iter().zip(&mesh.cells) {
-        displaced.push((
-            *cell,
-            nodes.iter().map(|n| deflection(*n)).fold(0.0, f64::max),
-        ));
+        let moved = nodes.iter().map(|n| deflection(*n)).fold(0.0, f64::max);
+        displaced.push((*cell, moved));
         let mut local = [0.0; 24];
         for (a, node) in nodes.iter().enumerate() {
             for c in 0..3 {
@@ -972,6 +993,15 @@ fn solve_elastic(
                 normal_max = normal_max.max(normal);
             }
         }
+        if on_surface[*cell] {
+            surface.push(SurfaceCell {
+                cell: *cell,
+                stress: mises_max,
+                interlayer: normal_max,
+                deflection: moved,
+                excluded: near[*cell],
+            });
+        }
         if near[*cell] {
             boundary_mpa = Some(boundary_mpa.unwrap_or(0.0).max(mises_max));
             continue;
@@ -990,6 +1020,7 @@ fn solve_elastic(
         stress,
         interlayer,
         displaced,
+        surface,
         iterations,
     }))
 }
@@ -1000,6 +1031,8 @@ struct ThermalSolution {
     max_c: f64,
     /// cellの8節点の温度の最大。
     cells: Vec<(usize, f64)>,
+    /// 表面のcellの、8節点の温度の最大。分布の表示に使う。
+    surface: Vec<(usize, f64)>,
     iterations: usize,
 }
 
@@ -1132,9 +1165,16 @@ fn solve_thermal(
         })
         .collect();
     let max_c = cells.iter().map(|(_, t)| *t).fold(f64::MIN, f64::max);
+    let on_surface = surface_mask(grid.occupied.len(), &faces);
+    let surface = cells
+        .iter()
+        .copied()
+        .filter(|(cell, _)| on_surface[*cell])
+        .collect();
     Ok(Ok(ThermalSolution {
         max_c,
         cells,
+        surface,
         iterations,
     }))
 }
@@ -1291,10 +1331,276 @@ fn case_pitch(model: &Model, voxel_mm: Option<f64>) -> f64 {
     voxel_mm.unwrap_or(model.policy.voxel_mm)
 }
 
+/// 分布として表示する量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quantity {
+    /// von Mises相当応力。
+    Stress,
+    /// 積層方向の垂直応力の引張。
+    Interlayer,
+    /// 変位の大きさ。
+    Deflection,
+    Temperature,
+}
+
+/// 部品の表面のcellに置いた解析の量。格子間隔hの解の値 (外挿前) であり、判定には使わない。
+/// viewerが部品の表面を色分けするために使う。cellの中心は`origin + index·pitch`である。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Field {
+    pub case: String,
+    pub quantity: Quantity,
+    pub part: String,
+    pub unit: String,
+    /// 判定の上限。変位の上限を与えないケースではNone。
+    pub limit: Option<f64>,
+    /// 値の基準。温度では周囲温度と固定温度の最小、他は0。
+    pub reference: f64,
+    pub pitch: f64,
+    pub origin: [f64; 3],
+    pub size: [usize; 3],
+    /// 表面のcellの番号と値。
+    pub cells: Vec<u32>,
+    pub values: Vec<f32>,
+    /// 拘束と荷重の近傍で応力を判定しないcell。`cells`と同じ順。応力以外では空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<bool>,
+    /// 判定しない近傍の、拘束と荷重の領域からの距離。応力以外ではNone。単位はmm。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_mm: Option<f64>,
+}
+
+/// 分布の表面のcellを番号で引く索引。
+struct Sampler<'a> {
+    field: &'a Field,
+    index: std::collections::HashMap<u32, usize>,
+}
+
+impl<'a> Sampler<'a> {
+    fn new(field: &'a Field) -> Self {
+        let index = field
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(k, cell)| (*cell, k))
+            .collect();
+        Self { field, index }
+    }
+
+    /// 点に最も近い表面のcellの番号 (`cells`の位置)。2 pitch以内に無ければNone。
+    fn nearest(&self, point: [f32; 3]) -> Option<usize> {
+        let field = self.field;
+        let [nx, ny, nz] = field.size;
+        let reach = 2isize;
+        let position: [f64; 3] =
+            std::array::from_fn(|axis| (f64::from(point[axis]) - field.origin[axis]) / field.pitch);
+        let nearest = position.map(|v| v.round() as isize);
+        let mut best: Option<(f64, usize)> = None;
+        for dz in -reach..=reach {
+            for dy in -reach..=reach {
+                for dx in -reach..=reach {
+                    let cell = [nearest[0] + dx, nearest[1] + dy, nearest[2] + dz];
+                    if cell
+                        .iter()
+                        .zip([nx, ny, nz])
+                        .any(|(c, n)| *c < 0 || *c as usize >= n)
+                    {
+                        continue;
+                    }
+                    let flat = (cell[2] as usize * ny + cell[1] as usize) * nx + cell[0] as usize;
+                    let Some(k) = self.index.get(&(flat as u32)) else {
+                        continue;
+                    };
+                    let distance: f64 = (0..3)
+                        .map(|axis| (cell[axis] as f64 - position[axis]).powi(2))
+                        .sum();
+                    if best.is_none_or(|(d, _)| distance < d) {
+                        best = Some((distance, *k));
+                    }
+                }
+            }
+        }
+        best.map(|(_, k)| k)
+    }
+
+    fn value(&self, point: [f32; 3]) -> f32 {
+        self.nearest(point)
+            .map_or(f32::NAN, |k| self.field.values[k])
+    }
+}
+
+/// 点ごとの、最も近い表面のcellの値と、そのcellが判定しない近傍にあるか。2 pitch以内に表面の
+/// cellが無い点の値はNaNとする。点はviewerの部品meshの頂点で、組立座標である。
+pub fn sample(field: &Field, points: &[[f32; 3]]) -> (Vec<f32>, Vec<bool>) {
+    let sampler = Sampler::new(field);
+    points
+        .iter()
+        .map(|point| match sampler.nearest(*point) {
+            Some(k) => (
+                field.values[k],
+                field.excluded.get(k).copied().unwrap_or(false),
+            ),
+            None => (f32::NAN, false),
+        })
+        .unzip()
+}
+
+/// 分布を色で描くための三角形。辺が`max_edge`を超え、かついずれかの分布の値を3頂点からの線形
+/// 補間で表すと、内側の点で分布の値の範囲の`tolerance`倍を超えて外れる三角形を、最長の辺の中点で
+/// 2つに分けることを繰り返す。値が一様な所の三角形は大きいまま残す。内側の点は間隔`max_edge`で
+/// 取る。三角形は頂点を共有せず、3頂点ずつ並べて返す。
+pub fn refine(
+    triangles: &[[[f32; 3]; 3]],
+    fields: &[Field],
+    max_edge: f64,
+    tolerance: f64,
+) -> Vec<[[f32; 3]; 3]> {
+    let ranges: Vec<f64> = fields
+        .iter()
+        .map(|field| {
+            let (low, high) = field
+                .values
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                    (lo.min(f64::from(*v)), hi.max(f64::from(*v)))
+                });
+            (high - low).max(1e-12)
+        })
+        .collect();
+    let samplers: Vec<Sampler> = fields.iter().map(Sampler::new).collect();
+    let values_at = |points: &[[f32; 3]]| -> Vec<Vec<f32>> {
+        samplers
+            .iter()
+            .map(|sampler| points.iter().map(|p| sampler.value(*p)).collect())
+            .collect()
+    };
+    let length = |a: [f32; 3], b: [f32; 3]| -> f64 {
+        (0..3)
+            .map(|k| f64::from(a[k] - b[k]).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    // 3頂点の重心座標で表した内側の点。間隔max_edgeの格子点 (辺の上を除く)。
+    let probes = |triangle: &[[f32; 3]; 3], longest: f64| -> Vec<([f32; 3], [f64; 3])> {
+        let n = (longest / max_edge).ceil().max(2.0) as usize;
+        let mut out = Vec::new();
+        for i in 1..n {
+            for j in 1..n - i {
+                let (u, v) = (i as f64 / n as f64, j as f64 / n as f64);
+                let w = [1.0 - u - v, u, v];
+                let point = std::array::from_fn(|k| {
+                    (0..3)
+                        .map(|c| w[c] * f64::from(triangle[c][k]))
+                        .sum::<f64>() as f32
+                });
+                out.push((point, w));
+            }
+        }
+        // 最長の辺の中点も確かめる。
+        for e in 0..3 {
+            let mut w = [0.0; 3];
+            w[e] = 0.5;
+            w[(e + 1) % 3] = 0.5;
+            let point = std::array::from_fn(|k| (triangle[e][k] + triangle[(e + 1) % 3][k]) / 2.0);
+            out.push((point, w));
+        }
+        out
+    };
+    let mut out = Vec::new();
+    let mut stack: Vec<[[f32; 3]; 3]> = triangles.to_vec();
+    while let Some(triangle) = stack.pop() {
+        let lengths = [0, 1, 2].map(|e| length(triangle[e], triangle[(e + 1) % 3]));
+        let e = (0..3)
+            .max_by(|a, b| lengths[*a].total_cmp(&lengths[*b]))
+            .expect("three edges");
+        if lengths[e] <= max_edge || fields.is_empty() {
+            out.push(triangle);
+            continue;
+        }
+        let corners = values_at(&triangle);
+        let inside = probes(&triangle, lengths[e]);
+        let points: Vec<[f32; 3]> = inside.iter().map(|(p, _)| *p).collect();
+        let sampled = values_at(&points);
+        let linear = fields.iter().enumerate().all(|(f, _)| {
+            inside.iter().enumerate().all(|(k, (_, w))| {
+                let actual = f64::from(sampled[f][k]);
+                let corner: Vec<f64> = corners[f].iter().map(|v| f64::from(*v)).collect();
+                if actual.is_nan() || corner.iter().any(|v| v.is_nan()) {
+                    // 値の無い点は、その周りを細かく描く必要がない。値が混ざる場合は分ける。
+                    return actual.is_nan() && corner.iter().all(|v| v.is_nan());
+                }
+                let interpolated: f64 = (0..3).map(|c| w[c] * corner[c]).sum();
+                (actual - interpolated).abs() <= tolerance * ranges[f]
+            })
+        });
+        if linear {
+            out.push(triangle);
+            continue;
+        }
+        let (a, b, c) = (triangle[e], triangle[(e + 1) % 3], triangle[(e + 2) % 3]);
+        let middle = std::array::from_fn(|k| (a[k] + b[k]) / 2.0);
+        stack.push([a, middle, c]);
+        stack.push([middle, b, c]);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field(
+    case: &str,
+    quantity: Quantity,
+    part: &Part,
+    unit: &str,
+    limit: Option<f64>,
+    reference: f64,
+    grid: &Grid,
+    cells: impl Iterator<Item = (usize, f64, bool)>,
+) -> Field {
+    let mut field = Field {
+        case: case.into(),
+        quantity,
+        part: part.id.clone(),
+        unit: unit.into(),
+        limit,
+        reference,
+        pitch: grid.pitch,
+        origin: grid.origin,
+        size: grid.size,
+        cells: Vec::new(),
+        values: Vec::new(),
+        excluded: Vec::new(),
+        exclusion_mm: None,
+    };
+    let mut any_excluded = false;
+    for (cell, value, excluded) in cells {
+        field.cells.push(cell as u32);
+        field.values.push(value as f32);
+        field.excluded.push(excluded);
+        any_excluded |= excluded;
+    }
+    if !any_excluded {
+        field.excluded.clear();
+    }
+    field
+}
+
+/// 応力の分布に、判定しない近傍の距離を記す。
+fn with_exclusion(mut field: Field, exclusion: f64) -> Field {
+    field.exclusion_mm = Some(exclusion);
+    field
+}
+
 /// 宣言した解析ケースを解き、`strength`と`thermal`のcheckを返す。
 pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
+    evaluate_with_fields(model).map(|(checks, _)| checks)
+}
+
+/// `evaluate`のcheckに加え、3つの格子で解けたケースの分布を返す。
+pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), String> {
     model.validate()?;
     let mut checks = Vec::new();
+    let mut fields = Vec::new();
     for case in &model.analyses.structural {
         let part = case_part(model, &case.part, "")?;
         let material = case_material(model, part, "")?;
@@ -1335,6 +1641,47 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
             }
         };
         let grid = Grid::rasterize_midpoint(part, pitch)?;
+        let allowable = material.allowable_stress_mpa.expect("validated") / case.safety_factor;
+        let surface = || fine.surface.iter();
+        fields.push(with_exclusion(
+            field(
+                &case.id,
+                Quantity::Stress,
+                part,
+                "MPa",
+                Some(allowable),
+                0.0,
+                &grid,
+                surface().map(|s| (s.cell, s.stress, s.excluded)),
+            ),
+            exclusion,
+        ));
+        if layered {
+            let interlayer = material.interlayer_allowable_stress_mpa.expect("validated");
+            fields.push(with_exclusion(
+                field(
+                    &case.id,
+                    Quantity::Interlayer,
+                    part,
+                    "MPa",
+                    Some(interlayer / case.safety_factor),
+                    0.0,
+                    &grid,
+                    surface().map(|s| (s.cell, s.interlayer.max(0.0), s.excluded)),
+                ),
+                exclusion,
+            ));
+        }
+        fields.push(field(
+            &case.id,
+            Quantity::Deflection,
+            part,
+            "mm",
+            case.max_deflection_mm,
+            0.0,
+            &grid,
+            surface().map(|s| (s.cell, s.deflection, false)),
+        ));
         let context = format!(
             "part {}; safety factor {}; {} CG iterations; stresses at element corners, excluding cells within {exclusion} mm of supports and loads",
             part.id, case.safety_factor, fine.iterations
@@ -1352,7 +1699,6 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
                 ),
             )
         };
-        let allowable = material.allowable_stress_mpa.expect("validated") / case.safety_factor;
         checks.push(if excluded_everywhere {
             everything_near(stress_target)
         } else {
@@ -1445,6 +1791,18 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
             .chain(case.fixed_temperatures.iter().map(|t| t.celsius))
             .fold(f64::MAX, f64::min);
         let grid = Grid::rasterize_midpoint(part, pitch)?;
+        fields.push(field(
+            &case.id,
+            Quantity::Temperature,
+            part,
+            "°C",
+            Some(case.max_temperature_c),
+            reference,
+            &grid,
+            fine.surface
+                .iter()
+                .map(|(cell, value)| (*cell, *value, false)),
+        ));
         checks.push(limit_check(
             &grid,
             Rule::Thermal,
@@ -1461,7 +1819,7 @@ pub fn evaluate(model: &Model) -> Result<Vec<Check>, String> {
             ),
         ));
     }
-    Ok(checks)
+    Ok((checks, fields))
 }
 
 #[cfg(test)]
@@ -1683,6 +2041,53 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         let across = value(check, "tension across layers");
         assert!(across < 1e-6, "{across}");
+    }
+
+    #[test]
+    fn fields_hold_surface_values_and_sample_mesh_vertices() {
+        // 引張棒の表面の応力は一様に10 MPa、両端から4 mmの表面は判定しない近傍である。
+        let mut model = bar(20.0, 6.0, 6.0, molding());
+        model
+            .analyses
+            .structural
+            .push(cantilever("pull", 20.0, [360.0, 0.0, 0.0]));
+        let (_, fields) = evaluate_with_fields(&model).unwrap();
+        let quantities: Vec<Quantity> = fields.iter().map(|f| f.quantity).collect();
+        assert_eq!(quantities, [Quantity::Stress, Quantity::Deflection]);
+        let stress = &fields[0];
+        assert_eq!(stress.limit, Some(100.0));
+        assert_eq!(stress.exclusion_mm, Some(4.0));
+        assert_eq!(stress.cells.len(), stress.values.len());
+        assert_eq!(stress.excluded.len(), stress.cells.len());
+        assert!(stress.values.iter().all(|v| (v - 10.0).abs() < 1e-3));
+
+        // 中央、拘束した端面、部品から離れた点。
+        let (values, excluded) = sample(
+            stress,
+            &[[10.0, 0.0, 3.0], [0.0, 3.0, 3.0], [50.0, 3.0, 3.0]],
+        );
+        assert!((values[0] - 10.0).abs() < 1e-3);
+        assert_eq!(excluded[..2], [false, true]);
+        assert!(values[2].is_nan());
+
+        // 変位は拘束端で0、引く端で0.2 mm。
+        let (values, _) = sample(&fields[1], &[[0.0, 3.0, 3.0], [20.0, 3.0, 3.0]]);
+        assert!(
+            values[0] < 0.02 && (values[1] - 0.2).abs() < 0.02,
+            "{values:?}"
+        );
+
+        // 熱のケースは温度の分布を持ち、基準は固定温度。
+        let (_, fields) = evaluate_with_fields(&rod(|case| {
+            case.fixed_temperatures.push(FixedTemperature {
+                region: end(20.0),
+                celsius: 20.0,
+            })
+        }))
+        .unwrap();
+        assert_eq!(fields[0].quantity, Quantity::Temperature);
+        assert_eq!(fields[0].reference, 20.0);
+        assert!(fields[0].excluded.is_empty());
     }
 
     #[test]

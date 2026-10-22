@@ -1,12 +1,17 @@
+import base64
 from dataclasses import replace
 import json
+from pathlib import Path
+import re
+import tempfile
 import unittest
 
 from typedsolid import (
     Analyses, AtFastener, Box, Convection, Elastic, Feature, FixedTemperature, Force, HeatInput, ManufacturingPlan,
     Material, Model, Molding, Part, Policy, StructuralCase, Surface, ThermalCase, _native,
 )
-from typedsolid.cadquery import build
+from examples.bracket_analysis import bracket
+from typedsolid.cadquery import build, write_viewer_figure
 
 # 解析解と比べやすいよう、ポアソン比を0とした仮の材料。
 RESIN = Material(
@@ -114,6 +119,33 @@ class AnalysisBuildTests(unittest.TestCase):
         message = by_target(build(bar(Analyses(thermal=(coarse,)))), "heat/temperature")["message"]
         self.assertIn("(grid 1 mm)", message)
         self.assertIn("(grid 4 mm)", message)
+
+    def test_viewer_embeds_the_surface_fields(self):
+        """解析の分布は部品meshの頂点ごとの値としてviewerに入る。引張棒の表面の応力は一様である。"""
+        result = build(bar(Analyses(structural=(PULL,), thermal=(HEAT,))))
+        self.assertEqual(
+            [(f["case"], f["quantity"]) for f in result.fields],
+            [("pull", "stress"), ("pull", "deflection"), ("heat", "temperature")],
+        )
+        with tempfile.TemporaryDirectory(dir=".work") as root:
+            html = write_viewer_figure(result, Path(root) / "viewer.html").read_text(encoding="utf-8")
+        data = json.loads(re.search(r'id="viewer-data">(.*?)</script>', html, re.S).group(1))
+        stress = next(f for f in data["fields"] if f["quantity"] == "stress")
+        self.assertEqual((stress["part"], stress["unit"], stress["limit"]), ("bar", "MPa", 50.0))
+        self.assertAlmostEqual(stress["minimum"], 10.0, places=3)
+        self.assertAlmostEqual(stress["maximum"], 10.0, places=3)
+        # 両端の拘束と荷重の近傍の頂点は判定しない。
+        self.assertIn(1, base64.b64decode(stress["excluded"]))
+        heat = next(f for f in data["fields"] if f["quantity"] == "temperature")
+        self.assertEqual(heat["reference"], 20.0)
+
+    def test_bracket_example_evaluates_the_rounded_corner(self):
+        """作例のL字の金具は、丸めた付け根の応力とたわみが収束して上限を満たす。"""
+        result = build(bracket())
+        self.assertTrue(result.export_allowed)
+        for target in ("arm_load/stress", "arm_load/deflection"):
+            check = by_target(result, target)
+            self.assertEqual(check["status"], "pass", check["message"])
 
     def test_exceeding_a_limit_fails_with_locations(self):
         hot = replace(HEAT, max_temperature_c=50.0, convection=(Convection(Surface(), 5.0, 20.0),))
