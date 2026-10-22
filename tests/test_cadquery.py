@@ -13,7 +13,7 @@ import cadquery as cq
 from examples.board_tray import board_tray
 from typedsolid import (
     Box, Clearance, Cylinder, Fdm, Feature, Keepout, ManufacturingPlan, Model, Orientation, Part, Policy, Resin,
-    hole,
+    hole, inner_fillet, round_edge,
 )
 from typedsolid.cadquery import build, export
 
@@ -56,6 +56,22 @@ class CadQueryTests(unittest.TestCase):
         result = build(add_feature(block(), Feature("slot", Box((4, -1, -1), (6, 11, 11)), operation="cut")))
         self.assertFalse(result.export_allowed)
         self.assertTrue(failures(result, "single_solid"))
+
+    def test_fillets_round_edges_and_fill_inner_corners(self):
+        """丸めた辺は正方形と四分円の差だけ体積が減り、埋めた内角は同じだけ増える。"""
+        corner = (2.0 ** 2 - math.pi * 2.0 ** 2 / 4) * 10.0
+        rounded = build(add_feature(block(), round_edge("edge", "z", (10, 10), 2.0, (0, 10), ("minus_x", "minus_y"))))
+        self.assertTrue(rounded.export_allowed, failures(rounded, "valid_solid"))
+        self.assertAlmostEqual(rounded.shapes["block"].Volume(), 1000.0 - corner, places=3)
+
+        floor = Part("bracket", (
+            Feature("floor", Box((0, 0, 0), (10, 10, 2))),
+            Feature("wall", Box((0, 0, 0), (2, 10, 10))),
+            inner_fillet("corner", "y", (2, 2), 2.0, (0, 10), ("plus_x", "plus_z")),
+        ))
+        result = build(Model((floor,)))
+        self.assertEqual(len(result.shapes["bracket"].Solids()), 1)
+        self.assertAlmostEqual(result.shapes["bracket"].Volume(), 200.0 + 160.0 + corner, places=3)
 
     def test_complete_removal_fails(self):
         result = build(add_feature(block(), Feature("remove", Box((-1, -1, -1), (11, 11, 11)), operation="cut")))

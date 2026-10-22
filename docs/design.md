@@ -37,15 +37,17 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 部品catalogはIRを組み立てるための寸法データであり、検証には関与しない。catalogが返す`Keepout`と`Feature`は手で書いたものと区別されず、同じRust coreで検証される。値はすべて公式資料が寸法線として与える数値に限り、記載のない項目は`None`として利用側に指定を求める。詳細は [部品catalog](catalog.md) を参照する。
 
-## IR v13
+## IR v14
 
 - 長さはmm。座標は右手系で全Part共通、+Zを上方とする。回転・配置変換はまだ扱わない。
-- `Model`は`schema_version=13`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`analyses`、`policy`を持つ。`analyses`は解析ケースを持たなければ出力を省く。
+- `Model`は`schema_version=14`、`parts`、`keepouts`、`sweeps`、`assembly`、`fasteners`、`materials`、`snap_fits`、`connectors`、`analyses`、`policy`を持つ。`analyses`は解析ケースを持たなければ出力を省く。
 - `Part`は単独の製造部品。`Feature`のIDはPart内で一意、Part IDとKeepout IDは各名前空間内で一意とする。
 - `Part`は製造案`manufacturing` (1〜16件) と、そのうち採用する案のid`adopted`を持つ。IRに記述した座標は組立状態の姿勢であり、製造時の姿勢は製造案が持つ。詳細は [製造案](#製造案) を参照する。
 - `Feature`は`shape`、`role`、`operation`を持つ。roleは`base/wall/mount/rib/generic`。roleだけで強度を保証しない。
 - `shape`は`kind`で分岐する。`box`は`min`/`max`、`cylinder`は`axis`、軸に垂直な平面上の`center`、`radius`、軸方向の`span`を持つ。cylinderは軸平行に限る。任意軸は配置変換とあわせて後続項目とする。
-- 穴は`operation=cut`のcylinder、bossは`add`のcylinderで表す。面取り・filletはOCCTのedge選択に依存するため導入しない。
+- `fillet`は軸平行の辺に沿う丸みで、`axis`、軸に垂直な平面上の辺の位置`edge` (並びは`center`と同じ)、`radius`、`span`、辺から正方形を取る2方向`toward` (軸に垂直な2軸を`edge`と同じ順に並べる) を持つ。形は一辺`radius`の正方形の柱から、奥の角を軸とする半径`radius`の円柱を引いたものである。`add`では凹んだ内角を埋め、`cut`では凸の辺を丸める。OCCTのedge選択は使わず、boxとcylinderのBooleanで作る。掃引の形状には使えない。
+- 穴は`operation=cut`のcylinder、bossは`add`のcylinderで表す。面取りと、辺を選んで丸めるOCCTのfilletは、edge選択に依存するため導入しない。
+- filletの最小feature寸法は半径と長さの小さい方とする。先端は厚さが0に近づくが、他のfeatureと一体になる部分であり、その薄さは最終形状の肉厚の検査が見る。
 - Booleanの意味は「すべてのAddの和から、すべてのCutを引く」。記述順依存の逐次CSGではない。Cutは生成用であり、最小feature寸法ルールの対象外。
 - 最小feature寸法はprimitiveの寸法を測る。cylinderは直径と高さの小さい方とする。
 - `Keepout`は確保領域と面ごとのclearanceを持つ。`clearance_mm`は`default`と面名 (`minus_x`等) の上書きからなる。支持面へ接触させる面だけを0にでき、他の面の要求は残る。
@@ -68,7 +70,7 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 
 ### 旧版からの昇格
 
-`schema_version`が1〜12のJSONは、読み込み時に順に昇格してv13へ変換する。いずれも対応は一意に定まる。
+`schema_version`が1〜13のJSONは、読み込み時に順に昇格してv14へ変換する。いずれも対応は一意に定まる。
 
 - v1→v2: v1は軸平行box、一様clearance、単一accessだけを表現できる。`bounds`は`shape`の`kind=box`へ、数値の`clearance_mm`は`{"default": n}`へ、`access`の文字列は1要素の配列へ、`null`は空配列へ移す。
 - v2→v3: v2は分解手順を持たないため、空の`assembly`を補う。v2の入力に`assembly`が現れた場合は拒否する。
@@ -82,8 +84,9 @@ JSONは初期のFFI・保存境界であり、Python scriptの文字列を評価
 - v10→v11: v10は切削と射出成形の製造案を持たないため、そのまま受理する。v10の入力に`kind`が`milling`か`molding`の製造案が現れた場合は拒否する。
 - v11→v12: v11の姿勢は傾きを持たず、`turn_deg`は直角に限られたため、そのまま受理する。v11の入力に`tilt_deg`が現れた場合は拒否する。
 - v12→v13: v12は解析ケースと解析の材料定数を持たないため、そのまま受理する。v12の入力に`analyses`か、材料の`elastic`、`allowable_stress_mpa`、`interlayer_allowable_stress_mpa`、`thermal_conductivity_w_per_mk`が現れた場合は拒否する。
+- v13→v14: v13はfilletの形状を持たないため、そのまま受理する。v13の入力に`kind`が`fillet`の形状が現れた場合は拒否する。
 
-出力は常にv13で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
+出力は常にv14で、旧版では書き出さない。Python APIの`Keepout(access=...)`は、`to_json`が同じ規則で`Sweep`へ展開する省略形として残す。
 
 ## 検査と出力
 
@@ -393,11 +396,17 @@ Python APIの`connector_opening`は、抜く向き、プラグ断面の中心と
 | 一端加熱・他端固定温度の棒 | T = T₀ + QL/(kA) | 一致 |
 | 同、他端を対流 | 膜の抵抗Q/(hA)を加えた値 | 一致 |
 | L字の腕の付け根の内角 | 応力の特異点 | 1.31、1.62、2.12 MPaと増え、not_evaluated |
+| 同、3倍 (部材の厚さ12 mm、格子1 mm) の鋭い内角 | 応力の特異点 | 1.47、2.10、2.79 MPaと増え、not_evaluated |
+| 同、内角を半径6 mmで丸めたもの | 公称の曲げ応力1.11 MPa | 2.18、2.01、1.47 MPaと収束し、判定値2.34 MPa |
 
 ### 作例と制約
 
 Raspberry Pi 4の筐体の底は、基板を締めるbossから0.05 Wを受け、外面から25 °C、内面から筐体内の空気40 °Cへ放熱する。0.5 mmの格子で最高温度は50.2、49.7、48.6 °C (h、2h、4h) と収束し、判定値50.7 °Cで上限55 °Cを満たす。解く時間は4 coreで約9秒である。欠陥版では、基板の領域に入り込んだboss 0のshimが基板から熱を受け、床から離れた細い円柱であるため55.8 °Cとなり、不合格となる。超過箇所はshimの位置に示される。shimを除くと50.2 °Cで合格し、床の削り込みを除いても結果は変わらない。
 
-蓋を四隅のネジの座面で支え、天板の中央を20 Nで押すケースは収束しなかった。0.5 mmの格子で変位は1.085、0.946、1.038 mmと単調でなく、除外域の外の応力も16.9、10.9、12.1 MPaであった。厚さ2 mmの天板と通気スリットが4hの格子 (2 mm) で崩れ、スリットの端とlipの付け根の鋭い内角が特異点となるためである。解く時間は約3分であった。IRはfilletを持たないため、荷重を受ける接合部の応力はnot_evaluatedとなりやすい。作例は強度のケースを持たない。
+蓋を四隅のネジの座面で支え、天板の中央を20 Nで押すケースは収束しなかった。0.5 mmの格子で変位は1.085、0.946、1.038 mmと単調でなく、除外域の外の応力も16.9、10.9、12.1 MPaであった。厚さ2 mmの天板と通気スリットが4hの格子 (2 mm) で崩れ、スリットの端とlipの付け根の鋭い内角が特異点となるためである。解く時間は約3分であった。lipの付け根の内側を半径1.5 mmで丸めても、1 mmと2 mmの格子の値は丸めない場合と同じであり、0.5 mmの格子の応力も16.9 MPaから16.7 MPaに変わっただけで、収束しなかった。作例は強度のケースを持たない。
+
+### 丸みと格子
+
+鋭い内角の応力は細分するほど増えるため、荷重を受ける接合部は`fillet`で丸める。丸めた面も格子では階段状に表され、丸みの効果が3つの格子に現れるには、部材が最も粗い格子 (4h) で3 cell以上の厚さを持ち、半径がその格子間隔の1.5倍程度以上である必要がある。厚さ4 mmのL字を0.5 mmの格子で解くと、半径2〜8 mmのいずれでも応力は収束しなかった。1 mmの格子では半径2 mmと3 mmの丸みがどちらも約1 cellとなり、区別されない。応力の評価点を要素の中心にしても収束しなかった。厚さ2 mmの壁を持つ筐体では、この条件に必要な格子 (約0.125 mm) の計算時間が実用的でない。
 
 接触、ネジの締結力、異方性 (層間以外)、大変形、座屈、放射、空気の流れは扱わない。印刷用STLを解析meshとして使わない。

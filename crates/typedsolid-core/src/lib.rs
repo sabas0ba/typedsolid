@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 本buildが生成するschema。読み込みは旧版からの昇格も受理する。
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// 座標の絶対値上限。単位はmm。
 const COORDINATE_LIMIT_MM: f64 = 1e6;
@@ -136,6 +136,17 @@ pub enum Shape {
         radius: f64,
         span: [f64; 2],
     },
+    /// 軸平行の辺に沿う丸み。軸に垂直な平面上の辺の位置`edge`から`toward`の2方向へ
+    /// 一辺`radius`の正方形を取り、その奥の角を中心とする半径`radius`の円を除いた形を、
+    /// 軸方向の範囲`span`に伸ばす。addでは凹んだ内角を埋め、cutでは凸の辺を丸める。
+    /// `toward`は軸に垂直な2軸の方向を、`edge`と同じ軸順に並べる。OCCTの辺の選択は使わない。
+    Fillet {
+        axis: Axis,
+        edge: [f64; 2],
+        radius: f64,
+        span: [f64; 2],
+        toward: [Direction; 2],
+    },
 }
 
 fn finite_coordinate(value: f64) -> Result<(), String> {
@@ -190,6 +201,39 @@ impl Shape {
                     finite_coordinate(high[axis])?;
                 }
             }
+            Self::Fillet {
+                axis,
+                edge,
+                radius,
+                span,
+                toward,
+            } => {
+                for value in edge.iter().chain(span.iter()) {
+                    finite_coordinate(*value)?;
+                }
+                if !radius.is_finite() || *radius < MINIMUM_EXTENT_MM {
+                    return Err(format!(
+                        "fillet radius must be finite and at least {MINIMUM_EXTENT_MM} mm"
+                    ));
+                }
+                if span[1] - span[0] < MINIMUM_EXTENT_MM {
+                    return Err(format!(
+                        "fillet span must be at least {MINIMUM_EXTENT_MM} mm"
+                    ));
+                }
+                let plane = axis.plane();
+                if (0..2).any(|k| toward[k].axis().index() != plane[k]) {
+                    return Err(
+                        "fillet toward must list the two directions perpendicular to the axis in the order of edge"
+                            .into(),
+                    );
+                }
+                let (low, high) = self.aabb();
+                for axis in 0..3 {
+                    finite_coordinate(low[axis])?;
+                    finite_coordinate(high[axis])?;
+                }
+            }
         }
         Ok(())
     }
@@ -214,16 +258,42 @@ impl Shape {
                 }
                 (low, high)
             }
+            Self::Fillet {
+                axis,
+                edge,
+                radius,
+                span,
+                toward,
+            } => {
+                let mut low = [0.0; 3];
+                let mut high = [0.0; 3];
+                low[axis.index()] = span[0];
+                high[axis.index()] = span[1];
+                for (slot, index) in axis.plane().into_iter().enumerate() {
+                    let far = edge[slot]
+                        + if toward[slot].is_positive() {
+                            *radius
+                        } else {
+                            -radius
+                        };
+                    low[index] = edge[slot].min(far);
+                    high[index] = edge[slot].max(far);
+                }
+                (low, high)
+            }
         }
     }
 
-    /// 最小feature寸法ルールが測る値。cylinderは直径と高さの小さい方とする。
+    /// 最小feature寸法ルールが測る値。cylinderは直径と高さの小さい方とする。filletは
+    /// 半径と長さの小さい方とする。filletの先端は厚さが0に近づくが、他のfeatureと一体に
+    /// なる部分であり、その薄さは最終形状の肉厚の検査が見る。
     pub fn minimum_dimension(&self) -> f64 {
         match self {
             Self::Box { min, max } => (0..3)
                 .map(|i| max[i] - min[i])
                 .fold(f64::INFINITY, f64::min),
             Self::Cylinder { radius, span, .. } => (radius * 2.0).min(span[1] - span[0]),
+            Self::Fillet { radius, span, .. } => radius.min(span[1] - span[0]),
         }
     }
 
@@ -249,6 +319,34 @@ impl Shape {
                 let du = point[first] - center[0];
                 let dv = point[second] - center[1];
                 du * du + dv * dv <= radius * radius
+            }
+            Self::Fillet {
+                axis,
+                edge,
+                radius,
+                span,
+                toward,
+            } => {
+                let along = point[axis.index()];
+                if along < span[0] || along > span[1] {
+                    return false;
+                }
+                // 辺から`toward`へ測った距離。正方形の内側は0〜radiusとなる。
+                let plane = axis.plane();
+                let depth: [f64; 2] = std::array::from_fn(|k| {
+                    let offset = point[plane[k]] - edge[k];
+                    if toward[k].is_positive() {
+                        offset
+                    } else {
+                        -offset
+                    }
+                });
+                if depth.iter().any(|d| *d < 0.0 || *d > *radius) {
+                    return false;
+                }
+                let du = radius - depth[0];
+                let dv = radius - depth[1];
+                du * du + dv * dv >= radius * radius
             }
         }
     }
@@ -526,6 +624,12 @@ impl Sweep {
         step_ids: &BTreeSet<&String>,
     ) -> Result<(), String> {
         match (&self.shape, &self.keepout) {
+            (Some(Shape::Fillet { .. }), None) => {
+                return Err(format!(
+                    "sweep {}: shape must be a box or a cylinder",
+                    self.id
+                ));
+            }
             (Some(shape), None) => shape
                 .validate()
                 .map_err(|e| format!("sweep {}: {e}", self.id))?,
@@ -1134,7 +1238,7 @@ fn box_bounds(part: &Part, feature_id: &str) -> Option<([f64; 3], [f64; 3])> {
         .find(|f| f.id == feature_id && f.operation == Operation::Add)
         .and_then(|f| match f.shape {
             Shape::Box { min, max } => Some((min, max)),
-            Shape::Cylinder { .. } => None,
+            Shape::Cylinder { .. } | Shape::Fillet { .. } => None,
         })
 }
 
@@ -1807,6 +1911,37 @@ fn upgrade_v12(value: &mut Value) -> Result<(), String> {
             return Err(format!("schema_version 12 does not define material {key}"));
         }
     }
+    root.insert("schema_version".into(), json!(13));
+    Ok(())
+}
+
+/// schema v13のJSONをv14へ変換する。v13はfilletの形状を持たないため、そのまま受理する。
+/// v13の入力に`kind`が`fillet`の形状が現れた場合は拒否する。
+fn upgrade_v13(value: &mut Value) -> Result<(), String> {
+    let root = value.as_object_mut().ok_or("model must be a JSON object")?;
+    let is_fillet = |shape: Option<&Value>| {
+        shape
+            .and_then(|shape| shape.get("kind"))
+            .and_then(Value::as_str)
+            == Some("fillet")
+    };
+    let features = root
+        .get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("features").and_then(Value::as_array))
+        .flatten();
+    let others = ["keepouts", "sweeps"]
+        .into_iter()
+        .filter_map(|key| root.get(key).and_then(Value::as_array))
+        .flatten();
+    if features
+        .chain(others)
+        .any(|item| is_fillet(item.get("shape")))
+    {
+        return Err("schema_version 13 does not define the fillet shape".into());
+    }
     root.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Ok(())
 }
@@ -1854,6 +1989,7 @@ impl Model {
             upgrade_v10,
             upgrade_v11,
             upgrade_v12,
+            upgrade_v13,
         ];
         match value.get("schema_version").and_then(Value::as_u64) {
             Some(version) if (1..=u64::from(SCHEMA_VERSION)).contains(&version) => {
@@ -3023,6 +3159,129 @@ mod tests {
                 other => other,
             }
         }
+    }
+
+    /// 床 (z < 2) と壁 (x < 2) の内角を埋める半径2 mmの丸み。
+    fn corner_fillet() -> Shape {
+        Shape::Fillet {
+            axis: Axis::Y,
+            edge: [2.0, 2.0],
+            radius: 2.0,
+            span: [0.0, 10.0],
+            toward: [Direction::PlusX, Direction::PlusZ],
+        }
+    }
+
+    #[test]
+    fn fillet_fills_the_corner_outside_the_arc() {
+        let fillet = corner_fillet();
+        // 辺の近くは埋まり、円の中心 (4, 4) の近くは空く。
+        assert!(fillet.contains([2.1, 5.0, 2.1]));
+        assert!(!fillet.contains([3.9, 5.0, 3.9]));
+        // 円弧の外側で正方形の内側。
+        assert!(fillet.contains([2.1, 5.0, 3.0]));
+        // 正方形の外と、軸方向の範囲の外。
+        assert!(!fillet.contains([1.9, 5.0, 2.1]));
+        assert!(!fillet.contains([2.1, 10.5, 2.1]));
+        let (low, high) = fillet.aabb();
+        assert_eq!((low, high), ([2.0, 0.0, 2.0], [4.0, 10.0, 4.0]));
+        assert_eq!(fillet.minimum_dimension(), 2.0);
+
+        // 凸の辺を丸めるcutは、角から内側へ向ける。
+        let rounding = Shape::Fillet {
+            axis: Axis::Z,
+            edge: [10.0, 10.0],
+            radius: 3.0,
+            span: [0.0, 5.0],
+            toward: [Direction::MinusX, Direction::MinusY],
+        };
+        assert!(rounding.contains([9.9, 9.9, 1.0]));
+        assert!(!rounding.contains([7.5, 7.5, 1.0]));
+        assert_eq!(rounding.aabb(), ([7.0, 7.0, 0.0], [10.0, 10.0, 5.0]));
+    }
+
+    #[test]
+    fn fillet_directions_follow_the_plane_order() {
+        let invalid = |shape: Shape| {
+            let mut m = model();
+            m.parts[0].features.push(Feature {
+                id: "round".into(),
+                role: Role::Generic,
+                operation: Operation::Add,
+                shape,
+            });
+            m.validate()
+        };
+        let Shape::Fillet {
+            axis, edge, span, ..
+        } = corner_fillet()
+        else {
+            unreachable!()
+        };
+        // 軸Yの面はx、zの順。
+        let swapped = Shape::Fillet {
+            axis,
+            edge,
+            radius: 2.0,
+            span,
+            toward: [Direction::PlusZ, Direction::PlusX],
+        };
+        assert!(invalid(swapped).unwrap_err().contains("toward"));
+        let along = Shape::Fillet {
+            axis,
+            edge,
+            radius: 2.0,
+            span,
+            toward: [Direction::PlusX, Direction::PlusY],
+        };
+        assert!(invalid(along).is_err());
+        let tiny = Shape::Fillet {
+            axis,
+            edge,
+            radius: 0.0001,
+            span,
+            toward: [Direction::PlusX, Direction::PlusZ],
+        };
+        assert!(invalid(tiny).unwrap_err().contains("radius"));
+        assert!(invalid(corner_fillet()).is_ok());
+    }
+
+    #[test]
+    fn fillet_is_not_a_sweep_shape() {
+        let mut m = model();
+        m.sweeps.push(Sweep {
+            id: "tool".into(),
+            shape: Some(corner_fillet()),
+            keepout: None,
+            direction: Direction::PlusZ,
+            distance_mm: Distance::Keyword(DistanceKeyword::Exit),
+            after_step: None,
+        });
+        assert!(m.validate().unwrap_err().contains("box or a cylinder"));
+    }
+
+    #[test]
+    fn schema_13_cannot_contain_fillets() {
+        let mut m = model();
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["schema_version"] = 13.into();
+        assert_eq!(
+            Model::from_json(&value.to_string()).unwrap().schema_version,
+            SCHEMA_VERSION
+        );
+        m.parts[0].features.push(Feature {
+            id: "round".into(),
+            role: Role::Generic,
+            operation: Operation::Add,
+            shape: corner_fillet(),
+        });
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["schema_version"] = 13.into();
+        assert!(
+            Model::from_json(&value.to_string())
+                .unwrap_err()
+                .contains("fillet")
+        );
     }
 
     #[test]

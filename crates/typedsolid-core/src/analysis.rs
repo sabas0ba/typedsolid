@@ -1727,36 +1727,80 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sharp_inner_corner_does_not_converge() {
-        // L字の腕の付け根の内角は応力の特異点であり、細分するほど応力が増える。変位は収束する。
-        let mut model = bar(4.0, 6.0, 20.0, molding());
+    /// 縦の脚 (4 mm角、高さ20 mm) の上端から腕 (長さ20 mm、厚さ4 mm) が伸びるL字を`scale`倍した
+    /// もの。脚の下端を拘束し、腕の先端を押す。`fillet`を与えると腕の付け根の内角を丸める。
+    fn bracket(scale: f64, fillet: Option<f64>) -> Model {
+        let mut model = bar(4.0 * scale, 6.0 * scale, 20.0 * scale, molding());
         let mut arm = model.parts[0].features[0].clone();
         arm.id = "arm".into();
         arm.shape = Shape::Box {
-            min: [0.0, 0.0, 16.0],
-            max: [20.0, 6.0, 20.0],
+            min: [0.0, 0.0, 16.0 * scale],
+            max: [20.0 * scale, 6.0 * scale, 20.0 * scale],
         };
         model.parts[0].features.push(arm);
+        if let Some(radius) = fillet {
+            let mut round = model.parts[0].features[0].clone();
+            round.id = "corner".into();
+            round.shape = Shape::Fillet {
+                axis: crate::Axis::Y,
+                edge: [4.0 * scale, 16.0 * scale],
+                radius,
+                span: [0.0, 6.0 * scale],
+                toward: [Direction::PlusX, Direction::MinusZ],
+            };
+            model.parts[0].features.push(round);
+        }
         model.analyses.structural.push(StructuralCase {
             id: "bracket".into(),
             part: "bar".into(),
             supports: vec![Region::Box {
                 min: [-1.0, -1.0, -0.1],
-                max: [5.0, 7.0, 0.1],
+                max: [4.0 * scale + 1.0, 6.0 * scale + 1.0, 0.1],
             }],
             forces: vec![Force {
-                region: end(20.0),
+                region: end(20.0 * scale),
                 newtons: [0.0, 0.0, -1.0],
             }],
             safety_factor: 1.0,
             max_deflection_mm: Some(10.0),
             voxel_mm: None,
         });
-        let checks = evaluate(&model).unwrap();
+        model
+    }
+
+    #[test]
+    fn sharp_inner_corner_does_not_converge() {
+        // L字の腕の付け根の内角は応力の特異点であり、細分するほど応力が増える。変位は収束する。
+        let checks = evaluate(&bracket(1.0, None)).unwrap();
         let stress = find(&checks, "bracket/stress");
         assert_eq!(stress.status, Status::NotEvaluated, "{}", stress.message);
         let deflection = find(&checks, "bracket/deflection");
+        assert_eq!(deflection.status, Status::Pass, "{}", deflection.message);
+    }
+
+    #[test]
+    fn rounded_inner_corner_converges() {
+        // 部材の厚さ12 mmを格子1 mmで解く。最も粗い格子 (4 mm) でも厚さは3 cellある。鋭い内角の
+        // 応力は細分で増え続けるが、半径6 mmで丸めると3つの格子で収束する。
+        let at_one_millimetre = |mut model: Model| {
+            model.analyses.structural[0].voxel_mm = Some(1.0);
+            evaluate(&model).unwrap()
+        };
+        let sharp = at_one_millimetre(bracket(3.0, None));
+        let stress = find(&sharp, "bracket/stress");
+        assert_eq!(stress.status, Status::NotEvaluated, "{}", stress.message);
+
+        let rounded = at_one_millimetre(bracket(3.0, Some(6.0)));
+        let stress = find(&rounded, "bracket/stress");
+        assert_eq!(stress.status, Status::Pass, "{}", stress.message);
+        // 付け根の公称の曲げ応力6FL/(bt²)を下回らない。
+        let nominal = 6.0 * 1.0 * (60.0 - 12.0) / (18.0 * 12.0 * 12.0);
+        assert!(
+            value(stress, "von Mises stress") > nominal,
+            "{}",
+            stress.message
+        );
+        let deflection = find(&rounded, "bracket/deflection");
         assert_eq!(deflection.status, Status::Pass, "{}", deflection.message);
     }
 

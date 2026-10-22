@@ -41,7 +41,22 @@ class Cylinder:
     kind: Literal["cylinder"] = "cylinder"
 
 
-Shape = Box | Cylinder
+@dataclass(frozen=True)
+class Fillet:
+    """軸平行の辺に沿う丸み。辺の位置edge (軸に垂直な平面上の2座標、Cylinderのcenterと同じ軸順)
+    からtowardの2方向へ一辺radiusの正方形を取り、その奥の角を中心とする半径radiusの円を
+    除いた形を、軸方向の範囲spanに伸ばす。addでは凹んだ内角を埋め、cutでは凸の辺を丸める。
+    通常はinner_filletとround_edgeで作る。"""
+
+    axis: Axis
+    edge: Vec2
+    radius: float
+    span: Vec2
+    toward: tuple[Direction, Direction]
+    kind: Literal["fillet"] = "fillet"
+
+
+Shape = Box | Cylinder | Fillet
 
 
 @dataclass(frozen=True)
@@ -60,6 +75,23 @@ def hole(id: str, axis: Axis, center: Vec2, diameter: float, span: Vec2, role: R
 def boss(id: str, axis: Axis, center: Vec2, diameter: float, span: Vec2, role: Role = "mount") -> Feature:
     """軸平行の円柱台座。ネジ穴を設ける場合はholeと組み合わせる。"""
     return Feature(id, Cylinder(axis, center, diameter / 2.0, span), role, "add")
+
+
+def inner_fillet(
+    id: str, axis: Axis, edge: Vec2, radius: float, span: Vec2, toward: tuple[Direction, Direction],
+    role: Role = "generic",
+) -> Feature:
+    """凹んだ内角を埋める丸み。edgeは2つの面が交わる辺、towardは辺から空間へ向かう2方向
+    (軸に垂直な2軸の順)。鋭い内角は応力の特異点となるため、荷重を受ける接合部の解析に使う。"""
+    return Feature(id, Fillet(axis, edge, radius, span, toward), role, "add")
+
+
+def round_edge(
+    id: str, axis: Axis, edge: Vec2, radius: float, span: Vec2, toward: tuple[Direction, Direction],
+    role: Role = "generic",
+) -> Feature:
+    """凸の辺を丸める。edgeは丸める辺、towardは辺から材料の内側へ向かう2方向 (軸に垂直な2軸の順)。"""
+    return Feature(id, Fillet(axis, edge, radius, span, toward), role, "cut")
 
 
 @dataclass(frozen=True)
@@ -541,7 +573,7 @@ class Model:
     parts: tuple[Part, ...]
     keepouts: tuple[Keepout, ...] = ()
     policy: Policy = field(default_factory=Policy)
-    schema_version: int = 13
+    schema_version: int = 14
     units: Literal["mm"] = "mm"
     # 後から加えたfieldは末尾に置き、既存の位置引数 (parts, keepouts, policy) を保つ。
     assembly: Assembly = field(default_factory=Assembly)
