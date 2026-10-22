@@ -20,7 +20,7 @@ from examples.assembly_defects import lid_overlap
 from examples.defects import baseline
 from typedsolid import Box, Feature, Model, Part
 from typedsolid.cadquery import build, export, write_viewer_figure
-from typedsolid.viewer import MeshPart, render_viewer
+from typedsolid.viewer import NO_VALUE, MeshPart, field_overlay, render_viewer
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check-viewer.py"
 _spec = importlib.util.spec_from_file_location("check_viewer", SCRIPT)
@@ -78,6 +78,26 @@ class ViewerHtmlTests(TemporaryDirectoryTest):
         failing = [c for c in data["checks"] if c["status"] == "fail"]
         self.assertEqual(failing[0]["locations"], [{"min": [0, 0, 14], "max": [40, 30, 15]}])
         self.assertEqual(data["parts"][0]["bounds"], {"min": [0, 0, 0], "max": [40, 30, 15]})
+
+    def test_field_values_are_quantized_per_vertex(self):
+        """分布は頂点ごとのu16に量子化し、値の無い頂点と判定しない近傍を区別して埋め込む。"""
+        values = struct.pack("<4f", 10.0, 20.0, 15.0, float("nan"))
+        overlay = field_overlay(
+            "plate", {"case": "load", "quantity": "stress", "unit": "MPa", "limit": 40.0, "reference": 0.0,
+                      "pitch": 0.5, "exclusion_mm": 4.0, "part": "plate", "cells": [1], "values": [1.0]},
+            values, bytes([0, 1, 0, 0]),
+        )
+        self.assertEqual((overlay.minimum, overlay.maximum), (10.0, 20.0))
+        self.assertEqual(struct.unpack("<4H", overlay.values), (0, 65534, 32767, NO_VALUE))
+        self.assertEqual(overlay.excluded, bytes([0, 1, 0, 0]))
+        self.assertNotIn("cells", overlay.meta)
+        part = MeshPart("plate", struct.pack("<12f", 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0))
+        data = embedded(render_viewer([part], [], fields=[overlay]))
+        self.assertEqual(data["fields"][0]["exclusion_mm"], 4.0)
+        self.assertEqual(base64.b64decode(data["fields"][0]["excluded"]), bytes([0, 1, 0, 0]))
+        # 近傍を持たない分布は印を埋め込まない。
+        plain = field_overlay("plate", {"quantity": "deflection"}, values, bytes(4))
+        self.assertIsNone(plain.excluded)
 
     def test_text_cannot_close_the_script_or_inject_markup(self):
         hostile = '</script><script>alert(1)</script> & {{APP}}'
@@ -163,18 +183,34 @@ class ScreenshotCheckTests(TemporaryDirectoryTest):
         path = self.root / "white.png"
         path.write_bytes(png(width, height, [b"\xff" * width * 3] * height, [0] * height))
         found = check_viewer.fractions(path)
-        self.assertEqual(found, {"location": 0.0, "part": 0.0, "cap": 0.0})
-        viewer = check_viewer.Viewer("lid_overlap", ("tray", "lid"), [{"status": "pass"}, {"status": "fail"}], 17.0)
+        self.assertEqual(found, {"location": 0.0, "part": 0.0, "cap": 0.0, "field": 0.0})
+        checks = [{"status": "pass"}, {"status": "fail"}]
+        viewers = (
+            check_viewer.Viewer("lid_overlap", ("tray", "lid"), checks, 17.0),
+            check_viewer.Viewer("heated", ("base", "lid"), checks, 17.0, "temperature"),
+            check_viewer.Viewer("bracket", ("bracket",), [{"status": "pass"}], 60.0, "stress"),
+        )
         seen = {"selected": {"location": 0.01}}
-        for scene in check_viewer.scenes(viewer):
-            with self.subTest(scene=scene.name):
-                self.assertTrue(scene.expect(found, seen))
+        for viewer in viewers:
+            for scene in check_viewer.scenes(viewer):
+                with self.subTest(viewer=viewer.name, scene=scene.name):
+                    self.assertTrue(scene.expect(found, seen))
+        # 分布の状態は、分布の部品だけを描き、検査の一覧を分布の量のruleに絞る。
+        field = check_viewer.scenes(viewers[1])[0]
+        self.assertEqual(field.fragment, "#field=0&rule=thermal&view=30,55,1&hidden=lid")
+        # 不合格の検査を持たないfixtureは、概観と分布だけを撮る。
+        self.assertEqual([scene.name for scene in check_viewer.scenes(viewers[2])], ["field", "overview"])
 
     def test_colour_classes(self):
         self.assertTrue(check_viewer.is_location(214, 38, 40))
         self.assertTrue(check_viewer.is_location(120, 45, 50))
         self.assertFalse(check_viewer.is_location(204, 173, 122))
         self.assertTrue(check_viewer.is_part(110, 125, 145))
+        # 分布の連続色は青で、1番目の部品色の青みは陰影を付けても分布に数えない。
+        self.assertTrue(check_viewer.is_field(134, 182, 239))
+        self.assertTrue(check_viewer.is_field(13, 54, 107))
+        self.assertFalse(check_viewer.is_field(140, 158, 184))
+        self.assertFalse(check_viewer.is_field(70, 79, 92))
         self.assertFalse(check_viewer.is_part(255, 255, 255))
         # 1番目の部品色 (0.55, 0.62, 0.72) の斜線。陰影の下限 (0.5倍) の表面の色は切り口ではない。
         self.assertTrue(check_viewer.is_cap(49, 55, 64))

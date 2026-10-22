@@ -20,7 +20,7 @@ import sys
 
 from . import _native
 
-__all__ = ["MeshPart", "render_viewer", "stl_part", "write_viewer"]
+__all__ = ["FieldOverlay", "MeshPart", "field_overlay", "render_viewer", "stl_part", "write_viewer"]
 
 ASSETS = Path(__file__).resolve().parent / "viewer_assets"
 # 外接boxの座標を丸める小数点以下の桁数。OCCTの許容差による端数を除く。検出箇所と同じ桁である。
@@ -55,6 +55,49 @@ class MeshPart:
             key: [round(pick(coordinates[axis::3]), BOUNDS_DIGITS) + 0.0 for axis in range(3)]
             for key, pick in (("min", min), ("max", max))
         }
+
+
+# 分布の値はu16に量子化する。この値は表面の解析cellが近くに無い頂点を表す。
+NO_VALUE = 0xFFFF
+QUANTIZATION_STEPS = NO_VALUE - 1
+
+
+@dataclass(frozen=True)
+class FieldOverlay:
+    """部品meshの頂点ごとの解析の量。判定には使わず、viewerが表面を色分けする。
+
+    valuesは頂点ごとのu16 (little endian) で、minimumからmaximumを量子化した値かNO_VALUE。
+    excludedは頂点ごとに0か1のbyteで、拘束と荷重の近傍で応力を判定しない頂点を示す。
+    metaは解析が返した分布の属性 (case、quantity、unit、limit、reference、pitch、exclusion_mm)。
+    """
+
+    part: str
+    meta: dict
+    minimum: float
+    maximum: float
+    values: bytes
+    excluded: bytes | None
+
+
+def field_overlay(part: str, field: dict, values: bytes, excluded: bytes) -> FieldOverlay:
+    """頂点ごとのf32の値 (little endian、NaNは値なし) を量子化する。"""
+    floats = array("f")
+    floats.frombytes(values)
+    if sys.byteorder == "big":
+        floats.byteswap()
+    finite = [value for value in floats if value == value]
+    low, high = (min(finite), max(finite)) if finite else (0.0, 0.0)
+    span = high - low
+    quantized = array("H", (
+        NO_VALUE if value != value else (round((value - low) / span * QUANTIZATION_STEPS) if span > 0 else 0)
+        for value in floats
+    ))
+    if sys.byteorder == "big":
+        quantized.byteswap()
+    meta = {key: field[key] for key in ("case", "quantity", "unit", "limit", "reference", "pitch") if key in field}
+    if field.get("exclusion_mm") is not None:
+        meta["exclusion_mm"] = field["exclusion_mm"]
+    return FieldOverlay(part, meta, float(low), float(high), quantized.tobytes(), excluded if any(excluded) else None)
 
 
 def stl_part(id: str, stl: bytes) -> MeshPart:
@@ -92,16 +135,28 @@ def _part_data(part: MeshPart) -> dict:
     return data
 
 
+def _field_data(overlay: FieldOverlay) -> dict:
+    data = {
+        "part": overlay.part, **overlay.meta, "minimum": overlay.minimum, "maximum": overlay.maximum,
+        "values": _base64(overlay.values),
+    }
+    if overlay.excluded is not None:
+        data["excluded"] = _base64(overlay.excluded)
+    return data
+
+
 def render_viewer(
     parts: Sequence[MeshPart], checks: list[dict], keepouts: Sequence[tuple[str, Box3]] = (),
-    title: str = "TypedSolid",
+    title: str = "TypedSolid", fields: Sequence[FieldOverlay] = (),
 ) -> str:
-    """viewerのHTML。partsは三角形を1つ以上持つ部品に限ること。"""
+    """viewerのHTML。partsは三角形を1つ以上持つ部品に限ること。fieldsは部品meshの頂点の順に
+    値を持つ分布である。"""
     data = {
         "title": title,
         "units": "mm",
         "parts": [_part_data(part) for part in parts],
         "keepouts": [{"id": keepout_id, "min": list(low), "max": list(high)} for keepout_id, (low, high) in keepouts],
+        "fields": [_field_data(overlay) for overlay in fields],
         "checks": [
             {
                 key: check[key]
@@ -124,10 +179,10 @@ def render_viewer(
 
 def write_viewer(
     parts: Sequence[MeshPart], checks: list[dict], path: str | Path,
-    keepouts: Sequence[tuple[str, Box3]] = (), title: str = "TypedSolid",
+    keepouts: Sequence[tuple[str, Box3]] = (), title: str = "TypedSolid", fields: Sequence[FieldOverlay] = (),
 ) -> Path:
     """viewerのHTMLをpathへ書く。"""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(render_viewer(parts, checks, keepouts, title), encoding="utf-8")
+    target.write_text(render_viewer(parts, checks, keepouts, title, fields), encoding="utf-8")
     return target

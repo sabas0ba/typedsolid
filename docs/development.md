@@ -113,7 +113,7 @@ export(model, ".work/plate")
 
 全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。`inner_fillet`は凹んだ内角を埋める`add`の`Fillet`、`round_edge`は凸の辺を丸める`cut`の`Fillet`を作る。`toward`は、内角では辺から空間へ、凸の辺では辺から材料の内側へ向かう2方向を、軸に垂直な2軸の順に与える。応力・熱は`Model.analyses`に解析ケースを宣言すると判定する。宣言しない種類は未評価で残り、`Policy.required`に加えるとexportが拒否される。
 
-解析ケースは部品ごとに宣言し、材料に定数を与える。領域は`Box`、`Surface`、`AtFastener`、`AtKeepout`、`AtConnector`で指定する。格子間隔は`voxel_mm`で与え、省略すると`Policy.voxel_mm`を使う。2倍と4倍の格子でも解いて収束を確かめるため、4倍の格子で消える細い壁を含む部品は評価できない。手法と制約は [設計](design.md#解析) を参照する。
+解析ケースは部品ごとに宣言し、材料に定数を与える。領域は`Box`、`Surface`、`AtFastener`、`AtKeepout`、`AtConnector`で指定する。格子間隔は`voxel_mm`で与え、省略すると`Policy.voxel_mm`を使う。2倍と4倍の格子でも解いて収束を確かめるため、4倍の格子で消える細い壁を含む部品は評価できない。手法と制約は [設計](design.md#解析) を参照する。強度のケースの例は`examples/bracket_analysis.py` (腕の付け根を丸めたL字の金具) にある。
 
 ```python
 from typedsolid import (
@@ -373,7 +373,7 @@ except ValueError as error:
 
 ## 3D viewer
 
-`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所を埋め込んだ1つのHTMLを書く。外部の資源を読まないため、browserで`file://`のまま開ける。`build`の結果からは`typedsolid.cadquery.write_viewer_figure(result, path)`で書ける。操作と表示状態のURLは [設計](design.md#3d-viewer) を参照する。
+`export`は`figures/viewer.html`に、部品のmesh、keepout、全checkと検出箇所、解析ケースの表面分布を埋め込んだ1つのHTMLを書く。外部の資源を読まないため、browserで`file://`のまま開ける。`build`の結果からは`typedsolid.cadquery.write_viewer_figure(result, path)`で書ける。操作と表示状態のURLは [設計](design.md#3d-viewer) を参照する。
 
 viewerの描画は、`docker/viewer/Dockerfile`のimageの中のChromiumで撮影して確かめる。
 
@@ -382,7 +382,7 @@ make viewer-check                    # imageを作り、.work/viewer-check に�
 .venv/bin/python scripts/check-viewer.py --chromium /path/to/chromium   # containerを使わない場合
 ```
 
-撮影は`docker run --network none`で行い、書き出したローカルのHTMLだけを開く。各fixtureで概観、checkの選択と半透明、検出箇所の注視、断面の4状態を撮り、部品、検出箇所、断面の色が画面に現れることを確かめる。scriptやWebGLが失敗すると画面が白く残り、検査が失敗する。docsの画像は`--docs docs/assets/viewer`で撮影結果から複製する。画素の値はChromiumの版で変わりうるため、docsの画像とは照合しない。
+撮影は`docker run --network none`で行い、書き出したローカルのHTMLだけを開く。各fixtureで概観、checkの選択と半透明、検出箇所の注視、断面の4状態を撮り、部品、検出箇所、断面の色が画面に現れることを確かめる。解析の分布を持つfixtureでは、分布を表示した状態で分布の色が現れることも確かめる。scriptやWebGLが失敗すると画面が白く残り、検査が失敗する。docsの画像は`--docs docs/assets/viewer`で撮影結果から複製する。画素の値はChromiumの版で変わりうるため、docsの画像とは照合しない。
 
 ## slicerとの突合
 

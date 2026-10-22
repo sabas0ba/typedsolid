@@ -44,6 +44,17 @@
       <h2>Parts</h2>
       <ul id="parts" class="parts"></ul>
     </section>
+    <section id="field-section" hidden>
+      <h2>Analysis field</h2>
+      <div class="controls">
+        <select id="field" aria-label="analysis field"></select>
+        <select id="field-map" aria-label="colour map"></select>
+        <select id="field-scale" aria-label="colour range"></select>
+        <input id="field-low" type="number" step="any" aria-label="range low" placeholder="low">
+        <input id="field-high" type="number" step="any" aria-label="range high" placeholder="high">
+      </div>
+      <div id="field-legend" class="field-legend"></div>
+    </section>
     <section>
       <h2>Section <span id="clip-label" class="muted"></span></h2>
       <div class="controls">
