@@ -31,6 +31,12 @@
     yaw: 35,
     pitch: 25,
     zoom: 1,
+    // 表示する分布の番号。nullなら部品色で描く。
+    field: null,
+    map: "sequential",
+    scale: "limit",
+    // scaleが"custom"のときの範囲 [下端, 上端]。
+    range: null,
   });
 
   // ---- データの復号 ----
@@ -65,6 +71,20 @@
     return out;
   }
 
+  function decodeUint16(text) {
+    const bytes = bytesOfBase64(text);
+    const view = new DataView(bytes.buffer);
+    const out = new Uint16Array(bytes.length / 2);
+    for (let i = 0; i < out.length; i += 1) {
+      out[i] = view.getUint16(2 * i, true);
+    }
+    return out;
+  }
+
+  function decodeBytes(text) {
+    return bytesOfBase64(text);
+  }
+
   // 三角形ごとに頂点を複製し、面の法線を付ける。陰影で面の境界を見せるためである。
   // indicesがnullなら、positionsは三角形ごとに3頂点を並べたもの (STLの三角形) とする。
   function flatTriangles(positions, indices) {
@@ -83,6 +103,166 @@
       }
     }
     return { positions: outPositions, normals: outNormals };
+  }
+
+  // flatTrianglesと同じ順に、頂点ごとの値を三角形の隅ごとに並べ直す。
+  function expandPerVertex(values, indices) {
+    if (!indices) {
+      return values;
+    }
+    const out = new values.constructor(indices.length);
+    for (let i = 0; i < indices.length; i += 1) {
+      out[i] = values[indices[i]];
+    }
+    return out;
+  }
+
+  // ---- 分布の色 ----
+
+  // 量子化した分布 (u16) のうち、表面の解析cellが近くに無い頂点を表す値。Python側と同じである。
+  const NO_VALUE = 0xffff;
+  const QUANTIZATION_STEPS = NO_VALUE - 1;
+
+  function dequantize(field, codes) {
+    const out = new Float32Array(codes.length);
+    const span = field.maximum - field.minimum;
+    for (let i = 0; i < codes.length; i += 1) {
+      out[i] = codes[i] === NO_VALUE ? NaN : field.minimum + (codes[i] / QUANTIZATION_STEPS) * span;
+    }
+    return out;
+  }
+
+  function hexToRgb(hex) {
+    const value = parseInt(hex.slice(1), 16);
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255].map((c) => c / 255);
+  }
+
+  function toLinear(c) {
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  }
+
+  function fromLinear(c) {
+    const clamped = Math.min(1, Math.max(0, c));
+    return clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * clamped ** (1 / 2.4) - 0.055;
+  }
+
+  // sRGB (0〜1) とOKLabの変換。色は知覚的に一様なOKLabで補間する。
+  function rgbToOklab(rgb) {
+    const [r, g, b] = rgb.map(toLinear);
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return [
+      0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+    ];
+  }
+
+  function oklabToLinear(lab) {
+    const [L, a, b] = lab;
+    const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+    const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+    const s = (L - 0.0894841775 * a - 1.291485548 * b) ** 3;
+    return [
+      4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+      -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+      -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s,
+    ];
+  }
+
+  function oklabToRgb(lab) {
+    return oklabToLinear(lab).map(fromLinear);
+  }
+
+  // OKLabの明度を変えた色。色相を保ち、sRGBに収まらなければ明度を保って彩度を下げる。
+  function withLightness(hex, lightness) {
+    const [, a, b] = rgbToOklab(hexToRgb(hex));
+    const inside = (k) => oklabToLinear([lightness, a * k, b * k]).every((c) => c >= 0 && c <= 1);
+    let low = 0;
+    let high = 1;
+    if (!inside(high)) {
+      for (let i = 0; i < 30; i += 1) {
+        const k = (low + high) / 2;
+        if (inside(k)) {
+          low = k;
+        } else {
+          high = k;
+        }
+      }
+      high = low;
+    }
+    return oklabToRgb([lightness, a * high, b * high]);
+  }
+
+  function rgbToHex(rgb) {
+    return `#${rgb.map((c) => Math.round(c * 255).toString(16).padStart(2, "0")).join("")}`;
+  }
+
+  // 連続色は青の1色相を明るい側から暗い側へ並べる。発散色は青と赤を灰の中点で結び、
+  // 両端の明度を揃える。赤の暗い端は、赤の色相と彩度を保って青の暗い端の明度にした色である。
+  const BLUE_DARK = "#0d366b";
+  const RED = "#e34948";
+  const COLOURMAPS = Object.freeze({
+    sequential: Object.freeze({
+      label: "sequential (blue)",
+      stops: ["#86b6ef", "#3987e5", "#1c5cab", BLUE_DARK],
+    }),
+    diverging: Object.freeze({
+      label: "diverging (blue – grey – red)",
+      stops: [BLUE_DARK, "#3987e5", "#f0efec", RED, rgbToHex(withLightness(RED, rgbToOklab(hexToRgb(BLUE_DARK))[0]))],
+    }),
+  });
+  // 上限に対する比の尺度で、上限を超えた値の色。連続色の青と区別する。
+  const OVER_LIMIT = RED;
+
+  // 範囲の決め方。limitは基準値から上限まで、dataは値の最小から最大まで、divergingは上限を
+  // 中点とし基準値と最大値のうち上限から遠い方までを両側に取る、customは利用者が与える範囲である。
+  const SCALES = Object.freeze({
+    limit: "reference to limit",
+    data: "minimum to maximum",
+    diverging: "centred on the limit",
+    custom: "custom range",
+  });
+
+  function colourAt(name, t) {
+    const stops = (COLOURMAPS[name] || COLOURMAPS.sequential).stops;
+    const x = Math.min(1, Math.max(0, t)) * (stops.length - 1);
+    const k = Math.min(stops.length - 2, Math.floor(x));
+    const a = rgbToOklab(hexToRgb(stops[k]));
+    const b = rgbToOklab(hexToRgb(stops[k + 1]));
+    const f = x - k;
+    return oklabToRgb(a.map((v, i) => v + (b[i] - v) * f));
+  }
+
+  // 分布の色の範囲。上限の無い量では、limitとdivergingは値の最小から最大までとする。
+  function fieldScale(field, mode, range) {
+    const hasLimit = field.limit !== null && field.limit !== undefined;
+    if (mode === "custom" && range && range[1] > range[0]) {
+      return { low: range[0], high: range[1], over: false };
+    }
+    if (mode === "limit" && hasLimit) {
+      // 上限が基準値以下でも、上限を超える値は上限超過の色で示す。
+      const low = Math.min(field.reference, field.minimum);
+      return { low: low < field.limit ? low : field.limit - 1e-12, high: field.limit, over: true };
+    }
+    if (mode === "diverging" && hasLimit) {
+      const half = Math.max(field.limit - Math.min(field.reference, field.minimum), field.maximum - field.limit, 1e-12);
+      return { low: field.limit - half, high: field.limit + half, over: false };
+    }
+    const high = field.maximum > field.minimum ? field.maximum : field.minimum + 1e-12;
+    return { low: field.minimum, high, over: false };
+  }
+
+  // 値の色。値の無い頂点はnullとし、部品色で描く。
+  function fieldColour(value, scale, map) {
+    if (Number.isNaN(value)) {
+      return null;
+    }
+    if (scale.over && value > scale.high) {
+      return hexToRgb(OVER_LIMIT);
+    }
+    return colourAt(map, (value - scale.low) / (scale.high - scale.low));
   }
 
   // ---- ベクトルと行列 (列優先の4×4) ----
@@ -305,6 +485,20 @@
     if (SORT_KEYS.includes(params.get("sort"))) {
       state.sort = params.get("sort");
     }
+    if (params.has("field")) {
+      const field = parseNumber(params.get("field"), null);
+      state.field = Number.isInteger(field) && field >= 0 ? field : null;
+    }
+    if (Object.hasOwn(COLOURMAPS, params.get("map"))) {
+      state.map = params.get("map");
+    }
+    if (Object.hasOwn(SCALES, params.get("scale"))) {
+      state.scale = params.get("scale");
+    }
+    if (params.has("range")) {
+      const [low, high] = params.get("range").split(",").map((v) => parseNumber(v, null));
+      state.range = low !== null && high !== null && high > low ? [low, high] : null;
+    }
     if (params.has("view")) {
       const [yaw, pitch, zoom] = params.get("view").split(",");
       state.yaw = parseNumber(yaw || "", DEFAULT_STATE.yaw);
@@ -338,6 +532,17 @@
     }
     if (state.ghost.length) {
       params.set("ghost", state.ghost.join(","));
+    }
+    if (state.field !== null) {
+      params.set("field", String(state.field));
+    }
+    for (const key of ["map", "scale"]) {
+      if (state[key] !== DEFAULT_STATE[key]) {
+        params.set(key, state[key]);
+      }
+    }
+    if (state.range) {
+      params.set("range", state.range.map((v) => round(v, 6)).join(","));
     }
     for (const key of ["status", "rule", "plan", "q", "sort"]) {
       if (state[key] !== DEFAULT_STATE[key]) {
@@ -450,15 +655,29 @@
 
   return {
     AXES,
+    COLOURMAPS,
     DEFAULT_STATE,
+    NO_VALUE,
+    OVER_LIMIT,
+    SCALES,
     SORT_KEYS,
     STATUS_FILTERS,
     boxCentre,
     boxEdges,
     clipPlane,
     clipQuad,
+    colourAt,
+    decodeBytes,
     decodeFloat32,
+    decodeUint16,
     decodeUint32,
+    dequantize,
+    expandPerVertex,
+    fieldColour,
+    fieldScale,
+    hexToRgb,
+    rgbToHex,
+    rgbToOklab,
     filterChecks,
     fitDistance,
     fittingFov,

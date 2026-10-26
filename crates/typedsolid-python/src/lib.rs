@@ -35,11 +35,87 @@ fn evaluate_snap_fits(json: &str) -> PyResult<String> {
 }
 
 /// 解析ケースの線形弾性と定常熱伝導。IRから直接rasterizeするためbackendに依存しない。
+/// `{"checks": [...], "fields": [...]}`を返す。fieldsは表面の分布で、判定には使わない。
 #[pyfunction]
 fn evaluate_analyses(json: &str) -> PyResult<String> {
     let model = Model::from_json(json).map_err(PyValueError::new_err)?;
-    let checks = analysis::evaluate(&model).map_err(PyValueError::new_err)?;
-    serde_json::to_string(&checks).map_err(|e| PyValueError::new_err(e.to_string()))
+    let (checks, fields) = analysis::evaluate_with_fields(&model).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&serde_json::json!({"checks": checks, "fields": fields}))
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// 分布を点に標本化する。positionsは点ごとに3つのlittle endianのf32を並べたもの。
+/// 点ごとの値 (little endianのf32、表面のcellが近くに無ければNaN) と、判定しない近傍か
+/// (0か1のbyte) を返す。
+/// 分布を色で描くための三角形。positionsは頂点ごとに3つのlittle endianのf32、indicesは
+/// 三角形ごとの頂点番号 (little endianのu32) で、Noneならpositionsが3頂点ずつ並ぶ。fieldsは
+/// 部品の分布のJSONの配列。三角形ごとに3頂点を並べたpositionsを返す。
+#[pyfunction]
+#[pyo3(signature = (fields, positions, indices, max_edge, tolerance))]
+fn refine_for_fields<'py>(
+    py: Python<'py>,
+    fields: &str,
+    positions: &[u8],
+    indices: Option<&[u8]>,
+    max_edge: f64,
+    tolerance: f64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let fields: Vec<analysis::Field> =
+        serde_json::from_str(fields).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let points = points_of(positions)?;
+    let corners: Vec<usize> = match indices {
+        Some(bytes) => bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("4 bytes")) as usize)
+            .collect(),
+        None => (0..points.len()).collect(),
+    };
+    if !corners.len().is_multiple_of(3) || corners.iter().any(|k| *k >= points.len()) {
+        return Err(PyValueError::new_err(
+            "indices must name three existing vertices per triangle",
+        ));
+    }
+    let triangles: Vec<[[f32; 3]; 3]> = corners
+        .chunks_exact(3)
+        .map(|t| [points[t[0]], points[t[1]], points[t[2]]])
+        .collect();
+    let refined = analysis::refine(&triangles, &fields, max_edge, tolerance);
+    let bytes: Vec<u8> = refined
+        .iter()
+        .flatten()
+        .flatten()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    Ok(PyBytes::new(py, &bytes))
+}
+
+fn points_of(positions: &[u8]) -> PyResult<Vec<[f32; 3]>> {
+    if !positions.len().is_multiple_of(12) {
+        return Err(PyValueError::new_err("positions must hold 3 f32 per point"));
+    }
+    Ok(positions
+        .chunks_exact(12)
+        .map(|chunk| {
+            std::array::from_fn(|axis| {
+                f32::from_le_bytes(chunk[4 * axis..4 * axis + 4].try_into().expect("4 bytes"))
+            })
+        })
+        .collect())
+}
+
+#[pyfunction]
+fn sample_field<'py>(
+    py: Python<'py>,
+    field: &str,
+    positions: &[u8],
+) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+    let field: analysis::Field =
+        serde_json::from_str(field).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let points = points_of(positions)?;
+    let (values, excluded) = analysis::sample(&field, &points);
+    let values: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let excluded: Vec<u8> = excluded.iter().map(|e| u8::from(*e)).collect();
+    Ok((PyBytes::new(py, &values), PyBytes::new(py, &excluded)))
 }
 
 /// ネジを外す順序の検査。形状を使わない。
@@ -147,6 +223,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_voxels, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_snap_fits, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_analyses, module)?)?;
+    module.add_function(wrap_pyfunction!(sample_field, module)?)?;
+    module.add_function(wrap_pyfunction!(refine_for_fields, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_fastener_releases, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_connectors, module)?)?;
     module.add_function(wrap_pyfunction!(evaluate_stl_voxels, module)?)?;

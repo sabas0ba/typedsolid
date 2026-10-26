@@ -1,12 +1,14 @@
 """欠陥fixtureの3D viewerを書き出し、headless Chromiumで表示状態ごとに撮影して画素を検査する。
 
-対象は、部品間の欠陥fixture、複数の欠陥を持つRaspberry Pi 4の筐体、およびその底をSTLに
-書き出して外部形状の経路 (typedsolid.external) で検査したものである。
+対象は、部品間の欠陥fixture、複数の欠陥を持つRaspberry Pi 4の筐体、その底をSTLに
+書き出して外部形状の経路 (typedsolid.external) で検査したもの、および強度の解析ケースを持つ
+L字の金具である。
 
 Chromiumは既定でdocker/viewerのimageの中で、networkを持たずに動かす。--chromiumで手元の
 binaryを指定することもできる。表示状態はURL fragmentで与える。各状態で、部品、検出箇所、
 半透明、断面の色が画面に現れることを確かめる。WebGLやscriptが失敗すると画面は白く残り、
-検査が落ちる。PNGは標準libraryで読む。
+検査が落ちる。解析の分布を持つfixtureでは、分布を表示した状態で分布の色が現れることも
+確かめる。PNGは標準libraryで読む。
 """
 
 import argparse
@@ -24,6 +26,7 @@ import zlib
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from examples.assembly_defects import ASSEMBLY_DEFECTS
+from examples.bracket_analysis import bracket
 from examples.pi4_enclosure import PLAN, pi4_enclosure_defects
 from typedsolid.cadquery import build, write_viewer_figure
 from typedsolid.external import inspect_file
@@ -38,9 +41,12 @@ CHROMIUM_FLAGS = (
 # 検出箇所の線が占める描画領域の割合の下限。白い画面では0になる。
 MIN_LINE_FRACTION = 0.0002
 # 撮影の後、docsに置く画像。fixture名と状態名の組。
-DOCS = (("post_in_keepout", "selected"), ("lid_overlap", "section"), ("pi4_enclosure_defects", "overview"))
+DOCS = (
+    ("post_in_keepout", "selected"), ("lid_overlap", "section"), ("pi4_enclosure_defects", "overview"),
+    ("pi4_enclosure_defects", "field"), ("bracket", "field"),
+)
 # 撮影するfixture。部品間の欠陥を1つずつ持つものと、複数の欠陥を同時に持つ筐体である。
-FIXTURES = tuple(factory for factory, _ in ASSEMBLY_DEFECTS) + (pi4_enclosure_defects,)
+FIXTURES = tuple(factory for factory, _ in ASSEMBLY_DEFECTS) + (pi4_enclosure_defects, bracket)
 # 外部形状の経路で撮影するSTLの名前。pi4_enclosure_defectsの底を書き出す。
 EXTERNAL = "pi4_base_stl"
 
@@ -53,6 +59,8 @@ class Viewer:
     parts: tuple[str, ...]
     checks: list[dict]
     top_mm: float
+    # 埋め込んだ解析の分布の、先頭の量。分布が無ければNone。
+    field: str | None = None
 
 
 # ---- PNG ----
@@ -123,6 +131,11 @@ def is_part(r: int, g: int, b: int) -> bool:
     return 60 < max(r, g, b) < 225 and max(r, g, b) - min(r, g, b) > 12 and not is_location(r, g, b)
 
 
+def is_field(r: int, g: int, b: int) -> bool:
+    """分布の連続色 (青)。部品色の青みは陰影を付けても青と赤の差が45以下であり、区別できる。"""
+    return b - r > 55 and b > g
+
+
 def _viewer_constants() -> tuple[list[tuple[float, float, float]], float]:
     """viewer.jsの部品色と切り口の斜線の比。描画と検査で値を重複して持たない。"""
     source = (ROOT / "python" / "typedsolid" / "viewer_assets" / "viewer.js").read_text(encoding="utf-8")
@@ -145,7 +158,7 @@ def is_cap(r: int, g: int, b: int) -> bool:
 def fractions(path: Path) -> dict[str, float]:
     """描画領域の画素のうち、各分類に入る割合。速さのため2画素おきに数える。"""
     width, height, size, pixels = read_png(path)
-    counts = {"location": 0, "part": 0, "cap": 0}
+    counts = {"location": 0, "part": 0, "cap": 0, "field": 0}
     total = 0
     for y in range(0, height, 2):
         for x in range(0, min(width, CANVAS_WIDTH), 2):
@@ -155,6 +168,7 @@ def fractions(path: Path) -> dict[str, float]:
             counts["location"] += is_location(r, g, b)
             counts["part"] += is_part(r, g, b)
             counts["cap"] += is_cap(r, g, b)
+            counts["field"] += is_field(r, g, b)
     return {key: value / total for key, value in counts.items()}
 
 
@@ -170,11 +184,20 @@ class Scene:
 
 def scenes(viewer: Viewer) -> list[Scene]:
     """fixtureごとの表示状態と、画面に現れるべきもの。"""
-    failing = next(i for i, check in enumerate(viewer.checks) if check["status"] == "fail")
+    failing = next((i for i, check in enumerate(viewer.checks) if check["status"] == "fail"), None)
     parts = ",".join(viewer.parts)
     # 断面はz方向の中央。部品の内側の面が切り口から見える。
     top = viewer.top_mm
-    return [
+    # 分布の部品を見せるため、他の部品を隠し、検査の一覧を解析のruleに絞って凡例を画面に入れる。
+    others = ",".join(part for part in viewer.parts if part != viewer.parts[0])
+    rule = "thermal" if viewer.field == "temperature" else "strength"
+    fragment = f"#field=0&rule={rule}&view=30,55,1" + (f"&hidden={others}" if others else "")
+    field = [Scene("field", fragment, lambda f, _: _require(f, field=0.05))] if viewer.field else []
+    overview = Scene("overview", "", lambda f, _: _require(f, part=0.05))
+    if failing is None:
+        # 不合格の検査を持たないfixtureは、検出箇所を描かない。
+        return field + [overview]
+    return field + [
         # 検出箇所の線が画面に現れること。小さい箇所の線は画素が少ないため、下限は0でない最小の目安とする。
         Scene("overview", "", lambda f, _: _require(f, part=0.05, location=MIN_LINE_FRACTION)),
         Scene("selected", f"#check={failing}&ghost={parts}", lambda f, _: _require(f, part=0.02, location=MIN_LINE_FRACTION)),
@@ -212,7 +235,8 @@ def model_viewer(factory, output: Path) -> Viewer:
     result = build(factory())
     write_viewer_figure(result, output / f"{factory.__name__}.html")
     top = max(shape.BoundingBox().zmax for shape in result.shapes.values())
-    return Viewer(factory.__name__, tuple(result.shapes), result.report["checks"], top)
+    field = result.fields[0]["quantity"] if result.fields else None
+    return Viewer(factory.__name__, tuple(result.shapes), result.report["checks"], top, field)
 
 
 def external_viewer(output: Path) -> Viewer:

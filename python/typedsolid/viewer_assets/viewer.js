@@ -19,8 +19,12 @@
   const CAP_FILL = 0.6;
   const CAP_STRIPE = 0.35;
   const CAP_PERIOD_PX = 8.0;
+  // 分布で、応力を判定しない拘束と荷重の近傍に重ねる斜線。値の色に掛ける比と、画面上の間隔。
+  const HATCH_SHADE = 0.55;
+  const HATCH_PERIOD_PX = 6.0;
 
   const data = JSON.parse(document.getElementById("viewer-data").textContent);
+  data.fields = data.fields || [];
   const checks = data.checks.map((check, index) => ({ ...check, index, locations: check.locations || [] }));
   const modelBox = core.unionBoxes(data.parts.map((part) => part.bounds).concat(data.keepouts));
   const modelRadius = Math.max(Math.hypot(...[0, 1, 2].map((i) => modelBox.max[i] - modelBox.min[i])) / 2, 1);
@@ -86,6 +90,49 @@
       gl_FragColor = phase < ${(CAP_PERIOD_PX / 3).toFixed(1)} ? vec4(uCut, uColour.a) : uColour;
     }`;
 
+  // 分布の色。頂点ごとの色を陰影付きで描き、判定しない近傍には画面上で一定間隔の45°の斜線を重ねる。
+  const FIELD_VERTEX = `
+    attribute vec3 aPosition;
+    attribute vec3 aNormal;
+    attribute vec3 aColour;
+    attribute float aExcluded;
+    uniform mat4 uViewProj;
+    varying vec3 vPosition;
+    varying vec3 vNormal;
+    varying vec3 vColour;
+    varying float vExcluded;
+    void main() {
+      vPosition = aPosition;
+      vNormal = aNormal;
+      vColour = aColour;
+      vExcluded = aExcluded;
+      gl_Position = uViewProj * vec4(aPosition, 1.0);
+    }`;
+  const FIELD_FRAGMENT = `
+    precision mediump float;
+    uniform vec4 uColour;
+    uniform vec4 uClip;
+    uniform vec3 uLight;
+    uniform vec3 uCut;
+    varying vec3 vPosition;
+    varying vec3 vNormal;
+    varying vec3 vColour;
+    varying float vExcluded;
+    void main() {
+      if (dot(vec4(vPosition, 1.0), uClip) < 0.0) discard;
+      if (!gl_FrontFacing) {
+        gl_FragColor = vec4(uCut, uColour.a);
+        return;
+      }
+      float light = 0.5 + 0.5 * abs(dot(normalize(vNormal), uLight));
+      vec3 colour = vColour * light;
+      float phase = mod(gl_FragCoord.x + gl_FragCoord.y, ${HATCH_PERIOD_PX.toFixed(1)});
+      if (vExcluded > 0.5 && phase < ${(HATCH_PERIOD_PX / 3).toFixed(1)}) {
+        colour *= ${HATCH_SHADE.toFixed(2)};
+      }
+      gl_FragColor = vec4(colour, uColour.a);
+    }`;
+
   function compile(type, source) {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source);
@@ -113,6 +160,8 @@
       uniforms,
       position: gl.getAttribLocation(handle, "aPosition"),
       normal: gl.getAttribLocation(handle, "aNormal"),
+      colour: gl.getAttribLocation(handle, "aColour"),
+      excluded: gl.getAttribLocation(handle, "aExcluded"),
     };
   }
 
@@ -136,15 +185,36 @@
   let surface = null;
   let flat = null;
   let cap = null;
+  let fieldProgram = null;
   let parts = [];
   let keepoutLines = null;
+  // 分布ごとの、三角形の隅の順に並べた値と近傍の印。色はscaleとmapが変わるたびに作り直す。
+  let fieldData = [];
+  let fieldColours = { key: "", buffers: new Map() };
+
+  // 分布は部品の頂点の順に値を持つ。描画は三角形ごとに頂点を複製するため、同じ順に並べ直す。
+  function decodeFields(partIndices) {
+    return data.fields.map((field) => {
+      const indices = partIndices.get(field.part);
+      const values = core.dequantize(field, core.decodeUint16(field.values));
+      const excluded = field.excluded ? core.decodeBytes(field.excluded) : null;
+      return {
+        ...field,
+        corners: core.expandPerVertex(values, indices),
+        excludedCorners: excluded ? core.expandPerVertex(excluded, indices) : null,
+      };
+    });
+  }
 
   function setUpScene() {
     surface = program(SURFACE_VERTEX, SURFACE_FRAGMENT);
     flat = program(FLAT_VERTEX, FLAT_FRAGMENT);
     cap = program(FLAT_VERTEX, CAP_FRAGMENT);
+    fieldProgram = program(FIELD_VERTEX, FIELD_FRAGMENT);
+    const partIndices = new Map();
     parts = data.parts.map((part, index) => {
       const indices = part.indices ? core.decodeUint32(part.indices) : null;
+      partIndices.set(part.id, indices);
       const triangles = core.flatTriangles(core.decodeFloat32(part.positions), indices);
       return {
         id: part.id,
@@ -154,6 +224,7 @@
         normals: buffer(triangles.normals),
       };
     });
+    fieldData = decodeFields(partIndices);
     const edges = [];
     for (const keepout of data.keepouts) {
       edges.push(...core.boxEdges(keepout));
@@ -220,6 +291,37 @@
     }
   }
 
+  function selectedField() {
+    return state.field !== null && state.field < fieldData.length ? fieldData[state.field] : null;
+  }
+
+  // 選択した分布の部品の、頂点ごとの色と近傍の印のbuffer。値の無い頂点は部品色とする。
+  function fieldBuffers(part) {
+    const field = selectedField();
+    if (!field || field.part !== part.id) {
+      return null;
+    }
+    const key = JSON.stringify([state.field, state.map, state.scale, state.range]);
+    if (fieldColours.key !== key) {
+      for (const handles of fieldColours.buffers.values()) {
+        gl.deleteBuffer(handles.colours);
+        gl.deleteBuffer(handles.excluded);
+      }
+      fieldColours = { key, buffers: new Map() };
+    }
+    if (!fieldColours.buffers.has(part.id)) {
+      const scale = core.fieldScale(field, state.scale, state.range);
+      const colours = new Float32Array(field.corners.length * 3);
+      const excluded = new Float32Array(field.corners.length);
+      for (let i = 0; i < field.corners.length; i += 1) {
+        colours.set(core.fieldColour(field.corners[i], scale, state.map) || part.colour, 3 * i);
+        excluded[i] = field.excludedCorners ? field.excludedCorners[i] : 0;
+      }
+      fieldColours.buffers.set(part.id, { colours: buffer(colours), excluded: buffer(excluded) });
+    }
+    return fieldColours.buffers.get(part.id);
+  }
+
   function drawParts(view, ghosts) {
     gl.useProgram(surface.handle);
     gl.uniformMatrix4fv(surface.uniforms.uViewProj, false, view.viewProj);
@@ -228,13 +330,36 @@
     const toEye = normalize3([0, 1, 2].map((i) => view.eye[i] - view.target[i]));
     const right = normalize3(cross3([0, 0, 1], toEye));
     const up = cross3(toEye, right);
-    gl.uniform3fv(surface.uniforms.uLight, normalize3([0, 1, 2].map((i) => toEye[i] + 0.7 * up[i] - 0.4 * right[i])));
+    const light = normalize3([0, 1, 2].map((i) => toEye[i] + 0.7 * up[i] - 0.4 * right[i]));
+    gl.uniform3fv(surface.uniforms.uLight, light);
     gl.uniform3fv(surface.uniforms.uCut, CUT_COLOUR);
     for (const part of parts) {
       if (state.hidden.includes(part.id) || state.ghost.includes(part.id) !== ghosts) {
         continue;
       }
-      gl.uniform4fv(surface.uniforms.uColour, [...part.colour, ghosts ? GHOST_ALPHA : 1]);
+      const alpha = ghosts ? GHOST_ALPHA : 1;
+      const coloured = fieldBuffers(part);
+      if (coloured) {
+        gl.useProgram(fieldProgram.handle);
+        gl.uniformMatrix4fv(fieldProgram.uniforms.uViewProj, false, view.viewProj);
+        gl.uniform4fv(fieldProgram.uniforms.uClip, core.clipPlane(state.clip));
+        gl.uniform3fv(fieldProgram.uniforms.uLight, light);
+        gl.uniform3fv(fieldProgram.uniforms.uCut, CUT_COLOUR);
+        gl.uniform4fv(fieldProgram.uniforms.uColour, [1, 1, 1, alpha]);
+        bind(fieldProgram, part.positions, part.normals);
+        gl.bindBuffer(gl.ARRAY_BUFFER, coloured.colours);
+        gl.enableVertexAttribArray(fieldProgram.colour);
+        gl.vertexAttribPointer(fieldProgram.colour, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, coloured.excluded);
+        gl.enableVertexAttribArray(fieldProgram.excluded);
+        gl.vertexAttribPointer(fieldProgram.excluded, 1, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, part.count);
+        gl.disableVertexAttribArray(fieldProgram.colour);
+        gl.disableVertexAttribArray(fieldProgram.excluded);
+        gl.useProgram(surface.handle);
+        continue;
+      }
+      gl.uniform4fv(surface.uniforms.uColour, [...part.colour, alpha]);
       bind(surface, part.positions, part.normals);
       gl.drawArrays(gl.TRIANGLES, 0, part.count);
     }
@@ -498,9 +623,92 @@
     }
   }
 
+  function fieldLabel(field) {
+    return `${field.case} · ${field.quantity} · ${field.part}`;
+  }
+
+  // 有効数字4桁。末尾の0は書かない。
+  function formatValue(value, unit) {
+    return `${Number(value.toPrecision(4))} ${unit}`;
+  }
+
+  function renderField() {
+    const section = document.getElementById("field-section");
+    section.hidden = !data.fields.length;
+    if (!data.fields.length) {
+      return;
+    }
+    const select = document.getElementById("field");
+    if (!select.options.length) {
+      select.append(element("option", { value: "", text: "off (part colours)" }));
+      data.fields.forEach((field, index) => select.append(element("option", { value: String(index), text: fieldLabel(field) })));
+      const map = document.getElementById("field-map");
+      for (const [name, entry] of Object.entries(core.COLOURMAPS)) {
+        map.append(element("option", { value: name, text: entry.label }));
+      }
+      const scale = document.getElementById("field-scale");
+      for (const [name, label] of Object.entries(core.SCALES)) {
+        scale.append(element("option", { value: name, text: label }));
+      }
+    }
+    const field = state.field !== null && state.field < data.fields.length ? data.fields[state.field] : null;
+    select.value = field ? String(state.field) : "";
+    document.getElementById("field-map").value = state.map;
+    document.getElementById("field-scale").value = state.scale;
+    const custom = state.scale === "custom";
+    for (const id of ["field-map", "field-scale"]) {
+      document.getElementById(id).disabled = !field;
+    }
+    const low = document.getElementById("field-low");
+    const high = document.getElementById("field-high");
+    low.hidden = high.hidden = !custom || !field;
+    const legend = document.getElementById("field-legend");
+    legend.replaceChildren();
+    if (!field) {
+      return;
+    }
+    const scale = core.fieldScale(field, state.scale, state.range);
+    if (custom && document.activeElement !== low && document.activeElement !== high) {
+      low.value = String(scale.low);
+      high.value = String(scale.high);
+    }
+    const stops = Array.from({ length: 11 }, (_, i) => core.rgbToHex(core.colourAt(state.map, i / 10)));
+    const bar = element("div", { class: "bar" });
+    bar.style.background = `linear-gradient(to right, ${stops.join(", ")})`;
+    legend.append(
+      bar,
+      element("div", { class: "ends" }, [
+        element("span", { text: formatValue(scale.low, field.unit) }),
+        element("span", { text: formatValue(scale.high, field.unit) }),
+      ]),
+    );
+    const notes = [
+      `values on the ${field.pitch} mm analysis grid, before extrapolation; range of the surface ${formatValue(field.minimum, field.unit)} – ${formatValue(field.maximum, field.unit)}`,
+    ];
+    if (field.limit !== null && field.limit !== undefined) {
+      notes.push(`limit ${formatValue(field.limit, field.unit)}`);
+    }
+    for (const text of notes) {
+      legend.append(element("p", { class: "note", text }));
+    }
+    if (scale.over) {
+      const key = element("span", { class: "key" });
+      key.style.background = core.OVER_LIMIT;
+      legend.append(element("p", { class: "note" }, [key, "over the limit"]));
+    }
+    if (field.excluded) {
+      legend.append(element("p", { class: "note" }, [
+        element("span", { class: "key hatched" }),
+        `hatched: within ${field.exclusion_mm} mm of supports and loads, not judged`,
+      ]));
+    }
+    legend.append(element("p", { class: "note", text: "part colour: no analysis cell near the surface" }));
+  }
+
   function renderPanel() {
     renderControls();
     renderParts();
+    renderField();
     renderChecks();
   }
 
@@ -510,6 +718,25 @@
     document.getElementById("filter-plan").addEventListener("change", (event) => setState({ plan: event.target.value }));
     document.getElementById("filter-text").addEventListener("input", (event) => setState({ q: event.target.value }));
     document.getElementById("sort").addEventListener("change", (event) => setState({ sort: event.target.value }));
+    document.getElementById("field").addEventListener("change", (event) => {
+      setState({ field: event.target.value === "" ? null : Number(event.target.value) });
+    });
+    document.getElementById("field-map").addEventListener("change", (event) => setState({ map: event.target.value }));
+    document.getElementById("field-scale").addEventListener("change", (event) => {
+      const field = state.field !== null ? data.fields[state.field] : null;
+      // 数値の範囲は、切り替える前の範囲から始める。
+      const range = event.target.value === "custom" && field ? (({ low, high }) => [low, high])(core.fieldScale(field, state.scale, state.range)) : state.range;
+      setState({ scale: event.target.value, range });
+    });
+    const customRange = () => {
+      const low = Number(document.getElementById("field-low").value);
+      const high = Number(document.getElementById("field-high").value);
+      if (Number.isFinite(low) && Number.isFinite(high) && high > low) {
+        setState({ range: [low, high] });
+      }
+    };
+    document.getElementById("field-low").addEventListener("change", customRange);
+    document.getElementById("field-high").addEventListener("change", customRange);
     document.getElementById("clip-axis").addEventListener("change", (event) => {
       const axis = event.target.value;
       if (!axis) {

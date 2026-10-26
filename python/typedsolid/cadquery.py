@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from importlib.metadata import version
 import io
@@ -32,7 +32,7 @@ from .cache import Cache
 from .figures import write_model_figures
 from .model import Model
 from .projection import write_projections
-from .viewer import MeshPart, write_viewer
+from .viewer import MeshPart, field_overlay, write_viewer
 
 Progress = Callable[[str], None]
 # 検出箇所と、並べ替えに使う体積の組。
@@ -54,6 +54,10 @@ FIGURES_DIR = "figures"
 PROJECTION_DIR = "projection"
 # 3D viewer。部品のmeshと検査結果を埋め込んだ1つのHTMLである。
 VIEWER_FILE = "viewer.html"
+# 分布を描く部品の三角形を細分する目安。三角形の内側を、解析の格子間隔のこの倍の間隔で
+# 標本化し、頂点からの線形補間との差が分布の値の範囲のFIELD_TOLERANCE倍を超えれば分ける。
+FIELD_EDGE_RATIO = 4.0
+FIELD_TOLERANCE = 0.05
 # viewerのmeshの弦誤差。部品全体の外接boxの対角長に対する比と、角度 (rad)。
 TESSELLATION_RATIO = 0.001
 ANGULAR_TOLERANCE = 0.2
@@ -680,6 +684,8 @@ class Build:
     shapes: dict[str, cq.Shape]
     report: dict[str, Any]
     model_json: str
+    # 解析ケースの表面の分布。判定には使わず、viewerが部品の表面を色分けするために使う。
+    fields: list[dict] = field(default_factory=list)
 
     @property
     def export_allowed(self) -> bool:
@@ -750,13 +756,15 @@ def _voxel_checks(data: dict, cache: Cache | None, progress: Progress) -> list[d
     return checks
 
 
-def _analysis_checks(data: dict, cache: Cache | None, progress: Progress) -> list[dict]:
-    """解析ケースごとに解く。ケースを宣言していない種類は、未評価のcheckを1つ残す。
+def _analyses(data: dict, cache: Cache | None, progress: Progress) -> tuple[list[dict], list[dict]]:
+    """解析ケースごとに解き、checkと表面の分布を返す。ケースを宣言していない種類は、未評価の
+    checkを1つ残す。
 
     結果は参照する部品、材料、ネジ固定、keepout、コネクタ開口、Policyとケースから決まる。
     """
     analyses = data.get("analyses", {})
     checks: list[dict] = []
+    fields: list[dict] = []
     for rule, kind in ANALYSIS_RULES.items():
         cases = analyses.get(kind, [])
         if not cases:
@@ -776,16 +784,17 @@ def _analysis_checks(data: dict, cache: Cache | None, progress: Progress) -> lis
             content = None if cache is None else cache.get(key)
             if content is not None:
                 progress(f"{kind} case {case['id']}: analysis reused")
-                checks += json.loads(content)
-                continue
-            progress(f"{kind} case {case['id']}: analysis of part {part['id']}")
-            other = "thermal" if kind == "structural" else "structural"
-            single = json.dumps({**data, "analyses": {kind: [case], other: []}}, allow_nan=False)
-            result = json.loads(_native.evaluate_analyses(single))
-            if cache is not None:
-                cache.put(key, json.dumps(result).encode())
-            checks += result
-    return checks
+            else:
+                progress(f"{kind} case {case['id']}: analysis of part {part['id']}")
+                other = "thermal" if kind == "structural" else "structural"
+                single = json.dumps({**data, "analyses": {kind: [case], other: []}}, allow_nan=False)
+                content = _native.evaluate_analyses(single).encode()
+                if cache is not None:
+                    cache.put(key, content)
+            result = json.loads(content)
+            checks += result["checks"]
+            fields += result["fields"]
+    return checks, fields
 
 
 def build(
@@ -857,14 +866,15 @@ def _build(model_json: str, cache: Cache | None, progress: Progress) -> Build:
     except Exception as error:
         voxel_checks = [_check(rule, "model", False, f"{type(error).__name__}: {error}") for rule in VOXEL_RULES]
     checks[:] = [c for c in checks if c["rule"] not in VOXEL_RULES] + voxel_checks
+    fields: list[dict] = []
     try:
-        analysis_checks = _analysis_checks(data, cache, progress)
+        analysis_checks, fields = _analyses(data, cache, progress)
     except Exception as error:
         analysis_checks = [
             _check(rule, "model", False, f"{type(error).__name__}: {error}") for rule in ANALYSIS_RULES
         ]
     checks[:] = [c for c in checks if c["rule"] not in ANALYSIS_RULES] + analysis_checks
-    return Build(shapes, report, model_json)
+    return Build(shapes, report, model_json, fields)
 
 
 def write_projection_figures(result: Build, directory: str | Path, *, overview: bool = True) -> list[str]:
@@ -893,7 +903,24 @@ def write_viewer_figure(
     shapes = _drawable(result)
     diagonal = max((shape.BoundingBox().DiagonalLength for shape in shapes.values()), default=1.0)
     parts = [_mesh_part(part_id, shape, TESSELLATION_RATIO * diagonal) for part_id, shape in shapes.items()]
-    return write_viewer(parts, embedded, path, keepouts, name)
+    # 分布は部品meshの頂点ごとに、最も近い表面の解析cellの値を持つ。分布を持つ部品は、値を頂点
+    # からの線形補間で表せない三角形を細分する。値が一様な所の三角形は大きいまま残す。
+    parts = [_refined(part, [f for f in result.fields if f["part"] == part.id]) for part in parts]
+    overlays = [
+        field_overlay(part.id, distribution, *_native.sample_field(json.dumps(distribution), part.positions))
+        for part in parts
+        for distribution in result.fields
+        if distribution["part"] == part.id
+    ]
+    return write_viewer(parts, embedded, path, keepouts, name, overlays)
+
+
+def _refined(part: MeshPart, fields: list[dict]) -> MeshPart:
+    if not fields:
+        return part
+    max_edge = FIELD_EDGE_RATIO * min(f["pitch"] for f in fields)
+    positions = _native.refine_for_fields(json.dumps(fields), part.positions, part.indices, max_edge, FIELD_TOLERANCE)
+    return MeshPart(part.id, positions)
 
 
 def _mesh_part(part_id: str, shape: cq.Shape, tolerance: float) -> MeshPart:

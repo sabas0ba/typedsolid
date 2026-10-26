@@ -222,3 +222,70 @@ test("union of boxes and box centre", () => {
   assert.deepEqual(core.boxCentre(union), [0, 1.5, 2]);
   assert.deepEqual(core.unionBoxes([]), { min: [0, 0, 0], max: [0, 0, 0] });
 });
+
+test("analysis fields are dequantized and expanded like the triangles", () => {
+  const field = { minimum: 10, maximum: 20 };
+  const codes = base64Of([0, 65534, 32767, 65535], Uint16Array);
+  const values = core.dequantize(field, core.decodeUint16(codes));
+  close(values.slice(0, 3), [10, 20, 15], 1e-3);
+  assert.ok(Number.isNaN(values[3]));
+  assert.deepEqual([...core.expandPerVertex(new Uint8Array([5, 6, 7]), new Uint32Array([2, 0, 1, 1]))], [7, 5, 6, 6]);
+  assert.deepEqual([...core.expandPerVertex(new Uint8Array([5, 6]), null)], [5, 6]);
+});
+
+test("field scales follow the chosen range", () => {
+  const field = { minimum: 2, maximum: 30, limit: 20, reference: 0 };
+  assert.deepEqual(core.fieldScale(field, "limit", null), { low: 0, high: 20, over: true });
+  assert.deepEqual(core.fieldScale(field, "data", null), { low: 2, high: 30, over: false });
+  // 上限を中点とし、上限から遠い方 (基準値の0、20離れる) までを両側に取る。
+  assert.deepEqual(core.fieldScale(field, "diverging", null), { low: 0, high: 40, over: false });
+  assert.deepEqual(core.fieldScale(field, "custom", [5, 8]), { low: 5, high: 8, over: false });
+  // 上限の無い量と、不正な数値の範囲は、値の最小から最大までとする。
+  assert.deepEqual(core.fieldScale({ ...field, limit: null }, "limit", null), { low: 2, high: 30, over: false });
+  assert.deepEqual(core.fieldScale(field, "custom", [8, 5]), { low: 2, high: 30, over: false });
+  // 上限が基準値 (周囲温度など) 以下でも、上限を超える値は上限超過として示す。
+  const hot = { minimum: 45, maximum: 80, limit: 30, reference: 40 };
+  const scale = core.fieldScale(hot, "limit", null);
+  assert.equal(scale.high, 30);
+  assert.ok(scale.over && scale.low < scale.high);
+  assert.equal(core.rgbToHex(core.fieldColour(45, scale, "sequential")), core.OVER_LIMIT);
+});
+
+test("field colours mark values over the limit and leave missing values to the part", () => {
+  const scale = { low: 0, high: 20, over: true };
+  assert.equal(core.fieldColour(Number.NaN, scale, "sequential"), null);
+  assert.equal(core.rgbToHex(core.fieldColour(25, scale, "sequential")), core.OVER_LIMIT);
+  assert.equal(core.rgbToHex(core.fieldColour(0, scale, "sequential")), core.COLOURMAPS.sequential.stops[0]);
+  assert.equal(core.rgbToHex(core.fieldColour(20, scale, "sequential")), core.COLOURMAPS.sequential.stops.at(-1));
+  // 発散色の中点は灰。
+  assert.equal(core.rgbToHex(core.colourAt("diverging", 0.5)), "#f0efec");
+});
+
+test("colour maps keep the lightness monotone on each arm", () => {
+  const lightness = (map, t) => core.rgbToOklab(core.colourAt(map, t))[0];
+  for (let i = 0; i < 20; i += 1) {
+    assert.ok(lightness("sequential", i / 20) > lightness("sequential", (i + 1) / 20));
+  }
+  for (let i = 0; i < 10; i += 1) {
+    // 中点から両端へ暗くなる。
+    assert.ok(lightness("diverging", 0.5 - i / 20) > lightness("diverging", 0.5 - (i + 1) / 20));
+    assert.ok(lightness("diverging", 0.5 + i / 20) > lightness("diverging", 0.5 + (i + 1) / 20));
+  }
+  // 発散色の両端は同じ明度に揃える。
+  assert.ok(Math.abs(lightness("diverging", 0) - lightness("diverging", 1)) < 0.01);
+});
+
+test("the field view round-trips through the URL fragment", () => {
+  const state = { ...core.parseState(""), field: 2, map: "diverging", scale: "custom", range: [1.5, 9] };
+  const parsed = core.parseState(core.formatState(state));
+  assert.equal(parsed.field, 2);
+  assert.equal(parsed.map, "diverging");
+  assert.equal(parsed.scale, "custom");
+  assert.deepEqual(parsed.range, [1.5, 9]);
+  const invalid = core.parseState("#field=-1&map=rainbow&scale=log&range=9,1");
+  assert.equal(invalid.field, null);
+  assert.equal(invalid.map, core.DEFAULT_STATE.map);
+  assert.equal(invalid.scale, core.DEFAULT_STATE.scale);
+  assert.equal(invalid.range, null);
+  assert.equal(core.formatState(core.parseState("")), "");
+});
