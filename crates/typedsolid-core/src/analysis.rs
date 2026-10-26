@@ -9,12 +9,20 @@
 //! 縁は特異点であり、細分するほど値が増える。格子間隔h、2h、4hで解き、判定に使う量の差が
 //! 細分とともに縮まなければ評価しない。収束した量は残りの差を見積もって安全側に外挿し、上限と
 //! 比べる。拘束と荷重の近傍の応力は判定せず、未評価として残す。
+//!
+//! 強度のケースでは、薄い部材と丸みの周りのcellを最大3段まで8分割する (`Refinement`)。3つの
+//! 格子は同じ段を基準の間隔h、2h、4hに適用したもので、各所の一辺はs、2s、4sとなる。
 
-use crate::multigrid::{CORNERS, Hierarchy, Level, Matrices};
+use crate::multigrid::{CORNERS, Geometry, Hierarchy, Level};
+use crate::octree::{Cell, Constraints, Locator, Tree, constraints, corner};
 use crate::voxel::Grid;
-use crate::{Anchor, Check, Material, Model, Part, Rule, Status, identifier};
+use crate::{
+    Anchor, Check, Location, MAX_LOCATIONS, Material, Model, Operation, Part, Rule, Shape, Status,
+    identifier,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Range;
 
 /// 1つのmodelが持てる解析ケースの上限。種類ごとである。
 const MAX_CASES: usize = 100;
@@ -532,118 +540,194 @@ fn unit_conduction() -> [[f64; 8]; 8] {
     k
 }
 
-/// 格子の節点の番号付けと、材料cellの要素。
-struct Mesh<'a> {
-    grid: &'a Grid,
-    /// 節点の格子の各軸の数。cellの数より1多い。
-    nodes: [usize; 3],
-    /// 材料cellごとの8節点の番号。
-    elements: Vec<[usize; 8]>,
-    /// 材料cellのcell番号。`elements`と同じ順。
-    cells: Vec<usize>,
-    /// 材料cellに接する節点。
-    active: Vec<bool>,
+/// 局所的に細かくする段の上限。最も細かいcellの一辺は格子間隔の1/8。
+const MAX_REFINEMENT: u32 = 3;
+/// 最も粗い格子 (各所の一辺の4倍) で、部材の厚さが持つcellの数。
+const CELLS_ACROSS: f64 = 3.0;
+/// 最も粗い格子で、丸みの半径が持つcellの数。
+const CELLS_PER_RADIUS: f64 = 1.5;
+/// 1つの格子の要素の上限。弾性では約450万自由度に当たる。
+const MAX_ELEMENTS: usize = 1_500_000;
+/// 分割の途中で数える葉 (空のcellを含む) の上限。
+const MAX_LEAVES: usize = 8 * MAX_ELEMENTS;
+
+/// 部品が点を含むか。追加の形状のいずれかに含まれ、除去の形状のいずれにも含まれない点で、
+/// 格子化 (`Grid::fill`) と同じ判定である。
+fn part_contains(part: &Part, point: [f64; 3]) -> bool {
+    let inside = |operation: Operation| {
+        part.features
+            .iter()
+            .filter(|f| f.operation == operation)
+            .any(|f| f.shape.contains(point))
+    };
+    inside(Operation::Add) && !inside(Operation::Cut)
 }
 
-impl<'a> Mesh<'a> {
-    fn new(grid: &'a Grid) -> Self {
-        let [nx, ny, nz] = grid.size;
-        let nodes = [nx + 1, ny + 1, nz + 1];
-        let node = |x: usize, y: usize, z: usize| (z * nodes[1] + y) * nodes[0] + x;
-        let mut elements = Vec::new();
-        let mut cells = Vec::new();
-        let mut active = vec![false; nodes[0] * nodes[1] * nodes[2]];
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let index = grid.index(x, y, z);
-                    if !grid.occupied[index] {
+/// 局所的に細かくする段。部品を格子間隔の半分の格子で測り、cellごとに段kを持つ。段kの所では
+/// 要素の一辺sを格子間隔hの1/2^kとする。
+///
+/// 最も粗い格子 (4s) で、軸方向の厚さtが`CELLS_ACROSS`個、丸みの半径rが`CELLS_PER_RADIUS`個の
+/// cellを持つよう、s ≤ t/12、s ≤ r/6とする。tは材料のcellを通る3軸の材料の区間の長さの最小で
+/// ある。丸みは、その形状の外接boxを半径だけ広げた範囲の材料に適用する。
+struct Refinement {
+    /// 厚さを測った格子。
+    grid: Grid,
+    levels: Vec<u8>,
+}
+
+impl Refinement {
+    /// 細かくする所が無ければNone。
+    fn new(part: &Part, pitch: f64) -> Result<Option<Self>, Unsolved> {
+        let grid = Grid::rasterize_midpoint(part, pitch / 2.0).map_err(|reason| {
+            format!(
+                "{reason} when measuring thickness at grid {} mm",
+                pitch / 2.0
+            )
+        })?;
+        let level = |target: f64| -> u8 {
+            (0..=MAX_REFINEMENT)
+                .find(|k| pitch / f64::from(1u32 << k) <= target * (1.0 + 1e-9))
+                .unwrap_or(MAX_REFINEMENT) as u8
+        };
+        let [nx, ny, _] = grid.size;
+        let count = grid.occupied.len();
+        let mut runs = vec![u32::MAX; count];
+        for axis in 0..3 {
+            let stride = [1, nx, nx * ny][axis];
+            let length = grid.size[axis];
+            for start in (0..count).filter(|i| (i / stride) % length == 0) {
+                let mut k = 0;
+                while k < length {
+                    if !grid.occupied[start + k * stride] {
+                        k += 1;
                         continue;
                     }
-                    let element = CORNERS.map(|c| node(x + c[0], y + c[1], z + c[2]));
-                    for n in element {
-                        active[n] = true;
+                    let first = k;
+                    while k < length && grid.occupied[start + k * stride] {
+                        k += 1;
                     }
-                    elements.push(element);
-                    cells.push(index);
-                }
-            }
-        }
-        Self {
-            grid,
-            nodes,
-            elements,
-            cells,
-            active,
-        }
-    }
-
-    fn node_count(&self) -> usize {
-        self.active.len()
-    }
-
-    fn cell_positions(&self) -> Vec<[usize; 3]> {
-        self.cells.iter().map(|cell| self.cell_xyz(*cell)).collect()
-    }
-
-    fn cell_xyz(&self, index: usize) -> [usize; 3] {
-        let [nx, ny, _] = self.grid.size;
-        [index % nx, (index / nx) % ny, index / (nx * ny)]
-    }
-
-    fn occupied(&self, xyz: [isize; 3]) -> bool {
-        let size = self.grid.size;
-        (0..3).all(|axis| xyz[axis] >= 0 && (xyz[axis] as usize) < size[axis])
-            && self.grid.occupied[self.grid.index(
-                xyz[0] as usize,
-                xyz[1] as usize,
-                xyz[2] as usize,
-            )]
-    }
-
-    /// cellの、空のcellに面する面。(cell番号, 軸, 正の側か)。
-    fn exposed_faces(&self) -> Vec<(usize, usize, bool)> {
-        let mut faces = Vec::new();
-        for &cell in &self.cells {
-            let xyz = self.cell_xyz(cell).map(|v| v as isize);
-            for axis in 0..3 {
-                for positive in [false, true] {
-                    let mut next = xyz;
-                    next[axis] += if positive { 1 } else { -1 };
-                    if !self.occupied(next) {
-                        faces.push((cell, axis, positive));
+                    let run = (k - first) as u32;
+                    for j in first..k {
+                        let slot = &mut runs[start + j * stride];
+                        *slot = (*slot).min(run);
                     }
                 }
             }
         }
-        faces
-    }
-
-    /// 面の4節点。
-    fn face_nodes(&self, cell: usize, axis: usize, positive: bool) -> [usize; 4] {
-        let [x, y, z] = self.cell_xyz(cell);
-        let side = usize::from(positive);
-        let [a, b] = match axis {
-            0 => [1, 2],
-            1 => [0, 2],
-            _ => [0, 1],
-        };
-        let mut out = [0usize; 4];
-        for (k, slot) in out.iter_mut().enumerate() {
-            let mut offset = [0usize; 3];
-            offset[axis] = side;
-            offset[a] = k & 1;
-            offset[b] = (k >> 1) & 1;
-            *slot =
-                ((z + offset[2]) * self.nodes[1] + (y + offset[1])) * self.nodes[0] + x + offset[0];
+        let mut levels: Vec<u8> = runs
+            .iter()
+            .zip(&grid.occupied)
+            .map(|(run, solid)| {
+                if *solid {
+                    level(f64::from(*run) * grid.pitch / (4.0 * CELLS_ACROSS))
+                } else {
+                    0
+                }
+            })
+            .collect();
+        for feature in &part.features {
+            let Shape::Fillet { radius, .. } = feature.shape else {
+                continue;
+            };
+            let k = level(radius / (4.0 * CELLS_PER_RADIUS));
+            let (low, high) = feature.shape.aabb();
+            let ranges = cell_ranges(&grid, low.map(|v| v - radius), high.map(|v| v + radius));
+            for z in ranges[2].clone() {
+                for y in ranges[1].clone() {
+                    for x in ranges[0].clone() {
+                        let index = grid.index(x, y, z);
+                        if grid.occupied[index] {
+                            levels[index] = levels[index].max(k);
+                        }
+                    }
+                }
+            }
         }
-        out
+        if levels.iter().all(|level| *level == 0) {
+            return Ok(None);
+        }
+        Ok(Some(Self { grid, levels }))
     }
 
-    /// 節点を共有する要素の連結成分のうち、`anchored`の節点を1つも含まないものがあるか。
-    /// そのような成分は剛体変位や温度が定まらず、方程式が特異になる。
-    fn floating(&self, anchored: impl Fn(usize) -> bool) -> bool {
-        let mut parent: Vec<usize> = (0..self.node_count()).collect();
+    /// box (mm) に重なる、厚さを測ったcellの段の最大。
+    fn depth(&self, low: [f64; 3], high: [f64; 3]) -> u32 {
+        // 格子の境界に揃った箱が隣のcellを含まないよう、わずかに縮める。
+        let margin = 1e-6 * self.grid.pitch;
+        let ranges = cell_ranges(
+            &self.grid,
+            low.map(|v| v + margin),
+            high.map(|v| v - margin),
+        );
+        let mut depth = 0;
+        for z in ranges[2].clone() {
+            for y in ranges[1].clone() {
+                for x in ranges[0].clone() {
+                    depth = depth.max(u32::from(self.levels[self.grid.index(x, y, z)]));
+                }
+            }
+        }
+        depth
+    }
+}
+
+/// box (mm) に重なる格子のcellの、各軸の番号の範囲。
+fn cell_ranges(grid: &Grid, low: [f64; 3], high: [f64; 3]) -> [Range<usize>; 3] {
+    std::array::from_fn(|axis| {
+        let corner = grid.origin[axis] - grid.pitch / 2.0;
+        let limit = grid.size[axis] as f64;
+        let first = ((low[axis] - corner) / grid.pitch)
+            .floor()
+            .clamp(0.0, limit) as usize;
+        let last = ((high[axis] - corner) / grid.pitch)
+            .ceil()
+            .clamp(0.0, limit) as usize;
+        first..last.max(first)
+    })
+}
+
+/// 解析の格子の配置。基準の格子 (間隔`pitch`) のcellを局所的に分割した八分木の、材料のcell。
+struct Layout {
+    /// 格子座標の原点 (基準の格子の最初のcellの最小の隅) と単位。単位はmm。
+    origin: [f64; 3],
+    unit: f64,
+    /// 要素のcell。最小の隅のzの順に並ぶ。
+    cells: Vec<Cell>,
+}
+
+impl Layout {
+    /// 要素の一辺。単位はmm。
+    fn size_mm(&self, element: usize) -> f64 {
+        self.cells[element].1 as f64 * self.unit
+    }
+
+    fn point(&self, lattice: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|axis| self.origin[axis] + lattice[axis] * self.unit)
+    }
+
+    fn centre(&self, element: usize) -> [f64; 3] {
+        let (at, size) = self.cells[element];
+        self.point(std::array::from_fn(|axis| {
+            at[axis] as f64 + size as f64 / 2.0
+        }))
+    }
+
+    /// 要素の一辺の最小と最大。単位はmm。
+    fn pitches(&self) -> (f64, f64) {
+        (0..self.cells.len())
+            .map(|e| self.size_mm(e))
+            .fold((f64::INFINITY, 0.0), |(lo, hi), s| (lo.min(s), hi.max(s)))
+    }
+
+    /// 格子間隔の表記。一様な格子では1つの値、細かくした格子では最小から最大まで。
+    fn label(&self) -> String {
+        range_label(self.pitches(), 1.0)
+    }
+
+    /// maskの要素の、面を共有して連結する成分ごとの外接box。大きい成分から`MAX_LOCATIONS`件
+    /// までと、成分の総数。
+    fn locations(&self, mask: &[bool]) -> (Vec<Location>, usize) {
+        let locator = Locator::new(&self.cells);
+        let mut parent: Vec<usize> = (0..self.cells.len()).collect();
         fn root(parent: &mut [usize], mut node: usize) -> usize {
             while parent[node] != node {
                 parent[node] = parent[parent[node]];
@@ -651,36 +735,320 @@ impl<'a> Mesh<'a> {
             }
             node
         }
-        for element in &self.elements {
-            let first = root(&mut parent, element[0]);
-            for node in &element[1..] {
-                let other = root(&mut parent, *node);
-                parent[other] = first;
+        for (e, cell) in self.cells.iter().enumerate() {
+            if !mask[e] {
+                continue;
+            }
+            for (axis, positive, quarter) in face_probes() {
+                if let Some(k) = locator.find(&self.cells, probe(cell, axis, positive, quarter), 4)
+                    && mask[k]
+                {
+                    let (a, b) = (root(&mut parent, e), root(&mut parent, k));
+                    parent[a.max(b)] = a.min(b);
+                }
             }
         }
-        let mut held = vec![false; parent.len()];
-        for node in (0..parent.len()).filter(|n| self.active[*n] && anchored(*n)) {
-            let r = root(&mut parent, node);
-            held[r] = true;
+        // 成分は最初の要素の順に番号を付ける。
+        let mut slots: HashMap<usize, usize> = HashMap::new();
+        let mut boxes: Vec<([f64; 3], [f64; 3], usize)> = Vec::new();
+        for (e, cell) in self.cells.iter().enumerate() {
+            if !mask[e] {
+                continue;
+            }
+            let r = root(&mut parent, e);
+            let next = boxes.len();
+            let slot = *slots.entry(r).or_insert(next);
+            if slot == next {
+                boxes.push(([f64::INFINITY; 3], [f64::NEG_INFINITY; 3], 0));
+            }
+            let low = self.point(cell.0.map(|v| v as f64));
+            let high = self.point(cell.0.map(|v| (v + cell.1) as f64));
+            let entry = &mut boxes[slot];
+            for axis in 0..3 {
+                entry.0[axis] = entry.0[axis].min(low[axis]);
+                entry.1[axis] = entry.1[axis].max(high[axis]);
+            }
+            entry.2 += 1;
         }
-        self.elements.iter().any(|element| {
-            let r = root(&mut parent, element[0]);
-            !held[r]
+        let total = boxes.len();
+        let mut order: Vec<usize> = (0..total).collect();
+        order.sort_by(|a, b| boxes[*b].2.cmp(&boxes[*a].2).then(a.cmp(b)));
+        let locations = order
+            .into_iter()
+            .take(MAX_LOCATIONS)
+            .map(|slot| Location {
+                min: boxes[slot].0,
+                max: boxes[slot].1,
+            })
+            .collect();
+        (locations, total)
+    }
+}
+
+/// 値の範囲の表記。`(最小, 最大)`に`factor`を掛け、単位mmを付ける。
+fn range_label((low, high): (f64, f64), factor: f64) -> String {
+    if low == high {
+        format!("{} mm", factor * low)
+    } else {
+        format!("{}–{} mm", factor * low, factor * high)
+    }
+}
+
+/// 面の法線の軸に対する面内の2軸。
+fn face_axes(axis: usize) -> [usize; 2] {
+    match axis {
+        0 => [1, 2],
+        1 => [0, 2],
+        _ => [0, 1],
+    }
+}
+
+/// 6面の、1/4ずつの位置。(法線の軸, 正の側か, 1/4の位置)。
+fn face_probes() -> impl Iterator<Item = (usize, bool, usize)> {
+    (0..3).flat_map(|axis| {
+        [false, true]
+            .into_iter()
+            .flat_map(move |positive| (0..4).map(move |quarter| (axis, positive, quarter)))
+    })
+}
+
+/// cellの面の1/4の中心から、面の外へわずかに出た点。格子座標の4倍で表す。
+fn probe(cell: &Cell, axis: usize, positive: bool, quarter: usize) -> [i64; 3] {
+    let [a, b] = face_axes(axis);
+    let (at, size) = *cell;
+    let mut point = [0i64; 3];
+    point[axis] = if positive {
+        4 * (at[axis] + size) + 1
+    } else {
+        4 * at[axis] - 1
+    };
+    point[a] = 4 * at[a] + size * (2 * (quarter & 1) as i64 + 1);
+    point[b] = 4 * at[b] + size * (2 * ((quarter >> 1) & 1) as i64 + 1);
+    point
+}
+
+/// 露出した面。要素の面全体か、隣の小さいcellに一部を覆われた面の1/4。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Patch {
+    element: usize,
+    axis: usize,
+    positive: bool,
+    /// 面内の2軸の側 (ビット0とビット1) で表した1/4の位置。面全体ではNone。
+    quarter: Option<usize>,
+}
+
+impl Patch {
+    /// 面の4隅の、要素内の隅の番号 (`CORNERS`の位置)。kのビット0とビット1は面内の2軸の側。
+    fn corner(&self, k: usize) -> usize {
+        let [a, b] = face_axes(self.axis);
+        let mut offset = [0usize; 3];
+        offset[self.axis] = usize::from(self.positive);
+        offset[a] = k & 1;
+        offset[b] = (k >> 1) & 1;
+        CORNERS.iter().position(|c| *c == offset).expect("a corner")
+    }
+
+    /// 面の4隅への一様な分布の配分 (合計1) と、隅が面の範囲に含まれるか。隅の番号は要素内の番号。
+    /// 双一次の形状関数の面の範囲での積分を、範囲の面積で割った値である。
+    fn shares(&self) -> [(usize, f64, bool); 4] {
+        std::array::from_fn(|k| match self.quarter {
+            None => (self.corner(k), 0.25, true),
+            Some(q) => {
+                let side = |bit: usize| {
+                    if (k >> bit) & 1 == (q >> bit) & 1 {
+                        0.75
+                    } else {
+                        0.25
+                    }
+                };
+                (self.corner(k), side(0) * side(1), k == q)
+            }
         })
     }
+
+    fn area(&self, layout: &Layout) -> f64 {
+        let size = layout.size_mm(self.element);
+        if self.quarter.is_some() {
+            size * size / 4.0
+        } else {
+            size * size
+        }
+    }
+
+    fn centre(&self, layout: &Layout) -> [f64; 3] {
+        let size = layout.size_mm(self.element);
+        let mut point = layout.centre(self.element);
+        point[self.axis] += if self.positive { 0.5 } else { -0.5 } * size;
+        if let Some(q) = self.quarter {
+            let [a, b] = face_axes(self.axis);
+            point[a] += ((q & 1) as f64 - 0.5) * size / 2.0;
+            point[b] += (((q >> 1) & 1) as f64 - 0.5) * size / 2.0;
+        }
+        point
+    }
+}
+
+/// 材料のcellに覆われていない面。
+fn exposed(layout: &Layout, locator: &Locator) -> Vec<Patch> {
+    let mut patches = Vec::new();
+    for (element, cell) in layout.cells.iter().enumerate() {
+        for axis in 0..3 {
+            for positive in [false, true] {
+                let open: Vec<usize> = (0..4)
+                    .filter(|quarter| {
+                        locator
+                            .find(&layout.cells, probe(cell, axis, positive, *quarter), 4)
+                            .is_none()
+                    })
+                    .collect();
+                let patch = |quarter| Patch {
+                    element,
+                    axis,
+                    positive,
+                    quarter,
+                };
+                if open.len() == 4 {
+                    patches.push(patch(None));
+                } else {
+                    patches.extend(open.into_iter().map(|q| patch(Some(q))));
+                }
+            }
+        }
+    }
+    patches
+}
+
+/// 解析の格子を作る。基準の格子のcellを`refinement`の段まで分割し、中心が部品に含まれる葉を
+/// 要素とする。分割しない基準のcellは、従来の格子と同じく`Grid::rasterize_midpoint`で判定する。
+fn mesh(
+    part: &Part,
+    pitch: f64,
+    refinement: Option<&Refinement>,
+    limit: usize,
+) -> Result<(Layout, Geometry, Locator), Unsolved> {
+    let grid = Grid::rasterize_midpoint(part, pitch)
+        .map_err(|reason| format!("{reason} at grid {pitch} mm"))?;
+    let base = 1i64 << MAX_REFINEMENT;
+    let unit = pitch / base as f64;
+    let origin = grid.origin.map(|v| v - pitch / 2.0);
+    let point = |lattice: [i64; 3]| -> [f64; 3] {
+        std::array::from_fn(|axis| origin[axis] + lattice[axis] as f64 * unit)
+    };
+    let depth = |cell: &Cell| {
+        refinement.map_or(0, |r| {
+            r.depth(point(cell.0), point(cell.0.map(|v| v + cell.1)))
+        })
+    };
+    let tree = Tree::new(grid.size, base, depth, MAX_LEAVES.max(8 * limit)).map_err(|count| {
+        format!("local refinement needs more than {count} cells at grid {pitch} mm")
+    })?;
+    let [nx, ny, nz] = grid.size;
+    let mut cells: Vec<Cell> = Vec::new();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let index = [x, y, z].map(|v| v as i64);
+                if tree.is_whole(index) && grid.occupied[grid.index(x, y, z)] {
+                    cells.push((index.map(|v| v * base), base));
+                }
+            }
+        }
+    }
+    for cell in tree.refined_leaves() {
+        let centre: [f64; 3] = std::array::from_fn(|axis| {
+            origin[axis] + (cell.0[axis] as f64 + cell.1 as f64 / 2.0) * unit
+        });
+        if part_contains(part, centre) {
+            cells.push(cell);
+        }
+    }
+    if cells.len() > limit {
+        return Err(format!(
+            "local refinement needs {} cells at grid {pitch} mm, above the limit of {limit}",
+            cells.len()
+        ));
+    }
+    cells.sort_unstable_by_key(|cell| [cell.0[2], cell.0[1], cell.0[0]]);
+    let mut positions: Vec<[i64; 3]> = cells
+        .iter()
+        .flat_map(|cell| (0..8).map(move |a| corner(cell, a)))
+        .collect();
+    positions.sort_unstable_by_key(|p| [p[2], p[1], p[0]]);
+    positions.dedup();
+    let index: HashMap<[i64; 3], usize> =
+        positions.iter().enumerate().map(|(k, p)| (*p, k)).collect();
+    let elements: Vec<[usize; 8]> = cells
+        .iter()
+        .map(|cell| std::array::from_fn(|a| index[&corner(cell, a)]))
+        .collect();
+    let locator = Locator::new(&cells);
+    let constraints = if tree.refined() {
+        constraints(&positions, &cells, &elements, &locator)
+    } else {
+        Constraints::none(positions.len())
+    };
+    let layout = Layout {
+        origin,
+        unit,
+        cells: cells.clone(),
+    };
+    let geometry = Geometry {
+        positions,
+        cells,
+        elements,
+        constraints,
+    };
+    Ok((layout, geometry, locator))
+}
+
+/// 節点を共有する要素の連結成分のうち、`anchored`の節点を1つも含まないものがあるか。
+/// そのような成分は剛体変位や温度が定まらず、方程式が特異になる。従属する節点は主節点と
+/// つながる。
+fn floating(geometry: &Geometry, anchored: impl Fn(usize) -> bool) -> bool {
+    let mut parent: Vec<usize> = (0..geometry.positions.len()).collect();
+    fn root(parent: &mut [usize], mut node: usize) -> usize {
+        while parent[node] != node {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        node
+    }
+    let join = |parent: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (root(parent, a), root(parent, b));
+        parent[rb] = ra;
+    };
+    for element in &geometry.elements {
+        for node in &element[1..] {
+            join(&mut parent, element[0], *node);
+        }
+    }
+    for node in 0..geometry.positions.len() {
+        for (master, _) in geometry.constraints.masters(node) {
+            join(&mut parent, node, *master);
+        }
+    }
+    let mut held = vec![false; parent.len()];
+    for node in (0..parent.len()).filter(|n| !geometry.constraints.is_dependent(*n) && anchored(*n))
+    {
+        let r = root(&mut parent, node);
+        held[r] = true;
+    }
+    geometry.elements.iter().any(|element| {
+        let r = root(&mut parent, element[0]);
+        !held[r]
+    })
 }
 
 /// 領域に含まれる露出した面。keepout、コネクタ開口、ネジ固定の領域は`reach`だけ広げる。
 /// 格子間隔hと2hの解で同じ領域を使うため、`reach`は格子に依らない値とする。
-fn region_faces(
-    mesh: &Mesh,
+fn region_patches(
+    layout: &Layout,
     model: &Model,
     part: &Part,
     region: &Region,
-    faces: &[(usize, usize, bool)],
+    patches: &[Patch],
     reach: f64,
-) -> Vec<(usize, usize, bool)> {
-    let pitch = mesh.grid.pitch;
+) -> Vec<Patch> {
     let within = |point: [f64; 3], low: [f64; 3], high: [f64; 3]| {
         (0..3).all(|axis| point[axis] >= low[axis] - 1e-9 && point[axis] <= high[axis] + 1e-9)
     };
@@ -756,76 +1124,103 @@ fn region_faces(
         }
     };
     // 面の中心で判定する。cellの中心で判定すると、端のcellの側面まで領域に含まれる。
-    faces
+    patches
         .iter()
         .copied()
-        .filter(|(cell, axis, positive)| {
-            let mut point = mesh.grid.centre_of(*cell);
-            point[*axis] += if *positive { 0.5 } else { -0.5 } * pitch;
-            predicate(point)
-        })
+        .filter(|patch| predicate(patch.centre(layout)))
         .collect()
 }
 
-/// `mask`のcellから各軸に`cells`個以内のcell。軸ごとの区間の最大で求める。
-fn dilate(grid: &Grid, mask: &[bool], cells: usize) -> Vec<bool> {
-    let size = grid.size;
-    let mut current = mask.to_vec();
-    for axis in 0..3 {
-        let stride = match axis {
-            0 => 1,
-            1 => size[0],
-            _ => size[0] * size[1],
-        };
-        let mut next = vec![false; current.len()];
-        for (index, slot) in next.iter_mut().enumerate() {
-            let position = (index / stride) % size[axis];
-            let low = position.saturating_sub(cells);
-            let high = (position + cells).min(size[axis] - 1);
-            let base = index - position * stride;
-            *slot = (low..=high).any(|k| current[base + k * stride]);
+/// 領域の合計を1とした主節点ごとの割合。面ごとに面積に比例して配り、面の中では双一次の
+/// 形状関数の積分で4隅へ配る。一様な表面荷重 (熱流束) を節点へ配ったものに当たり、節点へ
+/// 等分するのと違って縁と角の節点へ荷重が集中しない。従属する隅の分は主節点へ配る。
+fn surface_shares(layout: &Layout, geometry: &Geometry, patches: &[Patch]) -> Vec<(usize, f64)> {
+    let total: f64 = patches.iter().map(|p| p.area(layout)).sum();
+    let mut out = Vec::new();
+    for patch in patches {
+        let fraction = patch.area(layout) / total;
+        for (corner, share, _) in patch.shares() {
+            let node = geometry.elements[patch.element][corner];
+            for (master, weight) in geometry.constraints.expand(node) {
+                out.push((master, fraction * share * weight));
+            }
         }
-        current = next;
     }
-    current
+    out
 }
 
-/// 領域の合計を1とした節点ごとの割合。面は等しい面積を持ち、各面の分を4節点へ等分する。
-/// 一様な表面荷重 (熱流束) を双一次要素の節点へ配ったものに当たり、節点へ等分するのと
-/// 違って縁と角の節点へ荷重が集中しない。
-fn surface_shares(mesh: &Mesh, faces: &[(usize, usize, bool)]) -> Vec<(usize, f64)> {
-    let share = 0.25 / faces.len() as f64;
-    faces
-        .iter()
-        .flat_map(|(cell, axis, positive)| mesh.face_nodes(*cell, *axis, *positive))
-        .map(|node| (node, share))
+/// 面の範囲に含まれる隅の主節点。拘束や固定温度を与える節点である。従属する隅は主節点で
+/// 値が決まるため除く。
+fn patch_nodes<'a>(geometry: &'a Geometry, patch: &Patch) -> impl Iterator<Item = usize> + 'a {
+    let element = geometry.elements[patch.element];
+    patch
+        .shares()
+        .into_iter()
+        .filter(|(_, _, inside)| *inside)
+        .map(move |(corner, _, _)| element[corner])
+        .filter(|node| !geometry.constraints.is_dependent(*node))
+}
+
+/// 拘束と荷重の要素から、各軸に`factor`·(要素の一辺)以内に中心がある要素。
+fn near_boundary(layout: &Layout, boundary: &[bool], factor: f64) -> Vec<bool> {
+    let count = layout.cells.len();
+    let reach: Vec<f64> = (0..count).map(|e| factor * layout.size_mm(e)).collect();
+    let bucket = reach.iter().copied().fold(0.0, f64::max);
+    if bucket <= 0.0 {
+        return boundary.to_vec();
+    }
+    let key = |point: [f64; 3]| point.map(|v| (v / bucket).floor() as i64);
+    let mut buckets: HashMap<[i64; 3], Vec<[f64; 3]>> = HashMap::new();
+    for e in (0..count).filter(|e| boundary[*e]) {
+        let centre = layout.centre(e);
+        buckets.entry(key(centre)).or_default().push(centre);
+    }
+    (0..count)
+        .map(|e| {
+            let centre = layout.centre(e);
+            let limit = reach[e] + 1e-9 * bucket;
+            let low = key(centre.map(|v| v - limit));
+            let high = key(centre.map(|v| v + limit));
+            (low[2]..=high[2]).any(|z| {
+                (low[1]..=high[1]).any(|y| {
+                    (low[0]..=high[0]).any(|x| {
+                        buckets.get(&[x, y, z]).is_some_and(|points| {
+                            points
+                                .iter()
+                                .any(|p| (0..3).all(|axis| (p[axis] - centre[axis]).abs() <= limit))
+                        })
+                    })
+                })
+            })
+        })
         .collect()
 }
 
 /// 1つの格子での線形弾性の解。
 struct ElasticSolution {
+    layout: Layout,
     /// 節点の変位の大きさの最大。単位はmm。
     deflection_mm: f64,
-    /// 要素の8隅のvon Mises相当応力の最大と、cellごとの値。単位はMPa。拘束と荷重の近傍の
-    /// cellを除く。
+    /// 要素の8隅のvon Mises相当応力の最大と、要素ごとの値。単位はMPa。拘束と荷重の近傍の
+    /// 要素を除く。
     stress_mpa: f64,
     stress: Vec<(usize, f64)>,
-    /// 要素の8隅の積層方向の垂直応力 (引張) の最大と、cellごとの値。積層しない製造法では空。
-    /// 拘束と荷重の近傍のcellを除く。
+    /// 要素の8隅の積層方向の垂直応力 (引張) の最大と、要素ごとの値。積層しない製造法では空。
+    /// 拘束と荷重の近傍の要素を除く。
     interlayer_mpa: f64,
     interlayer: Vec<(usize, f64)>,
-    /// 拘束と荷重の近傍のcellのvon Mises相当応力の最大。近傍が無ければNone。
+    /// 拘束と荷重の近傍の要素のvon Mises相当応力の最大。近傍が無ければNone。
     boundary_mpa: Option<f64>,
-    /// 変位の大きい節点を含むcell。
+    /// 変位の大きい節点を含む要素。
     displaced: Vec<(usize, f64)>,
-    /// 表面のcellの値。分布の表示に使う。
+    /// 表面の要素の値。分布の表示に使う。
     surface: Vec<SurfaceCell>,
     iterations: usize,
 }
 
-/// 表面の1 cellの、要素の8隅の応力の最大、層間の引張の最大、8節点の変位の大きさの最大。
+/// 表面の1要素の、要素の8隅の応力の最大、層間の引張の最大、8節点の変位の大きさの最大。
 struct SurfaceCell {
-    cell: usize,
+    element: usize,
     stress: f64,
     interlayer: f64,
     deflection: f64,
@@ -833,11 +1228,11 @@ struct SurfaceCell {
     excluded: bool,
 }
 
-/// 露出した面を持つcell。
-fn surface_mask(length: usize, faces: &[(usize, usize, bool)]) -> Vec<bool> {
+/// 露出した面を持つ要素。
+fn surface_mask(length: usize, patches: &[Patch]) -> Vec<bool> {
     let mut mask = vec![false; length];
-    for (cell, _, _) in faces {
-        mask[*cell] = true;
+    for patch in patches {
+        mask[patch.element] = true;
     }
     mask
 }
@@ -845,40 +1240,40 @@ fn surface_mask(length: usize, faces: &[(usize, usize, bool)]) -> Vec<bool> {
 /// 解析できない理由。checkのmessageに書く。
 type Unsolved = String;
 
+/// 格子間隔`pitch`の格子で解く。`exclusion`は、拘束と荷重の近傍として応力を判定しない範囲を
+/// 要素の一辺に対する倍数で与える。
+#[allow(clippy::too_many_arguments)]
 fn solve_elastic(
     model: &Model,
     part: &Part,
     case: &StructuralCase,
     material: &Material,
     pitch: f64,
+    refinement: Option<&Refinement>,
     reach: f64,
     exclusion: f64,
-) -> Result<Result<ElasticSolution, Unsolved>, String> {
-    let grid = match Grid::rasterize_midpoint(part, pitch) {
-        Ok(grid) => grid,
-        Err(reason) => return Ok(Err(format!("{reason} at grid {pitch} mm"))),
-    };
-    let mesh = Mesh::new(&grid);
+) -> Result<ElasticSolution, Unsolved> {
+    let (layout, geometry, locator) = mesh(part, pitch, refinement, MAX_ELEMENTS)?;
     let elastic = material.elastic.as_ref().expect("validated");
     let element = unit_element(elastic.poisson_ratio);
-    let unit = &element.stiffness;
-    let scale = elastic.youngs_modulus_mpa * pitch;
-    let dofs = 3 * mesh.node_count();
-    let faces = mesh.exposed_faces();
+    let nodes = geometry.positions.len();
+    let dofs = 3 * nodes;
+    let patches = exposed(&layout, &locator);
+    let count = layout.cells.len();
 
-    let mut fixed: Vec<bool> = (0..dofs).map(|dof| !mesh.active[dof / 3]).collect();
-    // 拘束と荷重の面を持つcell。応力の判定から除く近傍の起点である。
-    let mut boundary = vec![false; grid.occupied.len()];
+    let mut fixed = vec![false; dofs];
+    // 拘束と荷重の面を持つ要素。応力の判定から除く近傍の起点である。
+    let mut boundary = vec![false; count];
     for region in &case.supports {
-        let selected = region_faces(&mesh, model, part, region, &faces, reach);
+        let selected = region_patches(&layout, model, part, region, &patches, reach);
         if selected.is_empty() {
-            return Ok(Err(format!(
+            return Err(format!(
                 "support {region:?} covers no surface at grid {pitch} mm"
-            )));
+            ));
         }
-        for (cell, axis, positive) in selected {
-            boundary[cell] = true;
-            for node in mesh.face_nodes(cell, axis, positive) {
+        for patch in &selected {
+            boundary[patch.element] = true;
+            for node in patch_nodes(&geometry, patch) {
                 for c in 0..3 {
                     fixed[3 * node + c] = true;
                 }
@@ -887,41 +1282,43 @@ fn solve_elastic(
     }
     let mut rhs = vec![0.0; dofs];
     for force in &case.forces {
-        let selected = region_faces(&mesh, model, part, &force.region, &faces, reach);
+        let selected = region_patches(&layout, model, part, &force.region, &patches, reach);
         if selected.is_empty() {
-            return Ok(Err(format!(
+            return Err(format!(
                 "force region {:?} covers no surface at grid {pitch} mm",
                 force.region
-            )));
+            ));
         }
-        for (cell, _, _) in &selected {
-            boundary[*cell] = true;
+        for patch in &selected {
+            boundary[patch.element] = true;
         }
-        for (node, share) in surface_shares(&mesh, &selected) {
+        for (node, share) in surface_shares(&layout, &geometry, &selected) {
             for c in 0..3 {
                 rhs[3 * node + c] += force.newtons[c] * share;
             }
         }
     }
-    if mesh.floating(|node| fixed[3 * node]) {
-        return Ok(Err(format!(
+    if floating(&geometry, |node| fixed[3 * node]) {
+        return Err(format!(
             "a connected piece of the part touches no support at grid {pitch} mm"
-        )));
+        ));
     }
     let mut displacement = vec![0.0; dofs];
-    let level = Level::new(
-        3,
-        mesh.nodes,
-        mesh.cell_positions(),
-        Matrices::Uniform(unit.iter().flatten().map(|k| scale * k).collect()),
-        Vec::new(),
-        fixed,
-    );
-    let Some(iterations) = Hierarchy::new(level).solve(&rhs, &mut displacement) else {
-        return Ok(Err(format!(
-            "the solver did not converge at grid {pitch} mm"
-        )));
+    let table = vec![
+        element
+            .stiffness
+            .iter()
+            .flatten()
+            .map(|k| elastic.youngs_modulus_mpa * k)
+            .collect(),
+    ];
+    // 一辺Lの要素の剛性は、一辺1の要素のL倍である。
+    let assigned = (0..count).map(|e| (0, layout.size_mm(e))).collect();
+    let hierarchy = Hierarchy::new(Level::new(3, geometry, table, assigned, Vec::new(), fixed));
+    let Some(iterations) = hierarchy.solve(&rhs, &mut displacement) else {
+        return Err(format!("the solver did not converge at grid {pitch} mm"));
     };
+    let geometry = hierarchy.fine().geometry();
 
     let deflection = |node: usize| {
         (0..3)
@@ -929,7 +1326,7 @@ fn solve_elastic(
             .sum::<f64>()
             .sqrt()
     };
-    let deflection_mm = (0..mesh.node_count()).map(deflection).fold(0.0, f64::max);
+    let deflection_mm = (0..nodes).map(deflection).fold(0.0, f64::max);
     let d = elasticity(elastic.poisson_ratio);
     // 要素の8隅で応力を求める。表面の隅の値は、平らな面の曲げで表面の応力に当たる。
     let corners = CORNERS.map(|c| {
@@ -940,27 +1337,23 @@ fn solve_elastic(
         .adopted_plan()
         .filter(|plan| plan.process.layering().is_some())
         .map(|plan| plan.orientation.build_vector());
-    // 近傍は各軸に`exclusion`以内のcellとする。
-    let near = dilate(
-        &grid,
-        &boundary,
-        (exclusion / pitch + 1e-9).floor() as usize,
-    );
+    let near = near_boundary(&layout, &boundary, exclusion);
     let mut boundary_mpa: Option<f64> = None;
-    let mut stress = Vec::with_capacity(mesh.elements.len());
+    let mut stress = Vec::with_capacity(count);
     let mut interlayer = Vec::new();
-    let mut displaced = Vec::with_capacity(mesh.elements.len());
-    let on_surface = surface_mask(grid.occupied.len(), &faces);
+    let mut displaced = Vec::with_capacity(count);
+    let on_surface = surface_mask(count, &patches);
     let mut surface = Vec::new();
-    for (nodes, cell) in mesh.elements.iter().zip(&mesh.cells) {
+    for (e, nodes) in geometry.elements.iter().enumerate() {
         let moved = nodes.iter().map(|n| deflection(*n)).fold(0.0, f64::max);
-        displaced.push((*cell, moved));
+        displaced.push((e, moved));
         let mut local = [0.0; 24];
         for (a, node) in nodes.iter().enumerate() {
             for c in 0..3 {
                 local[3 * a + c] = displacement[3 * node + c];
             }
         }
+        let size = layout.size_mm(e);
         let mut mises_max = 0.0f64;
         let mut normal_max = 0.0f64;
         let amplitude: [f64; 9] = std::array::from_fn(|m| {
@@ -975,7 +1368,7 @@ fn solve_elastic(
             let strain: [f64; 6] = std::array::from_fn(|i| {
                 let nodal: f64 = b[i].iter().zip(local.iter()).map(|(b, u)| b * u).sum();
                 let bubble: f64 = g[i].iter().zip(amplitude.iter()).map(|(g, a)| g * a).sum();
-                (nodal + bubble) / pitch
+                (nodal + bubble) / size
             });
             let sigma: [f64; 6] = std::array::from_fn(|i| {
                 elastic.youngs_modulus_mpa * (0..6).map(|m| d[i][m] * strain[m]).sum::<f64>()
@@ -993,26 +1386,27 @@ fn solve_elastic(
                 normal_max = normal_max.max(normal);
             }
         }
-        if on_surface[*cell] {
+        if on_surface[e] {
             surface.push(SurfaceCell {
-                cell: *cell,
+                element: e,
                 stress: mises_max,
                 interlayer: normal_max,
                 deflection: moved,
-                excluded: near[*cell],
+                excluded: near[e],
             });
         }
-        if near[*cell] {
+        if near[e] {
             boundary_mpa = Some(boundary_mpa.unwrap_or(0.0).max(mises_max));
             continue;
         }
-        stress.push((*cell, mises_max));
+        stress.push((e, mises_max));
         if build.is_some() {
-            interlayer.push((*cell, normal_max));
+            interlayer.push((e, normal_max));
         }
     }
     let maximum = |values: &[(usize, f64)]| values.iter().map(|(_, v)| *v).fold(0.0, f64::max);
-    Ok(Ok(ElasticSolution {
+    Ok(ElasticSolution {
+        layout,
         deflection_mm,
         stress_mpa: maximum(&stress),
         interlayer_mpa: maximum(&interlayer),
@@ -1022,16 +1416,17 @@ fn solve_elastic(
         displaced,
         surface,
         iterations,
-    }))
+    })
 }
 
 /// 1つの格子での定常熱伝導の解。
 struct ThermalSolution {
+    layout: Layout,
     /// 節点の温度の最大。単位は°C。
     max_c: f64,
-    /// cellの8節点の温度の最大。
+    /// 要素の8節点の温度の最大。
     cells: Vec<(usize, f64)>,
-    /// 表面のcellの、8節点の温度の最大。分布の表示に使う。
+    /// 表面の要素の、8節点の温度の最大。分布の表示に使う。
     surface: Vec<(usize, f64)>,
     iterations: usize,
 }
@@ -1043,39 +1438,35 @@ fn solve_thermal(
     material: &Material,
     pitch: f64,
     reach: f64,
-) -> Result<Result<ThermalSolution, Unsolved>, String> {
-    let grid = match Grid::rasterize_midpoint(part, pitch) {
-        Ok(grid) => grid,
-        Err(reason) => return Ok(Err(format!("{reason} at grid {pitch} mm"))),
-    };
-    let mesh = Mesh::new(&grid);
+) -> Result<ThermalSolution, Unsolved> {
+    let (layout, geometry, locator) = mesh(part, pitch, None, MAX_ELEMENTS)?;
     let unit = unit_conduction();
     // 熱伝導率はW/(m·K)で与えられ、mmの格子ではW/(mm·K)とする。
     let conductivity = material.thermal_conductivity_w_per_mk.expect("validated") / 1000.0;
-    let scale = conductivity * pitch;
-    let n = mesh.node_count();
-    let faces = mesh.exposed_faces();
-    let mut fixed: Vec<bool> = (0..n).map(|node| !mesh.active[node]).collect();
+    let n = geometry.positions.len();
+    let count = layout.cells.len();
+    let patches = exposed(&layout, &locator);
+    let mut fixed = vec![false; n];
     let mut temperature = vec![0.0; n];
     // 節点に固定した温度。異なる温度の領域が節点を共有すると、記述順で解が変わるため解かない。
     let mut assigned: Vec<Option<f64>> = vec![None; n];
     for item in &case.fixed_temperatures {
-        let selected = region_faces(&mesh, model, part, &item.region, &faces, reach);
+        let selected = region_patches(&layout, model, part, &item.region, &patches, reach);
         if selected.is_empty() {
-            return Ok(Err(format!(
+            return Err(format!(
                 "fixed temperature region {:?} covers no surface at grid {pitch} mm",
                 item.region
-            )));
+            ));
         }
-        for (cell, axis, positive) in selected {
-            for node in mesh.face_nodes(cell, axis, positive) {
+        for patch in &selected {
+            for node in patch_nodes(&geometry, patch) {
                 if let Some(other) = assigned[node]
                     && other != item.celsius
                 {
-                    return Ok(Err(format!(
+                    return Err(format!(
                         "fixed temperatures {other} °C and {} °C meet at the same surface at grid {pitch} mm",
                         item.celsius
-                    )));
+                    ));
                 }
                 assigned[node] = Some(item.celsius);
                 fixed[node] = true;
@@ -1088,41 +1479,45 @@ fn solve_thermal(
     // 1つの面は、最初に一致した対流の領域にだけ属する。
     let mut claimed = BTreeSet::new();
     for item in &case.convection {
-        let selected = region_faces(&mesh, model, part, &item.region, &faces, reach);
+        let selected = region_patches(&layout, model, part, &item.region, &patches, reach);
         if selected.is_empty() {
-            return Ok(Err(format!(
+            return Err(format!(
                 "convection region {:?} covers no surface at grid {pitch} mm",
                 item.region
-            )));
+            ));
         }
-        // 熱伝達係数はW/(m²·K)で与えられ、mm²の面ではW/(mm²·K)とする。
-        let conductance = item.h_w_per_m2k * 1e-6 * pitch * pitch / 4.0;
-        for face in selected {
-            if !claimed.insert(face) {
+        for patch in selected {
+            if !claimed.insert(patch) {
                 continue;
             }
-            for node in mesh.face_nodes(face.0, face.1, face.2) {
-                film[node] += conductance;
-                rhs[node] += conductance * item.ambient_c;
+            // 熱伝達係数はW/(m²·K)で与えられ、mm²の面ではW/(mm²·K)とする。膜の項は4隅へ
+            // 集中させる。従属する隅の分は主節点へ配る。
+            let conductance = item.h_w_per_m2k * 1e-6 * patch.area(&layout);
+            for (corner, share, _) in patch.shares() {
+                let node = geometry.elements[patch.element][corner];
+                for (master, weight) in geometry.constraints.expand(node) {
+                    film[master] += conductance * share * weight;
+                    rhs[master] += conductance * share * weight * item.ambient_c;
+                }
             }
         }
     }
     for input in &case.heat_inputs {
-        let selected = region_faces(&mesh, model, part, &input.region, &faces, reach);
+        let selected = region_patches(&layout, model, part, &input.region, &patches, reach);
         if selected.is_empty() {
-            return Ok(Err(format!(
+            return Err(format!(
                 "heat input region {:?} covers no surface at grid {pitch} mm",
                 input.region
-            )));
+            ));
         }
-        for (node, share) in surface_shares(&mesh, &selected) {
+        for (node, share) in surface_shares(&layout, &geometry, &selected) {
             rhs[node] += input.watts * share;
         }
     }
-    if mesh.floating(|node| fixed[node] || film[node] > 0.0) {
-        return Ok(Err(format!(
+    if floating(&geometry, |node| fixed[node] || film[node] > 0.0) {
+        return Err(format!(
             "a connected piece of the part touches no convection or fixed temperature at grid {pitch} mm"
-        )));
+        ));
     }
     // 対流も固定温度も無い節点の初期値は、周囲温度の平均とする。収束を速めるだけである。
     let start = case
@@ -1137,26 +1532,21 @@ fn solve_thermal(
             temperature[node] = start;
         }
     }
-    let level = Level::new(
-        1,
-        mesh.nodes,
-        mesh.cell_positions(),
-        Matrices::Uniform(unit.iter().flatten().map(|k| scale * k).collect()),
-        film,
-        fixed,
-    );
-    let Some(iterations) = Hierarchy::new(level).solve(&rhs, &mut temperature) else {
-        return Ok(Err(format!(
-            "the solver did not converge at grid {pitch} mm"
-        )));
+    let table = vec![unit.iter().flatten().map(|k| conductivity * k).collect()];
+    // 一辺Lの要素の伝導行列は、一辺1の要素のL倍である。
+    let scales = (0..count).map(|e| (0, layout.size_mm(e))).collect();
+    let hierarchy = Hierarchy::new(Level::new(1, geometry, table, scales, film, fixed));
+    let Some(iterations) = hierarchy.solve(&rhs, &mut temperature) else {
+        return Err(format!("the solver did not converge at grid {pitch} mm"));
     };
-    let cells: Vec<(usize, f64)> = mesh
+    let geometry = hierarchy.fine().geometry();
+    let cells: Vec<(usize, f64)> = geometry
         .elements
         .iter()
-        .zip(&mesh.cells)
-        .map(|(element, cell)| {
+        .enumerate()
+        .map(|(e, element)| {
             (
-                *cell,
+                e,
                 element
                     .iter()
                     .map(|node| temperature[*node])
@@ -1165,18 +1555,19 @@ fn solve_thermal(
         })
         .collect();
     let max_c = cells.iter().map(|(_, t)| *t).fold(f64::MIN, f64::max);
-    let on_surface = surface_mask(grid.occupied.len(), &faces);
+    let on_surface = surface_mask(count, &patches);
     let surface = cells
         .iter()
         .copied()
-        .filter(|(cell, _)| on_surface[*cell])
+        .filter(|(e, _)| on_surface[*e])
         .collect();
-    Ok(Ok(ThermalSolution {
+    Ok(ThermalSolution {
+        layout,
         max_c,
         cells,
         surface,
         iterations,
-    }))
+    })
 }
 
 /// 格子間隔h、2h、4hの値から求めた収束の判定。
@@ -1247,11 +1638,13 @@ fn analysis_check(rule: Rule, target: String, status: Status, message: String) -
     }
 }
 
-/// 格子間隔h、2h、4hの値と上限からcheckを作る。判定値が上限を超えたcellを検出箇所とし、
-/// cellの値も判定値と同じ比で外挿する。
+/// 格子間隔h、2h、4hの値と上限からcheckを作る。判定値が上限を超えた要素を検出箇所とし、
+/// 要素の値も判定値と同じ比で外挿する。`labels`は3つの格子の間隔の表記、`layout`は最も
+/// 細かい格子である。
 #[allow(clippy::too_many_arguments)]
 fn limit_check(
-    grid: &Grid,
+    layout: &Layout,
+    labels: &[String; 3],
     rule: Rule,
     target: String,
     quantity: &str,
@@ -1269,11 +1662,11 @@ fn limit_check(
         format!(" of the rise above {reference} {unit}")
     };
     let [fine, middle, coarse] = values;
-    let pitch = grid.pitch;
     let summary = format!(
-        "{quantity} {fine:.4} {unit} (grid {pitch} mm), {middle:.4} {unit} (grid {} mm), {coarse:.4} {unit} (grid {} mm); change{measured} {:.1}%; extrapolated {:.4} {unit}; limit {limit:.4} {unit}; {context}",
-        2.0 * pitch,
-        4.0 * pitch,
+        "{quantity} {fine:.4} {unit} (grid {}), {middle:.4} {unit} (grid {}), {coarse:.4} {unit} (grid {}); change{measured} {:.1}%; extrapolated {:.4} {unit}; limit {limit:.4} {unit}; {context}",
+        labels[0],
+        labels[1],
+        labels[2],
         100.0 * convergence.change,
         convergence.judged,
     );
@@ -1299,31 +1692,23 @@ fn limit_check(
         } else {
             1.0
         };
-        let mut mask = vec![false; grid.occupied.len()];
-        for (cell, value) in cells {
+        let mut mask = vec![false; layout.cells.len()];
+        for (element, value) in cells {
             if reference + (value - reference) * ratio > limit {
-                mask[*cell] = true;
+                mask[*element] = true;
             }
         }
-        let (locations, total) = grid.locations(&mask, 0.0);
+        let (locations, total) = layout.locations(&mask);
         check.message.push_str(&format!("; {total} location(s)"));
         check.locations = locations;
     }
     check
 }
 
-/// 格子間隔h、2h、4hで解く。いずれかが解けなければその理由を返す。
-fn solve_three<T>(
-    pitch: f64,
-    mut solve: impl FnMut(f64) -> Result<Result<T, Unsolved>, String>,
-) -> Result<Result<[T; 3], Unsolved>, String> {
-    let fine = solve(pitch)?;
-    let middle = solve(2.0 * pitch)?;
-    let coarse = solve(4.0 * pitch)?;
-    Ok(match (fine, middle, coarse) {
-        (Ok(fine), Ok(middle), Ok(coarse)) => Ok([fine, middle, coarse]),
-        (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => Err(reason),
-    })
+/// 格子間隔h、2h、4hで解く。`solve`は格子の段 (0、1、2) を受け取る。いずれかが解けなければ
+/// その理由を返す。
+fn solve_three<T>(mut solve: impl FnMut(u32) -> Result<T, Unsolved>) -> Result<[T; 3], Unsolved> {
+    Ok([solve(0)?, solve(1)?, solve(2)?])
 }
 
 /// 解析の格子間隔。ケースが与えなければpolicyの値。
@@ -1344,8 +1729,9 @@ pub enum Quantity {
     Temperature,
 }
 
-/// 部品の表面のcellに置いた解析の量。格子間隔hの解の値 (外挿前) であり、判定には使わない。
-/// viewerが部品の表面を色分けするために使う。cellの中心は`origin + index·pitch`である。
+/// 部品の表面のcellに置いた解析の量。最も細かい格子の解の値 (外挿前) であり、判定には使わない。
+/// viewerが部品の表面を色分けするために使う。cellの位置は格子座標で、点`origin + lattice·座標`
+/// に当たる。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Field {
@@ -1357,73 +1743,89 @@ pub struct Field {
     pub limit: Option<f64>,
     /// 値の基準。温度では周囲温度と固定温度の最小、他は0。
     pub reference: f64,
+    /// cellの一辺の最小。単位はmm。
     pub pitch: f64,
+    /// cellの一辺の最大。一様な格子ではNone。単位はmm。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pitch: Option<f64>,
+    /// 格子座標の原点と単位。単位はmm。
     pub origin: [f64; 3],
-    pub size: [usize; 3],
-    /// 表面のcellの番号と値。
-    pub cells: Vec<u32>,
+    pub lattice: f64,
+    /// 表面のcellの最小の隅の格子座標と一辺、および値。
+    pub cells: Vec<[i64; 4]>,
     pub values: Vec<f32>,
     /// 拘束と荷重の近傍で応力を判定しないcell。`cells`と同じ順。応力以外では空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<bool>,
-    /// 判定しない近傍の、拘束と荷重の領域からの距離。応力以外ではNone。単位はmm。
+    /// 判定しない近傍の、拘束と荷重の領域からの距離の最大。応力以外ではNone。単位はmm。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusion_mm: Option<f64>,
+    /// 判定しない近傍の距離の最小。距離が一様な場合はNone。単位はmm。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_exclusion_mm: Option<f64>,
 }
 
-/// 分布の表面のcellを番号で引く索引。
+/// 分布の表面のcellを、一辺ごとに最小の隅で引く索引。
 struct Sampler<'a> {
     field: &'a Field,
-    index: std::collections::HashMap<u32, usize>,
+    /// 一辺 (大きい順) と、最小の隅から`cells`の位置。
+    index: Vec<(i64, HashMap<[i64; 3], usize>)>,
 }
 
 impl<'a> Sampler<'a> {
     fn new(field: &'a Field) -> Self {
-        let index = field
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(k, cell)| (*cell, k))
-            .collect();
+        let mut index: Vec<(i64, HashMap<[i64; 3], usize>)> = Vec::new();
+        for (k, cell) in field.cells.iter().enumerate() {
+            let size = cell[3];
+            let slot = match index.iter().position(|(s, _)| *s == size) {
+                Some(slot) => slot,
+                None => {
+                    index.push((size, HashMap::new()));
+                    index.len() - 1
+                }
+            };
+            index[slot].1.insert([cell[0], cell[1], cell[2]], k);
+        }
+        index.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         Self { field, index }
     }
 
-    /// 点に最も近い表面のcellの番号 (`cells`の位置)。2 pitch以内に無ければNone。
+    /// 点に最も近い表面のcellの番号 (`cells`の位置)。中心がそのcellの一辺の2倍以内に無ければ
+    /// 候補としない。
     fn nearest(&self, point: [f32; 3]) -> Option<usize> {
         let field = self.field;
-        let [nx, ny, nz] = field.size;
-        let reach = 2isize;
-        let position: [f64; 3] =
-            std::array::from_fn(|axis| (f64::from(point[axis]) - field.origin[axis]) / field.pitch);
-        let nearest = position.map(|v| v.round() as isize);
+        let position: [f64; 3] = std::array::from_fn(|axis| {
+            (f64::from(point[axis]) - field.origin[axis]) / field.lattice
+        });
         let mut best: Option<(f64, usize)> = None;
-        for dz in -reach..=reach {
-            for dy in -reach..=reach {
-                for dx in -reach..=reach {
-                    let cell = [nearest[0] + dx, nearest[1] + dy, nearest[2] + dz];
-                    if cell
-                        .iter()
-                        .zip([nx, ny, nz])
-                        .any(|(c, n)| *c < 0 || *c as usize >= n)
-                    {
-                        continue;
-                    }
-                    let flat = (cell[2] as usize * ny + cell[1] as usize) * nx + cell[0] as usize;
-                    let Some(k) = self.index.get(&(flat as u32)) else {
-                        continue;
-                    };
-                    let distance: f64 = (0..3)
-                        .map(|axis| (cell[axis] as f64 - position[axis]).powi(2))
-                        .sum();
-                    if best.is_none_or(|(d, _)| distance < d) {
-                        best = Some((distance, *k));
+        for (size, cells) in &self.index {
+            let s = *size as f64;
+            // 中心 (i + 1/2)·sが点から2s以内にあるcellの番号i。
+            let range: [(i64, i64); 3] = std::array::from_fn(|axis| {
+                (
+                    ((position[axis] - 2.5 * s) / s).ceil() as i64,
+                    ((position[axis] + 1.5 * s) / s).floor() as i64,
+                )
+            });
+            for z in range[2].0..=range[2].1 {
+                for y in range[1].0..=range[1].1 {
+                    for x in range[0].0..=range[0].1 {
+                        let Some(k) = cells.get(&[x * size, y * size, z * size]) else {
+                            continue;
+                        };
+                        let distance: f64 = [x, y, z]
+                            .iter()
+                            .zip(position)
+                            .map(|(i, p)| ((*i as f64 + 0.5) * s - p).powi(2))
+                            .sum();
+                        if distance <= 4.0 * s * s && best.is_none_or(|(d, _)| distance < d) {
+                            best = Some((distance, *k));
+                        }
                     }
                 }
             }
         }
-        // 立方体の隅は2 pitchより遠いため、距離で棄却する。
-        best.filter(|(distance, _)| *distance <= (reach * reach) as f64)
-            .map(|(_, k)| k)
+        best.map(|(_, k)| k)
     }
 
     fn value(&self, point: [f32; 3]) -> f32 {
@@ -1432,8 +1834,8 @@ impl<'a> Sampler<'a> {
     }
 }
 
-/// 点ごとの、最も近い表面のcellの値と、そのcellが判定しない近傍にあるか。2 pitch以内に表面の
-/// cellが無い点の値はNaNとする。点はviewerの部品meshの頂点で、組立座標である。
+/// 点ごとの、最も近い表面のcellの値と、そのcellが判定しない近傍にあるか。cellの一辺の2倍以内に
+/// 表面のcellが無い点の値はNaNとする。点はviewerの部品meshの頂点で、組立座標である。
 pub fn sample(field: &Field, points: &[[f32; 3]]) -> (Vec<f32>, Vec<bool>) {
     let sampler = Sampler::new(field);
     points
@@ -1556,9 +1958,10 @@ fn field(
     unit: &str,
     limit: Option<f64>,
     reference: f64,
-    grid: &Grid,
+    layout: &Layout,
     cells: impl Iterator<Item = (usize, f64, bool)>,
 ) -> Field {
+    let (low, high) = layout.pitches();
     let mut field = Field {
         case: case.into(),
         quantity,
@@ -1566,17 +1969,20 @@ fn field(
         unit: unit.into(),
         limit,
         reference,
-        pitch: grid.pitch,
-        origin: grid.origin,
-        size: grid.size,
+        pitch: low,
+        max_pitch: (high > low).then_some(high),
+        origin: layout.origin,
+        lattice: layout.unit,
         cells: Vec::new(),
         values: Vec::new(),
         excluded: Vec::new(),
         exclusion_mm: None,
+        min_exclusion_mm: None,
     };
     let mut any_excluded = false;
-    for (cell, value, excluded) in cells {
-        field.cells.push(cell as u32);
+    for (element, value, excluded) in cells {
+        let (at, size) = layout.cells[element];
+        field.cells.push([at[0], at[1], at[2], size]);
         field.values.push(value as f32);
         field.excluded.push(excluded);
         any_excluded |= excluded;
@@ -1588,8 +1994,9 @@ fn field(
 }
 
 /// 応力の分布に、判定しない近傍の距離を記す。
-fn with_exclusion(mut field: Field, exclusion: f64) -> Field {
-    field.exclusion_mm = Some(exclusion);
+fn with_exclusion(mut field: Field, (low, high): (f64, f64)) -> Field {
+    field.exclusion_mm = Some(high);
+    field.min_exclusion_mm = (high > low).then_some(low);
     field
 }
 
@@ -1609,8 +2016,6 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
         let pitch = case_pitch(model, case.voxel_mm);
         // 領域は最も粗い格子の段を含む幅だけ広げ、3つの格子で同じ領域を使う。
         let reach = 2.0 * pitch;
-        // 拘束と荷重の近傍は、最も粗い格子の2 cell分とする。
-        let exclusion = 8.0 * pitch;
         let layered = part
             .adopted_plan()
             .is_some_and(|plan| plan.process.layering().is_some());
@@ -1618,9 +2023,25 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
         let interlayer_target = format!("{}/interlayer", case.id);
         let deflection_target = format!("{}/deflection", case.id);
         let boundary_target = format!("{}/boundary_stress", case.id);
-        let solved = solve_three(pitch, |h| {
-            solve_elastic(model, part, case, material, h, reach, exclusion)
-        })?;
+        // 厚さを測れない場合は細かくせず、一様な格子で解く。収束の判定は変わらない。
+        let (refinement, skipped) = match Refinement::new(part, pitch) {
+            Ok(refinement) => (refinement, String::new()),
+            Err(reason) => (None, format!("; not refined locally: {reason}")),
+        };
+        // 拘束と荷重の近傍は、各所の最も粗い格子の2 cell分 (最も細かい格子の8 cell分) とする。
+        let solved = solve_three(|level| {
+            let scale = f64::from(1u32 << level);
+            solve_elastic(
+                model,
+                part,
+                case,
+                material,
+                scale * pitch,
+                refinement.as_ref(),
+                reach,
+                8.0 / scale,
+            )
+        });
         let [fine, middle, coarse] = match solved {
             Ok(solutions) => solutions,
             Err(reason) => {
@@ -1642,7 +2063,22 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
                 continue;
             }
         };
-        let grid = Grid::rasterize_midpoint(part, pitch)?;
+        let layout = &fine.layout;
+        let pitches = layout.pitches();
+        let exclusion = (8.0 * pitches.0, 8.0 * pitches.1);
+        let within = if exclusion.0 == exclusion.1 {
+            range_label(exclusion, 1.0)
+        } else {
+            format!(
+                "{} (8 cells of the local finest grid)",
+                range_label(exclusion, 1.0)
+            )
+        };
+        let labels = [
+            fine.layout.label(),
+            middle.layout.label(),
+            coarse.layout.label(),
+        ];
         let allowable = material.allowable_stress_mpa.expect("validated") / case.safety_factor;
         let surface = || fine.surface.iter();
         fields.push(with_exclusion(
@@ -1653,8 +2089,8 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
                 "MPa",
                 Some(allowable),
                 0.0,
-                &grid,
-                surface().map(|s| (s.cell, s.stress, s.excluded)),
+                layout,
+                surface().map(|s| (s.element, s.stress, s.excluded)),
             ),
             exclusion,
         ));
@@ -1668,8 +2104,8 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
                     "MPa",
                     Some(interlayer / case.safety_factor),
                     0.0,
-                    &grid,
-                    surface().map(|s| (s.cell, s.interlayer.max(0.0), s.excluded)),
+                    layout,
+                    surface().map(|s| (s.element, s.interlayer.max(0.0), s.excluded)),
                 ),
                 exclusion,
             ));
@@ -1681,11 +2117,11 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
             "mm",
             case.max_deflection_mm,
             0.0,
-            &grid,
-            surface().map(|s| (s.cell, s.deflection, false)),
+            layout,
+            surface().map(|s| (s.element, s.deflection, false)),
         ));
         let context = format!(
-            "part {}; safety factor {}; {} CG iterations; stresses at element corners, excluding cells within {exclusion} mm of supports and loads",
+            "part {}; safety factor {}; {} CG iterations; stresses at element corners, excluding cells within {within} of supports and loads{skipped}",
             part.id, case.safety_factor, fine.iterations
         );
         let solutions = [&fine, &middle, &coarse];
@@ -1697,7 +2133,7 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
                 target,
                 Status::NotEvaluated,
                 format!(
-                    "not evaluated: every cell lies within {exclusion} mm of supports and loads on some grid"
+                    "not evaluated: every cell lies within {within} of supports and loads on some grid"
                 ),
             )
         };
@@ -1705,7 +2141,8 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
             everything_near(stress_target)
         } else {
             limit_check(
-                &grid,
+                layout,
+                &labels,
                 Rule::Strength,
                 stress_target,
                 "von Mises stress",
@@ -1723,7 +2160,8 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
                 everything_near(interlayer_target)
             } else {
                 limit_check(
-                    &grid,
+                    layout,
+                    &labels,
                     Rule::Strength,
                     interlayer_target,
                     "tension across layers",
@@ -1738,7 +2176,8 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
         }
         if let Some(limit) = case.max_deflection_mm {
             checks.push(limit_check(
-                &grid,
+                layout,
+                &labels,
                 Rule::Strength,
                 deflection_target,
                 "deflection",
@@ -1753,14 +2192,19 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
         // 拘束と荷重の近傍は、理想化した境界条件による応力の特異点を含み、判定できない。
         let near = fine
             .boundary_mpa
-            .map(|v| format!("; maximum von Mises stress there {v:.4} MPa at grid {pitch} mm"))
+            .map(|v| {
+                format!(
+                    "; maximum von Mises stress there {v:.4} MPa at grid {}",
+                    labels[0]
+                )
+            })
             .unwrap_or_default();
         checks.push(analysis_check(
             Rule::Strength,
             boundary_target,
             Status::NotEvaluated,
             format!(
-                "not evaluated: stresses within {exclusion} mm of supports and loads depend on how the boundary conditions idealize contact{near}"
+                "not evaluated: stresses within {within} of supports and loads depend on how the boundary conditions idealize contact{near}"
             ),
         ));
     }
@@ -1770,9 +2214,10 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
         let pitch = case_pitch(model, case.voxel_mm);
         let reach = 2.0 * pitch;
         let target = format!("{}/temperature", case.id);
-        let solved = solve_three(pitch, |h| {
+        let solved = solve_three(|level| {
+            let h = f64::from(1u32 << level) * pitch;
             solve_thermal(model, part, case, material, h, reach)
-        })?;
+        });
         let [fine, middle, coarse] = match solved {
             Ok(solutions) => solutions,
             Err(reason) => {
@@ -1792,7 +2237,11 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
             .map(|c| c.ambient_c)
             .chain(case.fixed_temperatures.iter().map(|t| t.celsius))
             .fold(f64::MAX, f64::min);
-        let grid = Grid::rasterize_midpoint(part, pitch)?;
+        let labels = [
+            fine.layout.label(),
+            middle.layout.label(),
+            coarse.layout.label(),
+        ];
         fields.push(field(
             &case.id,
             Quantity::Temperature,
@@ -1800,13 +2249,14 @@ pub fn evaluate_with_fields(model: &Model) -> Result<(Vec<Check>, Vec<Field>), S
             "°C",
             Some(case.max_temperature_c),
             reference,
-            &grid,
+            &fine.layout,
             fine.surface
                 .iter()
-                .map(|(cell, value)| (*cell, *value, false)),
+                .map(|(element, value)| (*element, *value, false)),
         ));
         checks.push(limit_check(
-            &grid,
+            &fine.layout,
+            &labels,
             Rule::Thermal,
             target,
             "maximum temperature",
@@ -2059,6 +2509,7 @@ mod tests {
         let stress = &fields[0];
         assert_eq!(stress.limit, Some(100.0));
         assert_eq!(stress.exclusion_mm, Some(4.0));
+        assert_eq!((stress.pitch, stress.max_pitch), (0.5, None));
         assert_eq!(stress.cells.len(), stress.values.len());
         assert_eq!(stress.excluded.len(), stress.cells.len());
         assert!(stress.values.iter().all(|v| (v - 10.0).abs() < 1e-3));
@@ -2076,12 +2527,10 @@ mod tests {
         let corner = stress
             .cells
             .iter()
-            .map(|&cell| {
-                let (nx, ny) = (stress.size[0], stress.size[1]);
-                let cell = cell as usize;
-                let index = [cell % nx, cell / nx % ny, cell / (nx * ny)];
+            .map(|cell| {
                 std::array::from_fn::<f32, 3, _>(|axis| {
-                    (stress.origin[axis] + index[axis] as f64 * stress.pitch) as f32
+                    let centre = cell[axis] as f64 + cell[3] as f64 / 2.0;
+                    (stress.origin[axis] + centre * stress.lattice) as f32
                 })
             })
             .max_by(|a, b| a.iter().sum::<f32>().total_cmp(&b.iter().sum::<f32>()))
@@ -2207,6 +2656,102 @@ mod tests {
         assert_eq!(stress.status, Status::NotEvaluated, "{}", stress.message);
         let deflection = find(&checks, "bracket/deflection");
         assert_eq!(deflection.status, Status::Pass, "{}", deflection.message);
+    }
+
+    #[test]
+    fn small_round_is_refined_locally() {
+        // 厚さ12 mmのL字の丸み (半径3 mm) は、格子1 mmでは最も粗い格子 (4 mm) で1 cellに満たない。
+        // 丸みの周りだけ0.5 mmに細かくすると、3つの格子で収束する。
+        let mut model = bracket(3.0, Some(3.0));
+        model.analyses.structural[0].voxel_mm = Some(1.0);
+        let (checks, fields) = evaluate_with_fields(&model).unwrap();
+        let stress = find(&checks, "bracket/stress");
+        assert_eq!(stress.status, Status::Pass, "{}", stress.message);
+        assert!(
+            stress.message.contains("(grid 0.5–1 mm)") && stress.message.contains("(grid 2–4 mm)"),
+            "{}",
+            stress.message
+        );
+        let nominal = 6.0 * 1.0 * (60.0 - 12.0) / (18.0 * 12.0 * 12.0);
+        assert!(
+            value(stress, "von Mises stress") > nominal,
+            "{}",
+            stress.message
+        );
+        // 判定しない近傍の距離は、各所の最も細かい格子の8 cell分である。
+        assert!(
+            stress.message.contains("within 4–8 mm"),
+            "{}",
+            stress.message
+        );
+        assert_eq!((fields[0].pitch, fields[0].max_pitch), (0.5, Some(1.0)));
+        assert_eq!(
+            (fields[0].min_exclusion_mm, fields[0].exclusion_mm),
+            (Some(4.0), Some(8.0))
+        );
+        // 細かくしたcellも分布の標本化に使う。丸みの面の点は値を持つ。
+        let at = 12.0 + 3.0 * (1.0 - 0.5f64.sqrt());
+        let (values, _) = sample(
+            &fields[0],
+            &[[at as f32, 9.0, (48.0 - 3.0 * (1.0 - 0.5f64.sqrt())) as f32]],
+        );
+        assert!(values[0] > 0.0, "{values:?}");
+    }
+
+    #[test]
+    fn thin_plate_is_refined_to_match_beam_theory() {
+        // 長さ15 mm、幅3 mm、厚さ1.5 mmの板の片持ち梁。格子0.5 mmでは最も粗い格子で厚さが1 cell
+        // に満たないため、厚さから一辺0.125 mmに細かくする (最も粗い格子で厚さ3 cell)。
+        let mut model = bar(15.0, 3.0, 1.5, molding());
+        // 端面を選ぶboxは、端のcell (一辺0.125 mm) の側面の中心を含まない厚さとする。
+        let face = |at: f64| Region::Box {
+            min: [at - 0.01, -1.0, -1.0],
+            max: [at + 0.01, 100.0, 100.0],
+        };
+        let mut case = cantilever("bend", 15.0, [0.0, 0.0, -0.01]);
+        case.supports = vec![face(0.0)];
+        case.forces[0].region = face(15.0);
+        model.analyses.structural.push(case);
+        let checks = evaluate(&model).unwrap();
+        let deflection = find(&checks, "bend/deflection");
+        assert_eq!(deflection.status, Status::Pass, "{}", deflection.message);
+        assert!(
+            deflection.message.contains("(grid 0.125 mm)"),
+            "{}",
+            deflection.message
+        );
+        let inertia = 3.0 * 1.5f64.powi(3) / 12.0;
+        let expected = 0.01 * 15f64.powi(3) / (3.0 * E_MPA * inertia)
+            + 0.01 * 15.0 / (5.0 / 6.0 * E_MPA / 2.0 * 4.5);
+        let delta = value(deflection, "deflection");
+        assert!(
+            (delta - expected).abs() / expected < 0.03,
+            "expected {expected}: {}",
+            deflection.message
+        );
+        // 拘束から1 mm (0.125 mmの8 cell分) の外の、最大の曲げ応力F(L - x)c/I。
+        let stress = find(&checks, "bend/stress");
+        assert_eq!(stress.status, Status::Pass, "{}", stress.message);
+        let sigma = 0.01 * (15.0 - 1.0) * 0.75 / inertia;
+        let root = value(stress, "von Mises stress");
+        assert!(
+            (root - sigma).abs() / sigma < 0.1,
+            "expected {sigma}: {}",
+            stress.message
+        );
+    }
+
+    #[test]
+    fn refinement_over_the_cell_limit_is_not_solved() {
+        let model = bar(15.0, 3.0, 1.5, molding());
+        let part = &model.parts[0];
+        let refinement = Refinement::new(part, 0.5).unwrap().expect("thin plate");
+        let Err(reason) = mesh(part, 0.5, Some(&refinement), 1000) else {
+            panic!("the mesh exceeds the limit");
+        };
+        assert!(reason.contains("above the limit of 1000"), "{reason}");
+        // 細かくしない格子は上限に収まる。
+        assert!(mesh(part, 0.5, None, 1000).is_ok());
     }
 
     #[test]

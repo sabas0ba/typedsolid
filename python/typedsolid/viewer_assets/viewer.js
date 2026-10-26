@@ -682,8 +682,9 @@
         element("span", { text: formatValue(scale.high, field.unit) }),
       ]),
     );
+    const grid = core.rangeLabel(field.pitch, field.max_pitch);
     const notes = [
-      `values on the ${field.pitch} mm analysis grid, before extrapolation; range of the surface ${formatValue(field.minimum, field.unit)} – ${formatValue(field.maximum, field.unit)}`,
+      `values on the ${grid} mm analysis grid, before extrapolation; range of the surface ${formatValue(field.minimum, field.unit)} – ${formatValue(field.maximum, field.unit)}`,
     ];
     if (field.limit !== null && field.limit !== undefined) {
       notes.push(`limit ${formatValue(field.limit, field.unit)}`);
@@ -699,7 +700,7 @@
     if (field.excluded) {
       legend.append(element("p", { class: "note" }, [
         element("span", { class: "key hatched" }),
-        `hatched: within ${field.exclusion_mm} mm of supports and loads, not judged`,
+        `hatched: within ${core.rangeLabel(field.min_exclusion_mm, field.exclusion_mm)} mm of supports and loads, not judged`,
       ]));
     }
     legend.append(element("p", { class: "note", text: "part colour: no analysis cell near the surface" }));

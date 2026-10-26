@@ -1,8 +1,9 @@
 """強度の解析ケースを持つL字の金具。縦の脚の下端を固定し、腕の先端を下へ押す。
 
 腕の付け根の内角は丸める。鋭い内角は応力の特異点となり、細分するほど応力が増えて評価できない。
-部材の厚さ12 mmは、解析の最も粗い格子 (格子間隔1 mmの4倍) でも3 cellあり、丸みの効果が
-3つの格子に現れる。金具は横倒しにし、側面を造形板に置いてFDMで造形する。L字の形が層の面に
+部材の厚さ12 mmは、解析の最も粗い格子 (格子間隔1 mmの4倍) でも3 cellある。丸みの半径3 mmは
+その格子で1 cellに満たないため、解析は丸みの周りだけを格子間隔0.5 mmに細かくし、丸みの効果を
+3つの格子に表す。金具は横倒しにし、側面を造形板に置いてFDMで造形する。L字の形が層の面に
 収まり、腕の下面が張り出さない。材料の値は説明用の値であり、特定の樹脂の値ではない。
 """
 
@@ -15,7 +16,7 @@ THICKNESS_MM = 12.0
 WIDTH_MM = 18.0
 HEIGHT_MM = 60.0
 REACH_MM = 60.0
-RADIUS_MM = 6.0
+RADIUS_MM = 3.0
 LOAD_N = 30.0
 SIDEWAYS = ManufacturingPlan("fdm_sideways", Fdm(), "typedsolid default FDM values", orientation=Orientation("minus_y"))
 MATERIAL = Material(

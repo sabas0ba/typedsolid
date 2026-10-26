@@ -98,6 +98,15 @@ class ViewerHtmlTests(TemporaryDirectoryTest):
         # 近傍を持たない分布は印を埋め込まない。
         plain = field_overlay("plate", {"quantity": "deflection"}, values, bytes(4))
         self.assertIsNone(plain.excluded)
+        # 局所的に細かくした格子は、cellの一辺と近傍の距離の範囲を持つ。
+        refined = field_overlay(
+            "plate", {"quantity": "stress", "pitch": 0.25, "max_pitch": 1.0, "exclusion_mm": 8.0,
+                      "min_exclusion_mm": 2.0}, values, bytes(4),
+        )
+        self.assertEqual(
+            {key: refined.meta[key] for key in ("pitch", "max_pitch", "exclusion_mm", "min_exclusion_mm")},
+            {"pitch": 0.25, "max_pitch": 1.0, "exclusion_mm": 8.0, "min_exclusion_mm": 2.0},
+        )
 
     def test_text_cannot_close_the_script_or_inject_markup(self):
         hostile = '</script><script>alert(1)</script> & {{APP}}'

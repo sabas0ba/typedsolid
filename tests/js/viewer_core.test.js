@@ -251,6 +251,13 @@ test("field scales follow the chosen range", () => {
   assert.equal(core.rgbToHex(core.fieldColour(45, scale, "sequential")), core.OVER_LIMIT);
 });
 
+test("ranges of local grids are written as one value when uniform", () => {
+  assert.equal(core.rangeLabel(0.5, undefined), "0.5");
+  assert.equal(core.rangeLabel(0.25, 1), "0.25–1");
+  assert.equal(core.rangeLabel(undefined, 4), "4");
+  assert.equal(core.rangeLabel(4, 4), "4");
+});
+
 test("field colours mark values over the limit and leave missing values to the part", () => {
   const scale = { low: 0, high: 20, over: true };
   assert.equal(core.fieldColour(Number.NaN, scale, "sequential"), null);

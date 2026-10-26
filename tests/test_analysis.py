@@ -140,12 +140,16 @@ class AnalysisBuildTests(unittest.TestCase):
         self.assertEqual(heat["reference"], 20.0)
 
     def test_bracket_example_evaluates_the_rounded_corner(self):
-        """作例のL字の金具は、丸めた付け根の応力とたわみが収束して上限を満たす。"""
+        """作例のL字の金具は、丸めた付け根の応力とたわみが収束して上限を満たす。丸みの周りだけを
+        格子間隔の半分に細かくする。"""
         result = build(bracket())
         self.assertTrue(result.export_allowed)
         for target in ("arm_load/stress", "arm_load/deflection"):
             check = by_target(result, target)
             self.assertEqual(check["status"], "pass", check["message"])
+            self.assertIn("(grid 0.5–1 mm)", check["message"])
+        stress = next(f for f in result.fields if f["quantity"] == "stress")
+        self.assertEqual((stress["pitch"], stress["max_pitch"]), (0.5, 1.0))
 
     def test_exceeding_a_limit_fails_with_locations(self):
         hot = replace(HEAT, max_temperature_c=50.0, convection=(Convection(Surface(), 5.0, 20.0),))

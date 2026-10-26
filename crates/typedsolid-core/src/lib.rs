@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod mesh;
 mod multigrid;
+mod octree;
 pub mod voxel;
 
 pub use analysis::{
