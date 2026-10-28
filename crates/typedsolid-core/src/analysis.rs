@@ -918,12 +918,63 @@ fn exposed(layout: &Layout, locator: &Locator) -> Vec<Patch> {
     patches
 }
 
-/// 解析の格子を作る。基準の格子のcellを`refinement`の段まで分割し、中心が部品に含まれる葉を
-/// 要素とする。分割しない基準のcellは、従来の格子と同じく`Grid::rasterize_midpoint`で判定する。
+/// 格子を作るときに、少なくとも指定の段まで分割する点。点を閉じた範囲に含むcellを分割する。
+/// 基準のcellの番号ごとに、格子座標の点と段を持つ。
+#[derive(Default)]
+struct Pins(HashMap<[i64; 3], Vec<([i64; 3], u32)>>);
+
+impl Pins {
+    fn add(&mut self, point: [i64; 3], level: u32) {
+        let base = 1i64 << MAX_REFINEMENT;
+        // 点が基準のcellの境界に乗る場合は、境界を共有するすべての基準のcellに登録する。
+        let candidates = point.map(|v| {
+            let index = v.div_euclid(base);
+            if v == index * base {
+                [index, index - 1]
+            } else {
+                [index, index]
+            }
+        });
+        for k in 0..8 {
+            let index: [i64; 3] = std::array::from_fn(|axis| candidates[axis][(k >> axis) & 1]);
+            let list = self.0.entry(index).or_default();
+            if !list.contains(&(point, level)) {
+                list.push((point, level));
+            }
+        }
+    }
+
+    /// cellが含む点の段の最大。
+    fn depth(&self, cell: &Cell) -> u32 {
+        let base = 1i64 << MAX_REFINEMENT;
+        let index = cell.0.map(|v| v.div_euclid(base));
+        self.0.get(&index).map_or(0, |list| {
+            list.iter()
+                .filter(|(point, _)| {
+                    (0..3).all(|axis| {
+                        point[axis] >= cell.0[axis] && point[axis] <= cell.0[axis] + cell.1
+                    })
+                })
+                .map(|(_, level)| *level)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+}
+
+/// 一辺`size` (格子座標) のcellの段。
+fn level_of(size: i64) -> u32 {
+    ((1i64 << MAX_REFINEMENT) / size).trailing_zeros()
+}
+
+/// 解析の格子を作る。基準の格子のcellを`refinement`と`pins`の段まで分割し、中心が部品に
+/// 含まれる葉を要素とする。分割しない基準のcellは、従来の格子と同じく
+/// `Grid::rasterize_midpoint`で判定する。
 fn mesh(
     part: &Part,
     pitch: f64,
     refinement: Option<&Refinement>,
+    pins: &Pins,
     limit: usize,
 ) -> Result<(Layout, Geometry, Locator), Unsolved> {
     let grid = Grid::rasterize_midpoint(part, pitch)
@@ -935,9 +986,10 @@ fn mesh(
         std::array::from_fn(|axis| origin[axis] + lattice[axis] as f64 * unit)
     };
     let depth = |cell: &Cell| {
-        refinement.map_or(0, |r| {
+        let required = refinement.map_or(0, |r| {
             r.depth(point(cell.0), point(cell.0.map(|v| v + cell.1)))
-        })
+        });
+        required.max(pins.depth(cell))
     };
     let tree = Tree::new(grid.size, base, depth, MAX_LEAVES.max(8 * limit)).map_err(|count| {
         format!("local refinement needs more than {count} cells at grid {pitch} mm")
@@ -1240,6 +1292,97 @@ fn surface_mask(length: usize, patches: &[Patch]) -> Vec<bool> {
 /// 解析できない理由。checkのmessageに書く。
 type Unsolved = String;
 
+/// 拘束を与えた格子。
+struct Supported {
+    layout: Layout,
+    geometry: Geometry,
+    patches: Vec<Patch>,
+    /// 拘束した自由度 (節点あたり3)。
+    fixed: Vec<bool>,
+    /// 拘束の面を持つ要素。
+    boundary: Vec<bool>,
+    /// 拘束の面に従属する節点が乗ったため、格子を作り直した回数。
+    #[cfg_attr(not(test), allow(dead_code))]
+    rounds: usize,
+}
+
+/// 拘束の面に乗る従属する節点を除くために格子を作り直す回数の上限。
+const MAX_SUPPORT_ROUNDS: usize = 8;
+
+/// 格子を作り、拘束の面の節点を拘束する。
+///
+/// 拘束の面に従属する節点が乗り、その主節点に拘束しないものがあると、節点は主節点の補間で
+/// 動き、面の拘束が辺や点の拘束になる。そのような節点が隅となるまで隣の大きいcellを分割して
+/// 格子を作り直す。主節点がすべて拘束された従属する節点は、補間した値も0である。
+fn supported_mesh(
+    model: &Model,
+    part: &Part,
+    case: &StructuralCase,
+    pitch: f64,
+    refinement: Option<&Refinement>,
+    reach: f64,
+) -> Result<Supported, Unsolved> {
+    let mut pins = Pins::default();
+    let mut rounds = 0;
+    loop {
+        let (layout, geometry, locator) = mesh(part, pitch, refinement, &pins, MAX_ELEMENTS)?;
+        let patches = exposed(&layout, &locator);
+        let mut fixed = vec![false; 3 * geometry.positions.len()];
+        // 拘束と荷重の面を持つ要素。応力の判定から除く近傍の起点である。
+        let mut boundary = vec![false; layout.cells.len()];
+        // 拘束の面に乗る従属する節点と、それを隅とする要素の一辺。
+        let mut dependent = Vec::new();
+        for region in &case.supports {
+            let selected = region_patches(&layout, model, part, region, &patches, reach);
+            if selected.is_empty() {
+                return Err(format!(
+                    "support {region:?} covers no surface at grid {pitch} mm"
+                ));
+            }
+            for patch in &selected {
+                boundary[patch.element] = true;
+                for (corner, _, inside) in patch.shares() {
+                    let node = geometry.elements[patch.element][corner];
+                    if !inside {
+                        continue;
+                    }
+                    if geometry.constraints.is_dependent(node) {
+                        dependent.push((node, layout.cells[patch.element].1));
+                        continue;
+                    }
+                    for c in 0..3 {
+                        fixed[3 * node + c] = true;
+                    }
+                }
+            }
+        }
+        let mut hanging = 0;
+        for (node, size) in dependent {
+            let masters = geometry.constraints.masters(node);
+            if masters.iter().any(|(m, _)| !fixed[3 * m]) {
+                pins.add(geometry.positions[node], level_of(size));
+                hanging += 1;
+            }
+        }
+        if hanging == 0 {
+            return Ok(Supported {
+                layout,
+                geometry,
+                patches,
+                fixed,
+                boundary,
+                rounds,
+            });
+        }
+        rounds += 1;
+        if rounds > MAX_SUPPORT_ROUNDS {
+            return Err(format!(
+                "a support meets a change of cell size that refinement does not remove at grid {pitch} mm"
+            ));
+        }
+    }
+}
+
 /// 格子間隔`pitch`の格子で解く。`exclusion`は、拘束と荷重の近傍として応力を判定しない範囲を
 /// 要素の一辺に対する倍数で与える。
 #[allow(clippy::too_many_arguments)]
@@ -1253,33 +1396,19 @@ fn solve_elastic(
     reach: f64,
     exclusion: f64,
 ) -> Result<ElasticSolution, Unsolved> {
-    let (layout, geometry, locator) = mesh(part, pitch, refinement, MAX_ELEMENTS)?;
+    let Supported {
+        layout,
+        geometry,
+        patches,
+        fixed,
+        mut boundary,
+        ..
+    } = supported_mesh(model, part, case, pitch, refinement, reach)?;
     let elastic = material.elastic.as_ref().expect("validated");
     let element = unit_element(elastic.poisson_ratio);
     let nodes = geometry.positions.len();
     let dofs = 3 * nodes;
-    let patches = exposed(&layout, &locator);
     let count = layout.cells.len();
-
-    let mut fixed = vec![false; dofs];
-    // 拘束と荷重の面を持つ要素。応力の判定から除く近傍の起点である。
-    let mut boundary = vec![false; count];
-    for region in &case.supports {
-        let selected = region_patches(&layout, model, part, region, &patches, reach);
-        if selected.is_empty() {
-            return Err(format!(
-                "support {region:?} covers no surface at grid {pitch} mm"
-            ));
-        }
-        for patch in &selected {
-            boundary[patch.element] = true;
-            for node in patch_nodes(&geometry, patch) {
-                for c in 0..3 {
-                    fixed[3 * node + c] = true;
-                }
-            }
-        }
-    }
     let mut rhs = vec![0.0; dofs];
     for force in &case.forces {
         let selected = region_patches(&layout, model, part, &force.region, &patches, reach);
@@ -1439,7 +1568,7 @@ fn solve_thermal(
     pitch: f64,
     reach: f64,
 ) -> Result<ThermalSolution, Unsolved> {
-    let (layout, geometry, locator) = mesh(part, pitch, None, MAX_ELEMENTS)?;
+    let (layout, geometry, locator) = mesh(part, pitch, None, &Pins::default(), MAX_ELEMENTS)?;
     let unit = unit_conduction();
     // 熱伝導率はW/(m·K)で与えられ、mmの格子ではW/(mm·K)とする。
     let conductivity = material.thermal_conductivity_w_per_mk.expect("validated") / 1000.0;
@@ -2742,16 +2871,69 @@ mod tests {
     }
 
     #[test]
+    fn supports_on_a_change_of_cell_size_hold_the_whole_face() {
+        // 脚 (2×3×4 mm) の下端から薄い板 (厚さ1.4375 mm = 23×0.0625 mm) が伸びる。板の上面を
+        // 拘束すると、上面の脚側の縁の節点は脚の大きいcell (0.125 mm) の辺の中点に乗り、
+        // 主節点の一方は上面より上にある。脚のcellを分割し、上面のすべての節点を拘束する。
+        let mut model = bar(2.0, 3.0, 4.0, molding());
+        let mut plate = model.parts[0].features[0].clone();
+        plate.id = "plate".into();
+        plate.shape = Shape::Box {
+            min: [2.0, 0.0, 0.0],
+            max: [5.0, 3.0, 1.4375],
+        };
+        model.parts[0].features.push(plate);
+        let mut case = cantilever("hold", 5.0, [0.0, 0.0, -1.0]);
+        case.supports = vec![Region::Box {
+            min: [2.0, -1.0, 1.43],
+            max: [5.0, 4.0, 1.45],
+        }];
+        let part = &model.parts[0];
+        let refinement = Refinement::new(part, 0.5).unwrap();
+        let supported = supported_mesh(&model, part, &case, 0.5, refinement.as_ref(), 1.0).unwrap();
+        assert!(supported.rounds > 0);
+        let geometry = &supported.geometry;
+        let region = &case.supports[0];
+        let selected = region_patches(
+            &supported.layout,
+            &model,
+            part,
+            region,
+            &supported.patches,
+            1.0,
+        );
+        assert!(!selected.is_empty());
+        for patch in &selected {
+            for (corner, _, inside) in patch.shares() {
+                let node = geometry.elements[patch.element][corner];
+                if !inside {
+                    continue;
+                }
+                let held = if geometry.constraints.is_dependent(node) {
+                    geometry
+                        .constraints
+                        .masters(node)
+                        .iter()
+                        .all(|(m, _)| supported.fixed[3 * m])
+                } else {
+                    supported.fixed[3 * node]
+                };
+                assert!(held, "{:?}", geometry.positions[node]);
+            }
+        }
+    }
+
+    #[test]
     fn refinement_over_the_cell_limit_is_not_solved() {
         let model = bar(15.0, 3.0, 1.5, molding());
         let part = &model.parts[0];
         let refinement = Refinement::new(part, 0.5).unwrap().expect("thin plate");
-        let Err(reason) = mesh(part, 0.5, Some(&refinement), 1000) else {
+        let Err(reason) = mesh(part, 0.5, Some(&refinement), &Pins::default(), 1000) else {
             panic!("the mesh exceeds the limit");
         };
         assert!(reason.contains("above the limit of 1000"), "{reason}");
         // 細かくしない格子は上限に収まる。
-        assert!(mesh(part, 0.5, None, 1000).is_ok());
+        assert!(mesh(part, 0.5, None, &Pins::default(), 1000).is_ok());
     }
 
     #[test]
