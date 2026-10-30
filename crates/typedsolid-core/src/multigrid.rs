@@ -1,20 +1,30 @@
-//! voxel格子の8節点六面体要素の連立方程式を、幾何マルチグリッドを前処理とする共役勾配法で解く。
+//! 八分木の格子の8節点六面体要素の連立方程式を、幾何マルチグリッドを前処理とする共役勾配法で
+//! 解く。
 //!
-//! 格子間隔を2倍ずつにした格子の階層を作る。粗い格子の演算子は、節点の三重線形補間Pによる
-//! Galerkin近似P^T A Pである。細かい要素は1つの粗いcellに収まるため、粗い要素の行列は
-//! その子の要素の行列をPで写したものの和となる。薄い形状が粗い格子で失われることはない。
+//! 要素は大きさの異なる立方体のcellで、隣より大きいcellの面や辺に乗る節点 (hanging node) は
+//! 大きいcellの隅の値で補間し、未知数から除く (`octree`)。要素の行列は隅の自由度について
+//! 持ち、積をとるときに従属する隅を主節点へ展開する。
+//!
+//! 粗い格子は、最も小さい要素を8つずつ親のcellへまとめて作る。それより大きい要素はそのまま
+//! 残す。粗い格子の演算子は、粗い格子の関数を細かい節点で評価する補間PによるGalerkin近似
+//! P^T A Pである。まとめた親の要素の行列は、子の要素の行列を親の三重線形補間で写したものの
+//! 和となる。薄い形状が粗い格子で失われることはない。一様な格子ではすべての要素を毎回まとめる。
+//! 拘束した自由度に接する要素は行列から拘束の行と列を除いて写す。従属する隅は、その主節点が
+//! すべて拘束されていれば拘束とみなす。粗い格子の演算子はこの点で近似となるが、前処理に使う
+//! だけであり、解の精度は細かい格子の演算子で決まる。
+//!
 //! 平滑化は対角で前処理した行列D⁻¹AのChebyshev多項式で、前後に同じ次数で行い、V-cycleを
 //! 対称にする。D⁻¹Aの最大固有値は格子ごとに冪乗法で見積もる。減衰Jacobi法は係数と最大
 //! 固有値の積が2を超えると高周波の誤差を増やし、弾性の要素ではその値が3.5〜4となる。
 //! 最も粗い格子は密行列のCholesky分解で解く。
 //!
-//! 固定した自由度 (拘束、固定温度、材料に接しない節点) は方程式から除く。
+//! 固定した自由度 (拘束、固定温度、材料に接しない節点) と従属する節点の自由度は方程式から除く。
 //!
-//! 要素ごとの行列とベクトルの積は、要素をz方向の区間に分けて並列に計算する。隣り合う区間は
-//! 節点の面を共有するため、偶数番と奇数番の区間を交互に処理する。同じ組の区間は節点を
-//! 共有せず、書き込む範囲が重ならない。
+//! 要素ごとの行列とベクトルの積は、要素をz方向の区間に分けて並列に計算する。偶数番と奇数番の
+//! 区間を交互に処理し、同じ組の区間が書き込む節点の範囲が重ならないことを確かめる。
 
-use std::collections::BTreeMap;
+use crate::octree::{self, Cell, Constraints, Locator, corner};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 /// 8節点六面体要素の節点の、要素内の位置 (0か1)。
@@ -50,115 +60,163 @@ const MIN_ELEMENTS_PER_THREAD: usize = 5_000;
 /// 密行列で解けない最も粗い格子で、代わりに行う平滑化の次数。
 const COARSEST_SMOOTHING: usize = 30;
 
-/// 要素の行列。n×n (nは要素の自由度) を行優先で並べる。
-pub(crate) enum Matrices {
-    /// すべての要素が同じ行列を持つ。
-    Uniform(Vec<f64>),
-    /// 要素ごとの行列を順に並べる。
-    Each(Vec<f64>),
+/// 格子の形。節点と要素のcellは格子座標で表す。
+pub(crate) struct Geometry {
+    /// 節点の格子座標。zの順に並ぶ。
+    pub(crate) positions: Vec<[i64; 3]>,
+    /// 要素のcell。最小の隅のzの順に並ぶ。
+    pub(crate) cells: Vec<Cell>,
+    /// 要素の8隅の節点の番号。
+    pub(crate) elements: Vec<[usize; 8]>,
+    pub(crate) constraints: Constraints,
 }
 
 /// 1つの格子の連立方程式。
 pub(crate) struct Level {
     /// 節点あたりの自由度。弾性は3、熱伝導は1。
     dofs_per_node: usize,
-    /// 節点の格子の各軸の数。cellの数より1多い。
-    nodes: [usize; 3],
-    /// 要素のcellの位置。
-    cells: Vec<[usize; 3]>,
-    /// 要素の8節点の番号。
-    elements: Vec<[usize; 8]>,
-    matrices: Matrices,
+    geometry: Geometry,
+    /// 要素の行列の表。n×n (nは要素の自由度) を行優先で並べる。
+    table: Vec<Vec<f64>>,
+    /// 要素ごとの、表の番号と倍率。
+    assigned: Vec<(usize, f64)>,
     /// 自由度ごとに対角へ加える値 (対流の膜係数)。空なら0。
     extra: Vec<f64>,
-    /// 方程式から除く自由度。
+    /// 方程式から除く自由度。従属する節点の自由度を含む。
     fixed: Vec<bool>,
+    /// 従属する隅を持つ要素の、(隅, 主節点, 重み)の範囲の始まり。要素の数より1多い。
+    link_start: Vec<usize>,
+    links: Vec<(usize, usize, f64)>,
     diagonal: Vec<f64>,
     /// D⁻¹Aの最大固有値の見積もり。
     largest: f64,
-    /// 要素をz方向に区切った区間。要素の番号の範囲と、その要素が触れる節点の番号の範囲。
+    /// 要素をz方向に区切った区間。要素の番号の範囲と、その要素が書き込む節点の番号の範囲。
     slabs: Vec<(Range<usize>, Range<usize>)>,
-    /// 1つ粗い格子への転送。自由度を持つ節点と、補間する粗い節点と重み。
-    transfer: Vec<Transfer>,
+    /// 1つ粗い格子への転送。
+    transfer: Transfer,
 }
 
-/// 細かい節点1つの補間。粗い節点は最大8つで、`count`個が有効である。
+/// 細かい節点の、粗い格子の主節点による補間。
+#[derive(Default)]
 struct Transfer {
-    node: usize,
-    parents: [(usize, f64); 8],
-    count: usize,
+    nodes: Vec<usize>,
+    /// 節点ごとの`parents`の範囲の始まり。`nodes`より1多い。
+    start: Vec<usize>,
+    parents: Vec<(usize, f64)>,
 }
 
 impl Level {
-    /// 最も細かい格子。`cells`は材料cellの位置、`fixed`は除く自由度。
+    /// 格子の連立方程式。`fixed`は除く自由度で、従属する節点の自由度は加えて除く。
     pub(crate) fn new(
         dofs_per_node: usize,
-        nodes: [usize; 3],
-        cells: Vec<[usize; 3]>,
-        matrices: Matrices,
+        geometry: Geometry,
+        table: Vec<Vec<f64>>,
+        assigned: Vec<(usize, f64)>,
         extra: Vec<f64>,
-        fixed: Vec<bool>,
+        mut fixed: Vec<bool>,
     ) -> Self {
-        let elements = cells
-            .iter()
-            .map(|cell| {
-                CORNERS.map(|c| node_index(nodes, [cell[0] + c[0], cell[1] + c[1], cell[2] + c[2]]))
-            })
-            .collect();
+        let mut link_start = Vec::with_capacity(geometry.elements.len() + 1);
+        let mut links = Vec::new();
+        for element in &geometry.elements {
+            link_start.push(links.len());
+            if element
+                .iter()
+                .any(|node| geometry.constraints.is_dependent(*node))
+            {
+                for (a, node) in element.iter().enumerate() {
+                    for (master, weight) in geometry.constraints.expand(*node) {
+                        links.push((a, master, weight));
+                    }
+                }
+            }
+        }
+        link_start.push(links.len());
+        for node in 0..geometry.positions.len() {
+            if geometry.constraints.is_dependent(node) {
+                for c in 0..dofs_per_node {
+                    fixed[dofs_per_node * node + c] = true;
+                }
+            }
+        }
         let mut level = Self {
             dofs_per_node,
-            nodes,
-            cells,
-            elements,
-            matrices,
+            geometry,
+            table,
+            assigned,
             extra,
             fixed,
+            link_start,
+            links,
             diagonal: Vec::new(),
             largest: 0.0,
             slabs: Vec::new(),
-            transfer: Vec::new(),
+            transfer: Transfer::default(),
         };
         level.slabs = level.compute_slabs();
         level.diagonal = level.compute_diagonal();
         level
     }
 
+    pub(crate) fn geometry(&self) -> &Geometry {
+        &self.geometry
+    }
+
+    fn links(&self, element: usize) -> &[(usize, usize, f64)] {
+        &self.links[self.link_start[element]..self.link_start[element + 1]]
+    }
+
+    /// 要素が書き込む節点の番号の範囲。
+    fn touched(&self, element: usize) -> Range<usize> {
+        let links = self.links(element);
+        let nodes: Box<dyn Iterator<Item = usize>> = if links.is_empty() {
+            Box::new(self.geometry.elements[element].iter().copied())
+        } else {
+            Box::new(links.iter().map(|(_, m, _)| *m))
+        };
+        let (low, high) = nodes.fold((usize::MAX, 0), |(lo, hi), n| (lo.min(n), hi.max(n)));
+        low..high + 1
+    }
+
     /// 要素をz方向の区間に分ける。要素はcellのzの順に並んでいる。並列化しない場合と、
-    /// zの順でない場合は1つの区間とする。
+    /// 同じ組の区間が節点を共有する場合は1つの区間とする。
     fn compute_slabs(&self) -> Vec<(Range<usize>, Range<usize>)> {
-        let all = vec![(0..self.elements.len(), 0..self.nodes.iter().product())];
+        let cells = &self.geometry.cells;
+        let count = cells.len();
+        let all = vec![(0..count, 0..self.geometry.positions.len())];
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .min(MAX_THREADS)
-            .min(self.elements.len() / MIN_ELEMENTS_PER_THREAD);
-        if threads <= 1 || self.cells.windows(2).any(|pair| pair[0][2] > pair[1][2]) {
+            .min(count / MIN_ELEMENTS_PER_THREAD);
+        if threads <= 1 || cells.windows(2).any(|pair| pair[0].0[2] > pair[1].0[2]) {
             return all;
         }
-        let count = 2 * threads;
-        let plane = self.nodes[0] * self.nodes[1];
-        let mut slabs = Vec::with_capacity(count);
+        let pieces = 2 * threads;
+        let mut slabs = Vec::with_capacity(pieces);
         let mut start = 0;
-        for k in 1..=count {
-            let target = self.elements.len() * k / count;
-            let mut end = target.max(start + 1).min(self.elements.len());
+        for k in 1..=pieces {
+            let target = count * k / pieces;
+            let mut end = target.max(start + 1).min(count);
             // 区間の境界はzの層の境界に合わせる。
-            while end < self.elements.len() && self.cells[end][2] == self.cells[end - 1][2] {
+            while end < count && cells[end].0[2] == cells[end - 1].0[2] {
                 end += 1;
             }
             if start >= end {
                 continue;
             }
-            let low = self.cells[start][2];
-            let high = self.cells[end - 1][2] + 1;
-            slabs.push((start..end, low * plane..(high + 1) * plane));
+            let (low, high) = (start..end).fold((usize::MAX, 0), |(low, high), e| {
+                let touched = self.touched(e);
+                (low.min(touched.start), high.max(touched.end))
+            });
+            slabs.push((start..end, low..high));
             start = end;
-            if start == self.elements.len() {
+            if start == count {
                 break;
             }
         }
         // 1つおきの区間が節点を共有しないことを確かめる。
-        let separated = slabs.windows(3).all(|w| w[0].1.end <= w[2].1.start);
+        let separated = slabs.windows(3).all(|w| w[0].1.end <= w[2].1.start)
+            && slabs.windows(2).all(|w| w[0].1.start <= w[1].1.start);
         if slabs.len() < 2 || !separated {
             return all;
         }
@@ -173,12 +231,9 @@ impl Level {
         self.fixed.len()
     }
 
-    fn matrix(&self, element: usize) -> &[f64] {
-        let n = self.size() * self.size();
-        match &self.matrices {
-            Matrices::Uniform(matrix) => matrix,
-            Matrices::Each(matrices) => &matrices[element * n..(element + 1) * n],
-        }
+    fn matrix(&self, element: usize) -> (&[f64], f64) {
+        let (index, scale) = self.assigned[element];
+        (&self.table[index], scale)
     }
 
     /// 要素の局所自由度 (隅a、成分c) の全体の番号。
@@ -190,10 +245,26 @@ impl Level {
     fn compute_diagonal(&self) -> Vec<f64> {
         let mut diagonal = vec![0.0; self.dofs()];
         let n = self.size();
-        for (e, element) in self.elements.iter().enumerate() {
-            let matrix = self.matrix(e);
-            for i in 0..n {
-                diagonal[self.dof(element, i)] += matrix[i * n + i];
+        let d = self.dofs_per_node;
+        for (e, element) in self.geometry.elements.iter().enumerate() {
+            let (matrix, scale) = self.matrix(e);
+            let links = self.links(e);
+            if links.is_empty() {
+                for i in 0..n {
+                    diagonal[self.dof(element, i)] += scale * matrix[i * n + i];
+                }
+                continue;
+            }
+            for &(a, m1, w1) in links {
+                for &(b, m2, w2) in links {
+                    if m1 != m2 {
+                        continue;
+                    }
+                    for c in 0..d {
+                        diagonal[d * m1 + c] +=
+                            scale * w1 * w2 * matrix[(a * d + c) * n + b * d + c];
+                    }
+                }
             }
         }
         for (value, extra) in diagonal.iter_mut().zip(&self.extra) {
@@ -208,7 +279,7 @@ impl Level {
     }
 
     /// 要素の範囲について`y += A x`を加える。`y`は全体の自由度の`offset`からの部分である。
-    /// `masked`なら除いた自由度のxを0とみなす。
+    /// `masked`なら除いた自由度のxを0とみなす。従属する節点のxは使わず、主節点から補間する。
     fn accumulate(
         &self,
         x: &[f64],
@@ -218,22 +289,46 @@ impl Level {
         masked: bool,
     ) {
         let n = self.size();
-        let mut local = [0.0; 24];
-        for e in elements {
-            let element = &self.elements[e];
-            for (i, slot) in local[..n].iter_mut().enumerate() {
-                let dof = self.dof(element, i);
-                *slot = if masked && self.fixed[dof] {
-                    0.0
-                } else {
-                    x[dof]
-                };
+        let d = self.dofs_per_node;
+        let value = |dof: usize| {
+            if masked && self.fixed[dof] {
+                0.0
+            } else {
+                x[dof]
             }
-            let matrix = self.matrix(e);
+        };
+        let mut local = [0.0; 24];
+        let mut product = [0.0; 24];
+        for e in elements {
+            let element = &self.geometry.elements[e];
+            let links = self.links(e);
+            if links.is_empty() {
+                for (i, slot) in local[..n].iter_mut().enumerate() {
+                    *slot = value(self.dof(element, i));
+                }
+            } else {
+                local[..n].fill(0.0);
+                for &(a, m, w) in links {
+                    for c in 0..d {
+                        local[a * d + c] += w * value(d * m + c);
+                    }
+                }
+            }
+            let (matrix, scale) = self.matrix(e);
             for i in 0..n {
                 let row = &matrix[i * n..(i + 1) * n];
-                let value: f64 = row.iter().zip(&local[..n]).map(|(k, u)| k * u).sum();
-                y[self.dof(element, i) - offset] += value;
+                product[i] = scale * row.iter().zip(&local[..n]).map(|(k, u)| k * u).sum::<f64>();
+            }
+            if links.is_empty() {
+                for (i, p) in product[..n].iter().enumerate() {
+                    y[self.dof(element, i) - offset] += p;
+                }
+            } else {
+                for &(a, m, w) in links {
+                    for c in 0..d {
+                        y[d * m + c - offset] += w * product[a * d + c];
+                    }
+                }
             }
         }
     }
@@ -241,7 +336,7 @@ impl Level {
     /// すべての要素について`y += A x`を加える。区間を偶数番と奇数番に分けて並列に処理する。
     fn accumulate_all(&self, x: &[f64], y: &mut [f64], masked: bool) {
         if self.slabs.len() <= 1 {
-            self.accumulate(x, y, 0, 0..self.elements.len(), masked);
+            self.accumulate(x, y, 0, 0..self.geometry.elements.len(), masked);
             return;
         }
         let d = self.dofs_per_node;
@@ -276,47 +371,51 @@ impl Level {
         }
     }
 
-    /// 自由度を持つ節点ごとに、補間する粗い節点と重みを求めておく。
-    fn compute_transfer(&mut self, coarse: [usize; 3]) {
+    /// 自由度を持つ節点ごとに、粗い格子の関数をその節点で評価する主節点と重みを求めておく。
+    fn compute_transfer(&mut self, coarse: &Level) {
         let d = self.dofs_per_node;
-        let per_axis = |v: usize| -> ([(usize, f64); 2], usize) {
-            if v.is_multiple_of(2) {
-                ([(v / 2, 1.0), (0, 0.0)], 1)
-            } else {
-                ([((v - 1) / 2, 0.5), (v.div_ceil(2), 0.5)], 2)
+        let locator = Locator::new(&coarse.geometry.cells);
+        let mut transfer = Transfer::default();
+        let mut found = Vec::new();
+        for (node, point) in self.geometry.positions.iter().enumerate() {
+            if (0..d).all(|c| self.fixed[d * node + c]) {
+                continue;
             }
-        };
-        let [nx, ny, nz] = self.nodes;
-        let mut transfer = Vec::new();
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let node = node_index(self.nodes, [x, y, z]);
-                    if (0..d).all(|c| self.fixed[d * node + c]) {
-                        continue;
-                    }
-                    let (px, cx) = per_axis(x);
-                    let (py, cy) = per_axis(y);
-                    let (pz, cz) = per_axis(z);
-                    let mut parents = [(0, 0.0); 8];
-                    let mut count = 0;
-                    for (zz, wz) in &pz[..cz] {
-                        for (yy, wy) in &py[..cy] {
-                            for (xx, wx) in &px[..cx] {
-                                parents[count] =
-                                    (node_index(coarse, [*xx, *yy, *zz]), wx * wy * wz);
-                                count += 1;
-                            }
+            locator.containing(&coarse.geometry.cells, *point, &mut found);
+            let Some(&k) = found.first() else {
+                continue;
+            };
+            let cell = &coarse.geometry.cells[k];
+            let t: [f64; 3] =
+                std::array::from_fn(|axis| (point[axis] - cell.0[axis]) as f64 / cell.1 as f64);
+            transfer.nodes.push(node);
+            transfer.start.push(transfer.parents.len());
+            let first = transfer.parents.len();
+            for (a, coarse_node) in coarse.geometry.elements[k].iter().enumerate() {
+                let weight: f64 = (0..3)
+                    .map(|axis| {
+                        if CORNERS[a][axis] == 1 {
+                            t[axis]
+                        } else {
+                            1.0 - t[axis]
                         }
+                    })
+                    .product();
+                if weight == 0.0 {
+                    continue;
+                }
+                for (master, w) in coarse.geometry.constraints.expand(*coarse_node) {
+                    match transfer.parents[first..]
+                        .iter_mut()
+                        .find(|(m, _)| *m == master)
+                    {
+                        Some(entry) => entry.1 += weight * w,
+                        None => transfer.parents.push((master, weight * w)),
                     }
-                    transfer.push(Transfer {
-                        node,
-                        parents,
-                        count,
-                    });
                 }
             }
         }
+        transfer.start.push(transfer.parents.len());
         self.transfer = transfer;
     }
 
@@ -324,12 +423,11 @@ impl Level {
     // 要素の行列の積は、隅と成分の番号の算術で書く方が対応を追いやすい。
     #[allow(clippy::needless_range_loop)]
     fn coarsen(&self) -> Option<Level> {
-        let cells = self.nodes.map(|n| n - 1);
-        if cells.iter().all(|c| *c <= 1) {
+        let cells = &self.geometry.cells;
+        if cells.len() <= 1 {
             return None;
         }
-        let coarse_cells = cells.map(|c| c.div_ceil(2));
-        let coarse_nodes = coarse_cells.map(|c| c + 1);
+        let smallest = cells.iter().map(|cell| cell.1).min()?;
         let d = self.dofs_per_node;
         let n = self.size();
 
@@ -352,48 +450,84 @@ impl Level {
             })
             .collect();
 
-        // 対角へ加える値は、その節点を含む最初の要素の行列に含める。
-        let mut owner = vec![usize::MAX; self.nodes.iter().product()];
+        // 対角へ加える値は、その節点を隅に持つ最初の要素の行列に含める。
+        let constraints = &self.geometry.constraints;
+        let mut owner = vec![usize::MAX; self.geometry.positions.len()];
         if !self.extra.is_empty() {
-            for (e, element) in self.elements.iter().enumerate() {
+            for (e, element) in self.geometry.elements.iter().enumerate() {
                 for node in element {
-                    if owner[*node] == usize::MAX {
+                    if owner[*node] == usize::MAX && !constraints.is_dependent(*node) {
                         owner[*node] = e;
                     }
                 }
             }
         }
+        // 隅の成分を拘束とみなすか。従属する隅は主節点がすべて拘束されていれば拘束とする。
+        let corner_fixed = |node: usize, c: usize| {
+            if constraints.is_dependent(node) {
+                constraints
+                    .masters(node)
+                    .iter()
+                    .all(|(m, _)| self.fixed[d * m + c])
+            } else {
+                self.fixed[d * node + c]
+            }
+        };
+        // 拘束にも対角の値にも関わらない要素は、行列を表のまま共有できる。
+        let plain: Vec<bool> = self
+            .geometry
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(e, element)| {
+                element
+                    .iter()
+                    .all(|node| owner[*node] != e && (0..d).all(|c| !corner_fixed(*node, c)))
+            })
+            .collect();
 
-        let mut index: BTreeMap<[usize; 3], usize> = BTreeMap::new();
-        let mut coarse_list: Vec<[usize; 3]> = Vec::new();
-        let mut matrices: Vec<f64> = Vec::new();
-        let mut fine = vec![0.0; n * n];
-        let mut product = vec![0.0; n * n];
-        for (e, element) in self.elements.iter().enumerate() {
-            let cell = self.cells[e];
-            let parent = cell.map(|v| v / 2);
-            let child = (cell[0] % 2) | ((cell[1] % 2) << 1) | ((cell[2] % 2) << 2);
-            let k = *index.entry(parent).or_insert_with(|| {
-                coarse_list.push(parent);
-                matrices.extend(std::iter::repeat_n(0.0, n * n));
-                coarse_list.len() - 1
-            });
-            // 除いた自由度の行と列を0にした要素の行列。
-            fine.copy_from_slice(self.matrix(e));
+        // 粗い要素のcellと、その子 (細かい要素の番号と子の位置) 。zの順に並べる。
+        type Members = Vec<(usize, Option<usize>)>;
+        let mut groups: BTreeMap<([i64; 3], i64), Members> = BTreeMap::new();
+        for (e, cell) in cells.iter().enumerate() {
+            let (parent, slot) = if cell.1 == smallest {
+                let size = 2 * smallest;
+                let at = cell.0.map(|v| v.div_euclid(size) * size);
+                let child = (0..3)
+                    .map(|axis| (((cell.0[axis] - at[axis]) / smallest) as usize) << axis)
+                    .sum::<usize>();
+                ((at, size), Some(child))
+            } else {
+                (*cell, None)
+            };
+            groups
+                .entry(([parent.0[2], parent.0[1], parent.0[0]], parent.1))
+                .or_default()
+                .push((e, slot));
+        }
+
+        // 細かい要素の、拘束の行と列を除き対角の値を加えた行列。
+        let local = |e: usize, out: &mut Vec<f64>| {
+            let (matrix, scale) = self.matrix(e);
+            out.clear();
+            out.extend(matrix.iter().map(|k| scale * k));
+            let element = &self.geometry.elements[e];
             for i in 0..n {
-                let dof = self.dof(element, i);
-                if !self.extra.is_empty() && owner[element[i / d]] == e {
-                    fine[i * n + i] += self.extra[dof];
+                let node = element[i / d];
+                if !self.extra.is_empty() && owner[node] == e {
+                    out[i * n + i] += self.extra[d * node + i % d];
                 }
-                if self.fixed[dof] {
+                if corner_fixed(node, i % d) {
                     for j in 0..n {
-                        fine[i * n + j] = 0.0;
-                        fine[j * n + i] = 0.0;
+                        out[i * n + j] = 0.0;
+                        out[j * n + i] = 0.0;
                     }
                 }
             }
-            let w = &weights[child];
-            // product = fine · (W ⊗ I)
+        };
+        // target += (W ⊗ I)^T · fine · (W ⊗ I)
+        let mut product = vec![0.0; n * n];
+        let mut transform = |fine: &[f64], w: &[[f64; 8]; 8], target: &mut [f64]| {
             for i in 0..n {
                 for b in 0..8 {
                     for c in 0..d {
@@ -402,8 +536,6 @@ impl Level {
                     }
                 }
             }
-            // coarse += (W ⊗ I)^T · product
-            let target = &mut matrices[k * n * n..(k + 1) * n * n];
             for b in 0..8 {
                 for c in 0..d {
                     let row = b * d + c;
@@ -415,18 +547,100 @@ impl Level {
                     }
                 }
             }
+        };
+
+        let mut table: Vec<Vec<f64>> = Vec::new();
+        // 細かい表の番号から粗い表の番号。
+        let mut carried: HashMap<usize, usize> = HashMap::new();
+        // 子の配置と細かい表の番号から、まとめた行列の粗い表の番号。
+        let mut merged: HashMap<(u8, usize), usize> = HashMap::new();
+        let mut coarse_cells = Vec::with_capacity(groups.len());
+        let mut assigned = Vec::with_capacity(groups.len());
+        let mut scratch = Vec::new();
+        for ((key, size), members) in groups {
+            coarse_cells.push(([key[2], key[1], key[0]], size));
+            let shared = members.iter().all(|(e, _)| plain[*e])
+                && members
+                    .iter()
+                    .all(|(e, _)| self.assigned[*e] == self.assigned[members[0].0]);
+            let (index, scale) = self.assigned[members[0].0];
+            if shared && members[0].1.is_none() {
+                let next = table.len();
+                let coarse = *carried.entry(index).or_insert(next);
+                if coarse == next {
+                    table.push(self.table[index].clone());
+                }
+                assigned.push((coarse, scale));
+                continue;
+            }
+            if shared {
+                let mask = members
+                    .iter()
+                    .map(|(_, slot)| 1u8 << slot.expect("merged"))
+                    .fold(0, |a, b| a | b);
+                let next = table.len();
+                let coarse = *merged.entry((mask, index)).or_insert(next);
+                if coarse == next {
+                    let mut matrix = vec![0.0; n * n];
+                    for (_, slot) in &members {
+                        transform(
+                            &self.table[index],
+                            &weights[slot.expect("merged")],
+                            &mut matrix,
+                        );
+                    }
+                    table.push(matrix);
+                }
+                assigned.push((coarse, scale));
+                continue;
+            }
+            let mut matrix = vec![0.0; n * n];
+            for (e, slot) in &members {
+                local(*e, &mut scratch);
+                match slot {
+                    Some(slot) => transform(&scratch, &weights[*slot], &mut matrix),
+                    None => {
+                        for (target, value) in matrix.iter_mut().zip(&scratch) {
+                            *target += value;
+                        }
+                    }
+                }
+            }
+            table.push(matrix);
+            assigned.push((table.len() - 1, 1.0));
         }
 
-        let dofs = d * coarse_nodes.iter().product::<usize>();
+        // 粗い要素の隅を節点とし、zの順に番号を付ける。
+        let mut positions: Vec<[i64; 3]> = coarse_cells
+            .iter()
+            .flat_map(|cell| (0..8).map(move |a| corner(cell, a)))
+            .collect();
+        positions.sort_unstable_by_key(|p| [p[2], p[1], p[0]]);
+        positions.dedup();
+        let index: HashMap<[i64; 3], usize> =
+            positions.iter().enumerate().map(|(k, p)| (*p, k)).collect();
+        let elements: Vec<[usize; 8]> = coarse_cells
+            .iter()
+            .map(|cell| std::array::from_fn(|a| index[&corner(cell, a)]))
+            .collect();
+        let locator = Locator::new(&coarse_cells);
+        let coarse_constraints =
+            octree::constraints(&positions, &coarse_cells, &elements, &locator);
+        let dofs = d * positions.len();
         let mut coarse = Level::new(
             d,
-            coarse_nodes,
-            coarse_list,
-            Matrices::Each(matrices),
+            Geometry {
+                positions,
+                cells: coarse_cells,
+                elements,
+                constraints: coarse_constraints,
+            },
+            table,
+            assigned,
             Vec::new(),
             vec![false; dofs],
         );
-        // 細かい格子のどの自由度にも補間されない自由度を除く。
+        // 細かい格子のどの自由度にも補間されない自由度を除く。従属する自由度は対角が0となる。
         let scale = coarse.diagonal.iter().copied().fold(0.0, f64::max);
         let fixed: Vec<bool> = coarse
             .diagonal
@@ -442,13 +656,14 @@ impl Level {
     fn restrict(&self, coarse: &Level, residual: &[f64], out: &mut [f64]) {
         out.fill(0.0);
         let d = self.dofs_per_node;
-        for t in &self.transfer {
+        let t = &self.transfer;
+        for (k, node) in t.nodes.iter().enumerate() {
             for c in 0..d {
-                let dof = d * t.node + c;
+                let dof = d * node + c;
                 if self.fixed[dof] {
                     continue;
                 }
-                for (parent, w) in &t.parents[..t.count] {
+                for (parent, w) in &t.parents[t.start[k]..t.start[k + 1]] {
                     out[d * parent + c] += w * residual[dof];
                 }
             }
@@ -463,13 +678,14 @@ impl Level {
     /// 粗い格子の修正を細かい格子へ補間して加える。x += P e。
     fn prolong_add(&self, coarse: &Level, correction: &[f64], x: &mut [f64]) {
         let d = self.dofs_per_node;
-        for t in &self.transfer {
+        let t = &self.transfer;
+        for (k, node) in t.nodes.iter().enumerate() {
             for c in 0..d {
-                let dof = d * t.node + c;
+                let dof = d * node + c;
                 if self.fixed[dof] {
                     continue;
                 }
-                for (parent, w) in &t.parents[..t.count] {
+                for (parent, w) in &t.parents[t.start[k]..t.start[k + 1]] {
                     let coarse_dof = d * parent + c;
                     if !coarse.fixed[coarse_dof] {
                         x[dof] += w * correction[coarse_dof];
@@ -557,10 +773,15 @@ impl Level {
             x[i] += step[i];
         }
     }
-}
 
-fn node_index(nodes: [usize; 3], xyz: [usize; 3]) -> usize {
-    (xyz[2] * nodes[1] + xyz[1]) * nodes[0] + xyz[0]
+    /// 除いた自由度も含む`y = A x`。固定した値の右辺への寄与を求めるために使う。
+    fn apply_full(&self, x: &[f64], y: &mut [f64]) {
+        y.fill(0.0);
+        self.accumulate_all(x, y, false);
+        for (i, extra) in self.extra.iter().enumerate() {
+            y[i] += extra * x[i];
+        }
+    }
 }
 
 /// 最も粗い格子の密行列のCholesky分解。
@@ -583,17 +804,35 @@ impl Dense {
         }
         let mut a = vec![0.0; m * m];
         let n = level.size();
-        for (e, element) in level.elements.iter().enumerate() {
-            let matrix = level.matrix(e);
-            for i in 0..n {
-                let row = position[level.dof(element, i)];
-                if row == usize::MAX {
-                    continue;
+        let d = level.dofs_per_node;
+        let mut add = |row: usize, col: usize, value: f64| {
+            let (row, col) = (position[row], position[col]);
+            if row != usize::MAX && col != usize::MAX {
+                a[row * m + col] += value;
+            }
+        };
+        for (e, element) in level.geometry.elements.iter().enumerate() {
+            let (matrix, scale) = level.matrix(e);
+            let links = level.links(e);
+            if links.is_empty() {
+                for i in 0..n {
+                    for j in 0..n {
+                        add(
+                            level.dof(element, i),
+                            level.dof(element, j),
+                            scale * matrix[i * n + j],
+                        );
+                    }
                 }
-                for j in 0..n {
-                    let col = position[level.dof(element, j)];
-                    if col != usize::MAX {
-                        a[row * m + col] += matrix[i * n + j];
+                continue;
+            }
+            for &(a1, m1, w1) in links {
+                for &(a2, m2, w2) in links {
+                    for c1 in 0..d {
+                        for c2 in 0..d {
+                            let k = matrix[(a1 * d + c1) * n + a2 * d + c2];
+                            add(d * m1 + c1, d * m2 + c2, scale * w1 * w2 * k);
+                        }
                     }
                 }
             }
@@ -696,8 +935,8 @@ impl Hierarchy {
         for k in 0..levels.len() {
             levels[k].estimate_largest();
             if k + 1 < levels.len() {
-                let coarse = levels[k + 1].nodes;
-                levels[k].compute_transfer(coarse);
+                let (fine, coarse) = levels.split_at_mut(k + 1);
+                fine[k].compute_transfer(&coarse[0]);
             }
         }
         let last = levels.last().expect("non-empty");
@@ -744,7 +983,7 @@ impl Hierarchy {
     }
 
     /// `A x = rhs`を解く。除いた自由度は`x`の初期値のまま動かさず、その寄与を右辺へ移す。
-    /// 収束すれば反復回数を返す。
+    /// 従属する節点の値は、解いた後に主節点から補間する。収束すれば反復回数を返す。
     pub(crate) fn solve(&self, rhs: &[f64], x: &mut [f64]) -> Option<usize> {
         let level = self.fine();
         let n = rhs.len();
@@ -796,6 +1035,7 @@ impl Hierarchy {
                         x[i] = free[i];
                     }
                 }
+                level.geometry.constraints.fill(level.dofs_per_node, x);
                 return Some(iteration);
             }
             level.apply(&direction, &mut product);
@@ -820,20 +1060,10 @@ impl Hierarchy {
     }
 }
 
-impl Level {
-    /// 除いた自由度も含む`y = A x`。固定した値の右辺への寄与を求めるために使う。
-    fn apply_full(&self, x: &[f64], y: &mut [f64]) {
-        y.fill(0.0);
-        self.accumulate_all(x, y, false);
-        for (i, extra) in self.extra.iter().enumerate() {
-            y[i] += extra * x[i];
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::octree::children;
 
     /// 一辺1、熱伝導率1の要素の伝導行列。
     fn conduction() -> Vec<f64> {
@@ -867,52 +1097,102 @@ mod tests {
         k
     }
 
-    #[test]
-    fn multigrid_matches_the_linear_temperature_field() {
-        // 長さ40 cellの棒の両端の温度を固定すると、温度は長さ方向に線形となる。粗くすると
-        // 奇数のcell数を含む格子になる。
-        let cells_per_axis = [40, 5, 3];
-        let nodes = cells_per_axis.map(|c| c + 1);
-        let mut cells = Vec::new();
-        for z in 0..cells_per_axis[2] {
-            for y in 0..cells_per_axis[1] {
-                for x in 0..cells_per_axis[0] {
-                    cells.push([x, y, z]);
-                }
-            }
+    /// cellの集まりの格子。節点はzの順に番号を付ける。
+    fn geometry(mut cells: Vec<Cell>) -> Geometry {
+        cells.sort_unstable_by_key(|cell| [cell.0[2], cell.0[1], cell.0[0]]);
+        let mut positions: Vec<[i64; 3]> = cells
+            .iter()
+            .flat_map(|cell| (0..8).map(move |a| corner(cell, a)))
+            .collect();
+        positions.sort_unstable_by_key(|p| [p[2], p[1], p[0]]);
+        positions.dedup();
+        let index: HashMap<[i64; 3], usize> =
+            positions.iter().enumerate().map(|(k, p)| (*p, k)).collect();
+        let elements: Vec<[usize; 8]> = cells
+            .iter()
+            .map(|cell| std::array::from_fn(|a| index[&corner(cell, a)]))
+            .collect();
+        let locator = Locator::new(&cells);
+        let constraints = octree::constraints(&positions, &cells, &elements, &locator);
+        Geometry {
+            positions,
+            cells,
+            elements,
+            constraints,
         }
-        let count: usize = nodes.iter().product();
+    }
+
+    /// x方向の両端の温度を固定した棒を解き、温度が長さ方向に線形であることを確かめる。
+    fn linear_temperature(cells: Vec<Cell>, length: i64, dense_limit: usize) -> usize {
+        let geometry = geometry(cells);
+        let count = geometry.positions.len();
         let mut fixed = vec![false; count];
         let mut x = vec![0.0; count];
-        for z in 0..nodes[2] {
-            for y in 0..nodes[1] {
-                for (end, value) in [(0, 10.0), (nodes[0] - 1, 50.0)] {
-                    let node = node_index(nodes, [end, y, z]);
-                    fixed[node] = true;
-                    x[node] = value;
-                }
+        for (node, point) in geometry.positions.iter().enumerate() {
+            if point[0] == 0 || point[0] == length {
+                fixed[node] = true;
+                x[node] = 10.0 + 40.0 * point[0] as f64 / length as f64;
             }
         }
-        let level = Level::new(
-            1,
-            nodes,
-            cells,
-            Matrices::Uniform(conduction()),
-            Vec::new(),
-            fixed,
-        );
-        let hierarchy = Hierarchy::with_dense_limit(level, 50);
+        let assigned = geometry
+            .cells
+            .iter()
+            .map(|cell| (0, cell.1 as f64))
+            .collect();
+        let positions = geometry.positions.clone();
+        let level = Level::new(1, geometry, vec![conduction()], assigned, Vec::new(), fixed);
+        let hierarchy = Hierarchy::with_dense_limit(level, dense_limit);
         assert!(hierarchy.levels.len() >= 3);
         let iterations = hierarchy.solve(&vec![0.0; count], &mut x).unwrap();
-        assert!(iterations < 30, "{iterations}");
-        for z in 0..nodes[2] {
-            for y in 0..nodes[1] {
-                for xi in 0..nodes[0] {
-                    let expected = 10.0 + 40.0 * xi as f64 / 40.0;
-                    let value = x[node_index(nodes, [xi, y, z])];
-                    assert!((value - expected).abs() < 1e-6, "{value} {expected}");
+        for (node, point) in positions.iter().enumerate() {
+            let expected = 10.0 + 40.0 * point[0] as f64 / length as f64;
+            assert!(
+                (x[node] - expected).abs() < 1e-6,
+                "{point:?} {} {expected}",
+                x[node]
+            );
+        }
+        iterations
+    }
+
+    #[test]
+    fn multigrid_matches_the_linear_temperature_field() {
+        // 長さ40 cellの棒。粗くすると奇数のcell数を含む格子になる。
+        let mut cells = Vec::new();
+        for z in 0..3 {
+            for y in 0..5 {
+                for x in 0..40 {
+                    cells.push(([x, y, z], 1));
                 }
             }
         }
+        let iterations = linear_temperature(cells, 40, 50);
+        assert!(iterations < 30, "{iterations}");
+    }
+
+    #[test]
+    fn hanging_nodes_keep_the_linear_temperature_field() {
+        // 一辺4のcellを並べた棒の中央を2段まで分割し、2:1に揃えた格子。線形の温度は
+        // 従属する節点を含めて厳密に表せる。
+        let mut cells = Vec::new();
+        for x in 0..10 {
+            for y in 0..2 {
+                let cell = ([4 * x, 4 * y, 0], 4);
+                match x {
+                    4 | 5 => {
+                        for child in children(&cell) {
+                            if x == 4 && child.0[0] >= 18 {
+                                cells.extend(children(&child));
+                            } else {
+                                cells.push(child);
+                            }
+                        }
+                    }
+                    _ => cells.push(cell),
+                }
+            }
+        }
+        let iterations = linear_temperature(cells, 40, 20);
+        assert!(iterations < 40, "{iterations}");
     }
 }

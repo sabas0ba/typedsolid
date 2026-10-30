@@ -235,6 +235,15 @@
     return oklabToRgb(a.map((v, i) => v + (b[i] - v) * f));
   }
 
+  // 最小と最大の表記。局所的に細かくした格子の間隔などで、一方が無いか等しければ1つの値とする。
+  function rangeLabel(low, high) {
+    const has = (value) => value !== null && value !== undefined;
+    if (has(low) && has(high) && low !== high) {
+      return `${low}–${high}`;
+    }
+    return String(has(low) ? low : high);
+  }
+
   // 分布の色の範囲。上限の無い量では、limitとdivergingは値の最小から最大までとする。
   function fieldScale(field, mode, range) {
     const hasLimit = field.limit !== null && field.limit !== undefined;
@@ -690,6 +699,7 @@
     parseState,
     perspective,
     pickLocation,
+    rangeLabel,
     rayBoxDistance,
     screenRay,
     sortChecks,

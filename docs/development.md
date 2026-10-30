@@ -113,7 +113,7 @@ export(model, ".work/plate")
 
 全座標はmm。`Feature(operation="cut")`は全Addを結合した後に差し引く。`hole`は`cut`のcylinder、`boss`は`add`のcylinderを作るhelperで、いずれも直径で指定する。`inner_fillet`は凹んだ内角を埋める`add`の`Fillet`、`round_edge`は凸の辺を丸める`cut`の`Fillet`を作る。`toward`は、内角では辺から空間へ、凸の辺では辺から材料の内側へ向かう2方向を、軸に垂直な2軸の順に与える。応力・熱は`Model.analyses`に解析ケースを宣言すると判定する。宣言しない種類は未評価で残り、`Policy.required`に加えるとexportが拒否される。
 
-解析ケースは部品ごとに宣言し、材料に定数を与える。領域は`Box`、`Surface`、`AtFastener`、`AtKeepout`、`AtConnector`で指定する。格子間隔は`voxel_mm`で与え、省略すると`Policy.voxel_mm`を使う。2倍と4倍の格子でも解いて収束を確かめるため、4倍の格子で消える細い壁を含む部品は評価できない。手法と制約は [設計](design.md#解析) を参照する。強度のケースの例は`examples/bracket_analysis.py` (腕の付け根を丸めたL字の金具) にある。
+解析ケースは部品ごとに宣言し、材料に定数を与える。領域は`Box`、`Surface`、`AtFastener`、`AtKeepout`、`AtConnector`で指定する。格子間隔は`voxel_mm`で与え、省略すると`Policy.voxel_mm`を使う。2倍と4倍の格子でも解いて収束を確かめる。強度のケースでは、薄い部材と丸みの周りだけ格子を自動で細かくする (最大で格子間隔の1/8)。熱のケースは細かくしないため、4倍の格子で消える細い壁を含む部品は評価できない。端面を選ぶ`Box`は、細かくしたcellの側面を含まないよう薄くする。手法と制約は [設計](design.md#解析) を参照する。強度のケースの例は`examples/bracket_analysis.py` (腕の付け根を丸めたL字の金具。丸みの周りを0.5 mmに細かくする) にある。
 
 ```python
 from typedsolid import (

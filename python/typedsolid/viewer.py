@@ -68,7 +68,8 @@ class FieldOverlay:
 
     valuesは頂点ごとのu16 (little endian) で、minimumからmaximumを量子化した値かNO_VALUE。
     excludedは頂点ごとに0か1のbyteで、拘束と荷重の近傍で応力を判定しない頂点を示す。
-    metaは解析が返した分布の属性 (case、quantity、unit、limit、reference、pitch、exclusion_mm)。
+    metaは解析が返した分布の属性 (case、quantity、unit、limit、reference、pitch、exclusion_mm)。局所的に
+    細かくした格子では、cellの一辺の最大max_pitchと、判定しない近傍の距離の最小min_exclusion_mmを加える。
     """
 
     part: str
@@ -95,8 +96,9 @@ def field_overlay(part: str, field: dict, values: bytes, excluded: bytes) -> Fie
     if sys.byteorder == "big":
         quantized.byteswap()
     meta = {key: field[key] for key in ("case", "quantity", "unit", "limit", "reference", "pitch") if key in field}
-    if field.get("exclusion_mm") is not None:
-        meta["exclusion_mm"] = field["exclusion_mm"]
+    for key in ("max_pitch", "exclusion_mm", "min_exclusion_mm"):
+        if field.get(key) is not None:
+            meta[key] = field[key]
     return FieldOverlay(part, meta, float(low), float(high), quantized.tobytes(), excluded if any(excluded) else None)
 
 
